@@ -27,7 +27,7 @@ def mask_token(text: str) -> str:
 def get_updates(offset: Optional[int] = None) -> Dict:
     token = settings.get("TELEGRAM_BOT_TOKEN")
     if not token:
-        return {"_status": 0, "_error": "토큰 미설정"}
+        return {"_status": 0, "_error": "token not set"}
 
     poll_timeout = settings.get("POLL_TIMEOUT_SEC") or 30
     http_timeout = poll_timeout + 5
@@ -98,7 +98,7 @@ def split_message(text: str, limit: int = 4096) -> List[str]:
 def send_message(chat_id: int, text: str, parse_mode: Optional[str] = "HTML") -> Dict:
     token = settings.get("TELEGRAM_BOT_TOKEN")
     if not token:
-        _LOGGER.warning("send_message: 토큰 미설정")
+        _LOGGER.warning("send_message: token not set")
         return {"ok": False}
 
     chunks = split_message(text)
@@ -174,7 +174,7 @@ def delete_message(chat_id: int, message_id: int) -> bool:
 def get_me(token: Optional[str] = None, timeout: int = 10) -> Dict:
     current_token = token or settings.get("TELEGRAM_BOT_TOKEN")
     if not current_token:
-        return {"_status": 0, "_error": "토큰 미설정"}
+        return {"_status": 0, "_error": "token not set"}
 
     url = _api_url("getMe", current_token)
     response, status = http_post(url, {}, timeout=timeout)
@@ -189,7 +189,7 @@ def register_prechecks() -> None:
     def check_bot_token(new_token: str) -> None:
         response = get_me(token=new_token, timeout=10)
         if response.get("_status") or not response.get("ok"):
-            raise ValueError("토큰 검증 실패: getMe 응답 없음/오류")
+            raise ValueError("Token validation failed: getMe returned no result or error")
 
     def check_allowed_user_id(new_id: int) -> None:
         response = get_me()
@@ -198,7 +198,7 @@ def register_prechecks() -> None:
 
         bot_id = response.get("result", {}).get("id")
         if bot_id == new_id:
-            raise ValueError("봇 자신의 ID는 허용 사용자로 지정할 수 없습니다")
+            raise ValueError("Cannot set the bot's own ID as the allowed user ID")
 
     settings.register_precheck("TELEGRAM_BOT_TOKEN", check_bot_token)
     settings.register_precheck("ALLOWED_USER_ID", check_allowed_user_id)

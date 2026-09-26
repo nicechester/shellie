@@ -41,13 +41,13 @@ class TestMemory(unittest.TestCase):
     def test_read_memory_both_missing_returns_sentinel(self) -> None:
         """Test read_memory returns sentinel when core and dated files are both absent."""
         result = memory.read_memory()
-        self.assertEqual(result, "등록된 메모리가 없습니다.")
+        self.assertEqual(result, "No memory entries found.")
 
     def test_read_memory_core_empty_and_no_dated_file_returns_sentinel(self) -> None:
         """Test read_memory returns sentinel when the core file exists but is empty."""
         open(self.memory_file, "w").close()
         result = memory.read_memory()
-        self.assertEqual(result, "등록된 메모리가 없습니다.")
+        self.assertEqual(result, "No memory entries found.")
 
     def test_read_memory_core_only(self) -> None:
         """Test read_memory returns core content when no dated file exists (legacy MEMORY.md)."""
@@ -80,7 +80,7 @@ class TestMemory(unittest.TestCase):
         with open(self._dated_path(_YESTERDAY), "w", encoding="utf-8") as f:
             f.write("- old entry\n")
         result = memory.read_memory()
-        self.assertEqual(result, "등록된 메모리가 없습니다.")
+        self.assertEqual(result, "No memory entries found.")
         self.assertNotIn("old entry", result)
 
     # -- append_memory ------------------------------------------------------
@@ -88,7 +88,7 @@ class TestMemory(unittest.TestCase):
     def test_append_memory_creates_todays_dated_file(self) -> None:
         """Test append_memory writes to today's dated file, not MEMORY.md."""
         result = memory.append_memory("hello")
-        self.assertEqual(result, "메모리가 저장되었습니다.")
+        self.assertEqual(result, "Memory saved.")
         dated_path = self._dated_path(_TODAY)
         self.assertTrue(os.path.exists(dated_path))
         self.assertFalse(os.path.exists(self.memory_file))
@@ -102,7 +102,7 @@ class TestMemory(unittest.TestCase):
         with open(dated_path, "w", encoding="utf-8") as f:
             f.write("- item1\n")
         result = memory.append_memory("item2")
-        self.assertEqual(result, "메모리가 저장되었습니다.")
+        self.assertEqual(result, "Memory saved.")
         with open(dated_path, "r", encoding="utf-8") as f:
             content = f.read()
         self.assertEqual(content, "- item1\n- item2\n")
@@ -113,7 +113,7 @@ class TestMemory(unittest.TestCase):
         with open(dated_path, "w", encoding="utf-8") as f:
             f.write("- item1")
         result = memory.append_memory("item2")
-        self.assertEqual(result, "메모리가 저장되었습니다.")
+        self.assertEqual(result, "Memory saved.")
         with open(dated_path, "r", encoding="utf-8") as f:
             content = f.read()
         self.assertEqual(content, "- item1\n- item2\n")
@@ -121,7 +121,7 @@ class TestMemory(unittest.TestCase):
     def test_append_memory_multiline_input_normalized(self) -> None:
         """Test append_memory normalizes multi-line input to a single line."""
         result = memory.append_memory("a\nb\r\nc")
-        self.assertEqual(result, "메모리가 저장되었습니다.")
+        self.assertEqual(result, "Memory saved.")
         with open(self._dated_path(_TODAY), "r", encoding="utf-8") as f:
             content = f.read()
         self.assertEqual(content, "- a b c\n")
@@ -129,7 +129,7 @@ class TestMemory(unittest.TestCase):
     def test_append_memory_whitespace_collapsed(self) -> None:
         """Test append_memory collapses multiple whitespace runs into single spaces."""
         result = memory.append_memory("a    b\t c")
-        self.assertEqual(result, "메모리가 저장되었습니다.")
+        self.assertEqual(result, "Memory saved.")
         with open(self._dated_path(_TODAY), "r", encoding="utf-8") as f:
             content = f.read()
         self.assertEqual(content, "- a b c\n")
@@ -137,24 +137,24 @@ class TestMemory(unittest.TestCase):
     def test_append_memory_empty_input(self) -> None:
         """Test append_memory with empty input returns error and does not create a dated file."""
         result = memory.append_memory("")
-        self.assertEqual(result, "저장할 내용이 없습니다.")
+        self.assertEqual(result, "Nothing to save.")
         self.assertFalse(os.path.exists(self._dated_path(_TODAY)))
 
     def test_append_memory_whitespace_only_input(self) -> None:
         """Test append_memory with whitespace-only input returns error and creates no file."""
         result = memory.append_memory("   \n\t\n   ")
-        self.assertEqual(result, "저장할 내용이 없습니다.")
+        self.assertEqual(result, "Nothing to save.")
         self.assertFalse(os.path.exists(self._dated_path(_TODAY)))
 
     def test_append_memory_success_return_value(self) -> None:
         """Test append_memory returns success message on successful save."""
         result = memory.append_memory("test content")
-        self.assertEqual(result, "메모리가 저장되었습니다.")
+        self.assertEqual(result, "Memory saved.")
 
     def test_append_memory_does_not_write_core_file(self) -> None:
         """Test append_memory never writes to the core MEMORY.md file."""
         result = memory.append_memory("new fact")
-        self.assertEqual(result, "메모리가 저장되었습니다.")
+        self.assertEqual(result, "Memory saved.")
         self.assertFalse(os.path.exists(self.memory_file))
 
 

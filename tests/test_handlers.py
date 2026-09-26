@@ -38,7 +38,7 @@ def _row(
     value="v",
     source="default",
     telegram_editable=True,
-    apply_timing="즉시",
+    apply_timing="immediate",
     description="desc",
     constraint="",
     default="v",
@@ -193,7 +193,7 @@ class RestartCommandTests(HandlersTestCase):
                 with self.assertRaises(SystemExit):
                     handlers.process_update(self._update("/restart"))
         reply = self.mock_send_message.call_args[0][1]
-        self.assertIn("서비스 관리자 없이", reply)
+        self.assertIn("without a service manager", reply)
 
     def test_restart_no_warning_when_systemd_present(self) -> None:
         with mock.patch.object(handlers.sys, "exit", side_effect=_raise_system_exit):
@@ -201,7 +201,7 @@ class RestartCommandTests(HandlersTestCase):
                 with self.assertRaises(SystemExit):
                     handlers.process_update(self._update("/restart"))
         reply = self.mock_send_message.call_args[0][1]
-        self.assertNotIn("서비스 관리자 없이", reply)
+        self.assertNotIn("without a service manager", reply)
 
     def test_restart_no_warning_when_launchd_present(self) -> None:
         with mock.patch.object(handlers.sys, "exit", side_effect=_raise_system_exit):
@@ -209,7 +209,7 @@ class RestartCommandTests(HandlersTestCase):
                 with self.assertRaises(SystemExit):
                     handlers.process_update(self._update("/restart"))
         reply = self.mock_send_message.call_args[0][1]
-        self.assertNotIn("서비스 관리자 없이", reply)
+        self.assertNotIn("without a service manager", reply)
 
 
 class SettingsCommandTests(HandlersTestCase):
@@ -233,26 +233,26 @@ class SettingsCommandTests(HandlersTestCase):
         self.mock_delete_message.assert_called_once_with(1, 99)
         self.mock_settings.update.assert_not_called()
         reply = self.mock_send_message.call_args[0][1]
-        self.assertIn("보안상", reply)
+        self.assertIn("security", reply)
 
     def test_set_non_secret_blocked_key_not_deleted(self) -> None:
         handlers.process_update(self._update("/set ALLOWED_USER_ID 5", message_id=99))
         self.mock_delete_message.assert_not_called()
         self.mock_settings.update.assert_not_called()
         reply = self.mock_send_message.call_args[0][1]
-        self.assertIn("보안상", reply)
+        self.assertIn("security", reply)
 
     def test_set_unknown_key_suggests_close_match(self) -> None:
         handlers.process_update(self._update("/set SHELL_TIMEOUT_SE 60"))
         reply = self.mock_send_message.call_args[0][1]
-        self.assertIn("알 수 없는 키", reply)
+        self.assertIn("Unknown key", reply)
         self.assertIn("SHELL_TIMEOUT_SEC", reply)
 
     def test_set_multiline_value_rejected_for_non_system_prompt(self) -> None:
         handlers.process_update(self._update("/set SHELL_TIMEOUT_SEC 60\nextra"))
         self.mock_settings.update.assert_not_called()
         reply = self.mock_send_message.call_args[0][1]
-        self.assertIn("줄바꿈", reply)
+        self.assertIn("newlines", reply)
 
     def test_settings_listing_is_pre_wrapped_and_masked(self) -> None:
         handlers.process_update(self._update("/settings"))
@@ -294,7 +294,7 @@ class FunctionCallLoopTests(HandlersTestCase):
         handlers.process_update(self._update("loop forever"))
 
         reply = self.mock_send_message.call_args[0][1]
-        self.assertIn("함수 호출 한도", reply)
+        self.assertIn("Function call limit", reply)
         self.assertIn("2", reply)
         self.assertEqual(self.mock_call_gemini.call_count, 3)  # fc_max_loops + 1
         self.assertEqual(self.mock_run_tool.call_count, 2)
@@ -303,7 +303,7 @@ class FunctionCallLoopTests(HandlersTestCase):
         self.mock_call_gemini.return_value = (_blocked_response("SAFETY"), "m1")
         handlers.process_update(self._update("something"))
         reply = self.mock_send_message.call_args[0][1]
-        self.assertIn("차단", reply)
+        self.assertIn("blocked", reply)
         self.assertEqual(handlers._history, [])
 
 

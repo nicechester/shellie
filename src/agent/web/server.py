@@ -104,22 +104,27 @@ def _make_handler_class() -> type:
             host = self.headers.get("Host")
             allowed_hosts = ("127.0.0.1:{}".format(port), "localhost:{}".format(port))
             if host not in allowed_hosts:
-                self._reject(403, "허용되지 않은 Host 헤더입니다")
+                self._reject(403, "Host header not allowed")
                 return False
 
             origin = self.headers.get("Origin")
-            if origin is not None:
+            if origin is not None and origin != "null":
                 allowed_origins = (
                     "http://127.0.0.1:{}".format(port),
                     "http://localhost:{}".format(port),
                 )
                 if origin not in allowed_origins:
-                    self._reject(403, "허용되지 않은 Origin입니다")
+                    _LOGGER.warning(
+                        "web request rejected code=403 reason=Origin not allowed "
+                        "path=%s origin=%r allowed=%r",
+                        self.path, origin, allowed_origins,
+                    )
+                    self._reject(403, "Origin not allowed")
                     return False
 
             sec_fetch_site = self.headers.get("Sec-Fetch-Site")
             if sec_fetch_site is not None and sec_fetch_site not in ("same-origin", "none"):
-                self._reject(403, "허용되지 않은 요청입니다")
+                self._reject(403, "Request not allowed")
                 return False
 
             return True
@@ -130,44 +135,44 @@ def _make_handler_class() -> type:
             content_type = self.headers.get("Content-Type", "")
             media_type = content_type.split(";", 1)[0].strip().lower()
             if media_type != "application/x-www-form-urlencoded":
-                self._send_html(415, self._simple_page("지원하지 않는 Content-Type입니다"))
+                self._send_html(415, self._simple_page("Unsupported Content-Type"))
                 return None
 
             length_header = self.headers.get("Content-Length")
             if length_header is None:
-                self._send_html(411, self._simple_page("Content-Length가 필요합니다"))
+                self._send_html(411, self._simple_page("Content-Length required"))
                 return None
             try:
                 length = int(length_header)
             except ValueError:
-                self._send_html(400, self._simple_page("잘못된 요청입니다"))
+                self._send_html(400, self._simple_page("Bad request"))
                 return None
             if length < 0:
-                self._send_html(400, self._simple_page("잘못된 요청입니다"))
+                self._send_html(400, self._simple_page("Bad request"))
                 return None
             if length > _MAX_BODY_BYTES:
                 self.close_connection = True
-                self._send_html(413, self._simple_page("요청 본문이 너무 큽니다"))
+                self._send_html(413, self._simple_page("Request body too large"))
                 return None
 
             raw = self.rfile.read(length)
             try:
                 text = raw.decode("utf-8")
             except UnicodeDecodeError:
-                self._send_html(400, self._simple_page("UTF-8 디코딩에 실패했습니다"))
+                self._send_html(400, self._simple_page("UTF-8 decoding failed"))
                 return None
 
             try:
                 form = parse_qs(text, keep_blank_values=True, max_num_fields=100)
             except ValueError:
-                self._send_html(400, self._simple_page("잘못된 요청입니다"))
+                self._send_html(400, self._simple_page("Bad request"))
                 return None
             return form
 
         def _check_csrf(self, form: Dict[str, List[str]]) -> bool:
             submitted = form.get("csrf", [""])[0]
             if not hmac.compare_digest(submitted, _CSRF):
-                self._reject(403, "페이지를 새로고침한 뒤 다시 시도하세요")
+                self._reject(403, "Please refresh the page and try again")
                 return False
             return True
 
@@ -177,7 +182,7 @@ def _make_handler_class() -> type:
             try:
                 info = dict(manager.status_provider() or {})
             except Exception:
-                _LOGGER.exception("status_provider 호출 실패")
+                _LOGGER.exception("status_provider call failed")
                 info = {}
             info["revision"] = settings.revision
             info.setdefault("started_at", manager.started_at)
@@ -224,7 +229,7 @@ def _make_handler_class() -> type:
                         saved = None
                 self._render(200, saved=saved)
             except Exception:
-                _LOGGER.exception("GET / 처리 중 예외 발생")
+                _LOGGER.exception("Exception in GET /")
                 self._send_html(500, self._simple_page("500 Internal Server Error"))
 
         def do_POST(self) -> None:  # noqa: N802
@@ -239,13 +244,13 @@ def _make_handler_class() -> type:
                 else:
                     self._send_html(404, self._simple_page("404 Not Found"))
             except Exception:
-                _LOGGER.exception("POST 처리 중 예외 발생")
+                _LOGGER.exception("Exception in POST handler")
                 self._send_html(500, self._simple_page("500 Internal Server Error"))
 
         def _method_not_allowed(self) -> None:
             if not self._security_gate():
                 return
-            self._send_html(405, self._simple_page("허용되지 않은 메서드입니다"))
+            self._send_html(405, self._simple_page("Method not allowed"))
 
         do_HEAD = _method_not_allowed  # noqa: N815
         do_PUT = _method_not_allowed  # noqa: N815
@@ -286,7 +291,7 @@ def _make_handler_class() -> type:
             if "ALLOWED_USER_ID" in changes:
                 confirm_raw = form.get("confirm.ALLOWED_USER_ID", [""])[0].strip().lower()
                 if confirm_raw not in ("on", "1", "true", "yes"):
-                    errors["ALLOWED_USER_ID"] = "변경을 확인하는 체크박스를 선택해야 합니다"
+                    errors["ALLOWED_USER_ID"] = "You must check the confirmation checkbox to change this"
 
             if errors:
                 self._render(400, errors=errors, submitted=submitted)
@@ -305,7 +310,7 @@ def _make_handler_class() -> type:
                 info = telegram_client.get_me()
                 if info.get("ok"):
                     username = info.get("result", {}).get("username") or "?"
-                    _notice = "새 봇: @{} — 다른 봇이면 /start 대화가 필요합니다".format(username)
+                    _notice = "New bot: @{} — if this is a different bot, you may need to /start a conversation".format(username)
 
             self._send_redirect("/?saved={}".format(len(result.applied)))
 
@@ -320,7 +325,7 @@ def _make_handler_class() -> type:
 
             key = form.get("key", [""])[0].strip().upper()
             if not key:
-                self._send_html(400, self._simple_page("key가 필요합니다"))
+                self._send_html(400, self._simple_page("key is required"))
                 return
 
             if key == "ALLOWED_USER_ID":
@@ -371,7 +376,7 @@ class WebServerManager:
             try:
                 candidate = int(new_port)
             except (TypeError, ValueError):
-                raise ValueError("포트 값이 올바르지 않습니다")
+                raise ValueError("Invalid port value")
             if self._port is not None and candidate == self._port:
                 # Re-affirming the port we are already bound to (e.g. the
                 # system-actor rollback after a failed port switch, below) —
@@ -383,7 +388,7 @@ class WebServerManager:
             try:
                 probe.bind((_BIND_ADDR, candidate))
             except OSError:
-                raise ValueError("포트 사용 중: {}".format(candidate))
+                raise ValueError("Port in use: {}".format(candidate))
             finally:
                 probe.close()
 
@@ -406,20 +411,20 @@ class WebServerManager:
                 try:
                     telegram_client.send_message(
                         old_id,
-                        "⚠️ 허용 사용자가 로컬 웹에서 변경되었습니다. 이 계정의 명령은 이제 거부됩니다.",
+                        "⚠️ Allowed user was changed via the local web UI. Commands from this account will now be rejected.",
                         parse_mode=None,
                     )
                 except Exception:
-                    _LOGGER.exception("ALLOWED_USER_ID 변경 알림(기존 계정) 실패")
+                    _LOGGER.exception("Failed to notify old ALLOWED_USER_ID account")
             if new_id is not None:
                 try:
                     telegram_client.send_message(
                         new_id,
-                        "✅ 이 계정이 허용 사용자로 지정되었습니다.",
+                        "✅ This account has been set as the allowed user.",
                         parse_mode=None,
                     )
                 except Exception:
-                    _LOGGER.exception("ALLOWED_USER_ID 변경 알림(신규 계정) 실패")
+                    _LOGGER.exception("Failed to notify new ALLOWED_USER_ID account")
 
         threading.Thread(target=worker, name="web-notify-allowed-user", daemon=True).start()
 
@@ -440,7 +445,7 @@ class WebServerManager:
         try:
             httpd = http.server.HTTPServer((_BIND_ADDR, port), handler_cls)
         except OSError as exc:
-            _LOGGER.error("웹 서버 기동 실패 port=%s error=%s", port, exc)
+            _LOGGER.error("Web server failed to start port=%s error=%s", port, exc)
             return
 
         thread = threading.Thread(
@@ -454,7 +459,7 @@ class WebServerManager:
         self._thread = thread
         self._port = port
         self._started_at = time.time()
-        _LOGGER.info("웹 서버 기동: http://127.0.0.1:%s/", port)
+        _LOGGER.info("Web server started: http://127.0.0.1:%s/", port)
 
     def _stop_locked(self) -> Optional[threading.Thread]:
         httpd = self._httpd
@@ -473,11 +478,11 @@ class WebServerManager:
                 httpd.shutdown()
                 httpd.server_close()
             except Exception:
-                _LOGGER.exception("웹 서버 종료 중 예외 발생")
+                _LOGGER.exception("Exception shutting down web server")
 
         worker_thread = threading.Thread(target=shutdown_worker, name="web-shutdown", daemon=True)
         worker_thread.start()
-        _LOGGER.info("웹 서버 종료 요청")
+        _LOGGER.info("Web server shutdown requested")
         return worker_thread
 
     def _on_port_change(self, new_port: Any) -> None:
@@ -503,7 +508,7 @@ class WebServerManager:
             try:
                 new_httpd = http.server.HTTPServer((_BIND_ADDR, new_port), handler_cls)
             except OSError as exc:
-                _LOGGER.error("새 포트 바인드 실패, 롤백합니다: port=%s error=%s", new_port, exc)
+                _LOGGER.error("Failed to bind new port, rolling back: port=%s error=%s", new_port, exc)
                 if old_port is not None:
                     settings.update({"WEB_PORT": old_port}, actor="system")
                 return
@@ -520,14 +525,14 @@ class WebServerManager:
                 self._thread = new_thread
                 self._port = new_port
                 self._started_at = time.time()
-            _LOGGER.info("웹 서버 포트 전환 완료: %s", new_port)
+            _LOGGER.info("Web server port switch complete: %s", new_port)
 
             if old_httpd is not None:
                 try:
                     old_httpd.shutdown()
                     old_httpd.server_close()
                 except Exception:
-                    _LOGGER.exception("이전 웹 서버 종료 중 예외 발생")
+                    _LOGGER.exception("Exception shutting down old web server")
 
         threading.Thread(target=worker, name="web-port-change", daemon=True).start()
 

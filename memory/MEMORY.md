@@ -7,4 +7,4 @@
 `grep -ri "<키워드>" memory/`로 검색해야 한다.
 
 - 에이전트 이름은 Shellie이다.
-- 답변은 한국어로 한다.
+- Reply in English.

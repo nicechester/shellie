@@ -28,10 +28,10 @@ _TEXTAREA_KEYS = ("SYSTEM_PROMPT",)
 _BOOL_KEYS = ("WEB_ENABLED",)
 
 _SOURCE_LABELS = {
-    "default": "기본값",
+    "default": "default",
     "env": "env",
     "override": "override",
-    "없음": "없음",
+    "none": "none",
 }
 
 _STYLE = """
@@ -81,19 +81,19 @@ def render(
     status = status or {}
 
     parts: List[str] = []
-    parts.append('<!doctype html><html lang="ko"><head><meta charset="utf-8">')
-    parts.append("<title>Shellie 설정</title>")
+    parts.append('<!doctype html><html lang="en"><head><meta charset="utf-8">')
+    parts.append("<title>Shellie Settings</title>")
     parts.append(_STYLE)
     parts.append("</head><body>")
-    parts.append("<h1>Shellie 설정</h1>")
+    parts.append("<h1>Shellie Settings</h1>")
 
     if status.get("setup_required"):
         parts.append(
-            '<div class="banner banner-setup">⚙️ 설정 필요 모드: 필수값을 입력하면 자동으로 시작됩니다</div>'
+            '<div class="banner banner-setup">⚙️ Setup required: enter the required values to start automatically</div>'
         )
     if saved is not None:
         parts.append(
-            '<div class="banner banner-saved">저장됨: {}개 변경</div>'.format(
+            '<div class="banner banner-saved">Saved: {} change(s)</div>'.format(
                 html.escape(str(saved), quote=True)
             )
         )
@@ -110,8 +110,8 @@ def render(
     field_errors = {k: v for k, v in errors.items() if not k.startswith("_")}
     if field_errors:
         parts.append(
-            '<div class="banner banner-error">입력을 확인하세요: {}개 항목에 오류가 있습니다. '
-            "아무 항목도 저장되지 않았습니다.</div>".format(len(field_errors))
+            '<div class="banner banner-error">Please check your input: {} field(s) have errors. '
+            "Nothing was saved.</div>".format(len(field_errors))
         )
 
     parts.append('<form method="post" action="/settings">')
@@ -120,7 +120,7 @@ def render(
     for row in rows:
         parts.append(_render_row(row, field_errors.get(row["key"]), submitted.get(row["key"])))
 
-    parts.append('<div class="save-bar"><button type="submit">저장</button></div>')
+    parts.append('<div class="save-bar"><button type="submit">Save</button></div>')
     parts.append("</form>")
 
     parts.append("<footer>")
@@ -130,13 +130,13 @@ def render(
         started_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started_at))
     else:
         started_text = "-"
-    parts.append("기동 시각: {} · ".format(html.escape(started_text, quote=True)))
+    parts.append("Started: {} · ".format(html.escape(started_text, quote=True)))
     polling = status.get("polling")
     if polling is None:
         polling_text = "-"
     else:
-        polling_text = "폴링 중" if polling else "중지됨"
-    parts.append("폴링 상태: {}".format(html.escape(polling_text, quote=True)))
+        polling_text = "polling" if polling else "stopped"
+    parts.append("Polling: {}".format(html.escape(polling_text, quote=True)))
     parts.append("</footer>")
 
     parts.append("</body></html>")
@@ -167,8 +167,8 @@ def _render_row(
         out.append(
             '<input type="password" id="{0}" name="{0}" value="" autocomplete="off">'.format(field_id)
         )
-        hint = current_value if current_value else "(미설정)"
-        out.append('<div class="meta">현재: {}</div>'.format(html.escape(hint, quote=True)))
+        hint = current_value if current_value else "(not set)"
+        out.append('<div class="meta">current: {}</div>'.format(html.escape(hint, quote=True)))
     elif key in _TEXTAREA_KEYS:
         out.append(
             '<textarea id="{0}" name="{0}">{1}</textarea>'.format(
@@ -176,10 +176,10 @@ def _render_row(
             )
         )
     elif key in _BOOL_KEYS:
-        current_on = current_value.strip().lower() in ("true", "on", "1", "yes", "켜기")
+        current_on = current_value.strip().lower() in ("true", "on", "1", "yes")
         selected_value = submitted_value if submitted_value is not None else ("on" if current_on else "off")
         out.append('<select id="{0}" name="{0}">'.format(field_id))
-        for opt_value, opt_label in (("on", "켜기"), ("off", "끄기")):
+        for opt_value, opt_label in (("on", "On"), ("off", "Off")):
             selected_attr = " selected" if opt_value == selected_value else ""
             out.append('<option value="{0}"{1}>{2}</option>'.format(opt_value, selected_attr, opt_label))
         out.append("</select>")
@@ -210,20 +210,20 @@ def _render_row(
         out.append('<div class="checkbox-row">')
         out.append('<input type="checkbox" id="{0}" name="{0}" value="on">'.format(confirm_id))
         out.append(
-            '<label for="{0}">변경을 확인합니다 (기존·새 계정에 알림이 갑니다)</label>'.format(confirm_id)
+            '<label for="{0}">I confirm this change (both old and new accounts will be notified)</label>'.format(confirm_id)
         )
         out.append("</div>")
 
     if key == "WEB_ENABLED":
         out.append(
-            '<div class="meta">끄면 텔레그램 /set WEB_ENABLED on 으로만 다시 켤 수 있습니다</div>'
+            '<div class="meta">If disabled, you can only re-enable it via Telegram /set WEB_ENABLED on</div>'
         )
 
     badges = '<span class="badge">{}</span>'.format(html.escape(source_label, quote=True))
     if not row["telegram_editable"]:
-        badges += '<span class="badge">🔒웹 전용</span>'
+        badges += '<span class="badge">🔒web-only</span>'
     out.append(
-        '<div class="meta">{} 적용: {}</div>'.format(badges, html.escape(row["apply_timing"], quote=True))
+        '<div class="meta">{} apply: {}</div>'.format(badges, html.escape(row["apply_timing"], quote=True))
     )
     if row["constraint"]:
         out.append('<div class="meta">{}</div>'.format(html.escape(row["constraint"], quote=True)))
@@ -239,7 +239,7 @@ def _render_row(
         out.append('<div class="row-actions">')
         out.append(
             '<button type="submit" formaction="/unset" formmethod="post" '
-            'name="key" value="{}">기본값으로</button>'.format(html.escape(key, quote=True))
+            'name="key" value="{}">Reset to default</button>'.format(html.escape(key, quote=True))
         )
         out.append("</div>")
 

@@ -94,7 +94,7 @@ class ExecuteShellUnresolvableShellTests(unittest.TestCase):
                 "SHELL_PATH": "/opt/does/not/exist",
             }.get(key)
             result = shell.execute_shell("echo hi")
-        self.assertIn("설정된 셸을 찾을 수 없음", result)
+        self.assertIn("Configured shell not found", result)
         self.assertIn("/opt/does/not/exist", result)
 
 
@@ -143,15 +143,15 @@ class ExecuteShellRealExecutionTests(unittest.TestCase):
 
     def test_empty_output_message(self) -> None:
         result = shell.execute_shell("true")
-        self.assertIn("성공적으로 실행되었습니다", result)
+        self.assertIn("Executed successfully", result)
 
     def test_truncation_applies_configured_limit(self) -> None:
         self.mock_settings.get.side_effect = _settings_get_factory({"SHELL_OUTPUT_LIMIT": 200})
         # Build a 300-char output using only shell builtins and printf (POSIX-portable).
         long_output_cmd = "i=0; while [ $i -lt 300 ]; do printf X; i=$((i+1)); done"
         result = shell.execute_shell(long_output_cmd)
-        self.assertLessEqual(len(result.split("... (")[0]), 200)
-        self.assertIn("잘림", result)
+        self.assertLessEqual(len(result[:result.index("\n...")]), 200)
+        self.assertIn("truncated", result)
 
     def test_secret_env_vars_removed_from_child(self) -> None:
         with mock.patch.dict(
@@ -181,7 +181,7 @@ class ExecuteShellTimeoutTests(unittest.TestCase):
         result = shell.execute_shell("sleep 30 & sleep 30 & wait")
         elapsed = time.time() - start
 
-        self.assertIn("시간 초과", result)
+        self.assertIn("timed out", result)
         # Should return well before the grandchildren's own 30s sleep would finish.
         self.assertLess(elapsed, 6.0)
 

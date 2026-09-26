@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import logging
 import os
+import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -16,6 +17,11 @@ _LOGGER = logging.getLogger("shellie.gemini")
 _GEMINI_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent"
 
 _FALLBACK_5XX = (500, 502, 503, 504)
+
+# Cap for a single cooldown sleep between whole-chain retry passes.
+_MAX_COOLDOWN_SEC = 300
+
+_RETRY_DELAY_MESSAGE_RE = re.compile(r"retry in ([\d.]+)s", re.IGNORECASE)
 
 
 class ToolEntry:
@@ -40,7 +46,7 @@ class ToolEntry:
 
 def _execute_shell_declaration() -> Dict[str, Any]:
     env = shell.execution_environment()
-    description = "{}({})의 {}에서 셸 명령어를 실행합니다. 파일 관리, 스크립트 실행 등이 가능합니다.".format(
+    description = "Runs a shell command on {}({}) in {}. Supports file management, script execution, etc.".format(
         env["os"], env["arch"], env["shell"]
     )
     return {
@@ -49,7 +55,7 @@ def _execute_shell_declaration() -> Dict[str, Any]:
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "command": {"type": "STRING", "description": "실행할 셸 명령어"},
+                "command": {"type": "STRING", "description": "Shell command to execute"},
             },
             "required": ["command"],
         },
@@ -63,11 +69,11 @@ def _execute_shell_run(args: Dict[str, Any]) -> str:
 def _append_memory_declaration() -> Dict[str, Any]:
     return {
         "name": "append_memory",
-        "description": "중요한 규칙이나 사용자 개인화 정보를 MEMORY.md에 저장합니다.",
+        "description": "Saves important rules or user personalization info to MEMORY.md.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "content": {"type": "STRING", "description": "기억할 핵심 요약 내용"},
+                "content": {"type": "STRING", "description": "Key summary to remember"},
             },
             "required": ["content"],
         },
@@ -99,7 +105,7 @@ def build_tools_schema() -> List[Dict[str, Any]]:
     try:
         declarations.extend(mcp.tool_declarations())
     except Exception:
-        _LOGGER.exception("MCP 툴 선언 생성 중 예외 발생, 기본 툴만 사용합니다")
+        _LOGGER.exception("Exception building MCP tool declarations, using built-in tools only")
     return [{"functionDeclarations": declarations}]
 
 
@@ -154,18 +160,18 @@ def list_skills() -> str:
 
 def build_system_instruction() -> Dict[str, Any]:
     text = settings.get("SYSTEM_PROMPT")
-    text += "\n\n[장기 기억]\n" + read_memory()
-    text += '\n(오래된 기억 검색: 셸에서 grep -ri "<키워드>" memory/ 실행)'
+    text += "\n\n[long-term memory]\n" + read_memory()
+    text += '\n(search older memories: run grep -ri "<keyword>" memory/ in the shell)'
 
     skills_text = list_skills()
     if skills_text:
         text += (
-            "\n\n[스킬 목록] (.py: python3 skills/<이름>.py 로 실행 / "
-            ".md: cat skills/<이름>.md 로 전문을 읽고 그 절차를 따르세요)\n" + skills_text
+            "\n\n[skills] (.py: run with python3 skills/<name>.py / "
+            ".md: read full text with cat skills/<name>.md and follow the procedure)\n" + skills_text
         )
 
     env = shell.execution_environment()
-    text += "\n\n[실행 환경]\nOS: {} / 아키텍처: {} / 셸: {} / 작업 디렉터리: {}".format(
+    text += "\n\n[execution environment]\nOS: {} / arch: {} / shell: {} / cwd: {}".format(
         env["os"], env["arch"], env["shell"], env["cwd"]
     )
     return {"parts": [{"text": text}]}
@@ -196,19 +202,77 @@ def _fallback_reason(status: int, res: Dict[str, Any]) -> str:
     if status == 429:
         return "429"
     if status == 0:
-        return "전송 오류"
+        return "transport error"
     if status in _FALLBACK_5XX:
         return "HTTP {}".format(status)
     if _error_status(res) == "RESOURCE_EXHAUSTED":
         return "RESOURCE_EXHAUSTED"
-    return "알 수 없는 오류"
+    return "unknown error"
 
 
-def call_gemini(contents: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], str]:
+def _parse_retry_delay(res: Dict[str, Any]) -> Optional[float]:
+    """Best-effort extraction of a server-suggested retry delay (seconds) from
+    a Gemini 429 error body. Fully defensive: never raises, returns None if
+    nothing parseable.
+    """
+    try:
+        error = res.get("error") if isinstance(res, dict) else None
+        if not isinstance(error, dict):
+            return None
+
+        details = error.get("details")
+        if isinstance(details, list):
+            for detail in details:
+                if not isinstance(detail, dict):
+                    continue
+                type_name = detail.get("@type")
+                if isinstance(type_name, str) and type_name.endswith("RetryInfo"):
+                    retry_delay = detail.get("retryDelay")
+                    if isinstance(retry_delay, str) and retry_delay.endswith("s"):
+                        try:
+                            return float(retry_delay[:-1])
+                        except ValueError:
+                            pass
+
+        message = error.get("message")
+        if isinstance(message, str):
+            match = _RETRY_DELAY_MESSAGE_RE.search(message)
+            if match:
+                try:
+                    return float(match.group(1))
+                except ValueError:
+                    pass
+    except Exception:
+        return None
+    return None
+
+
+def call_gemini(
+    contents: List[Dict[str, Any]],
+    on_cooldown: Optional[Callable[[int, int, float], None]] = None,
+) -> Tuple[Dict[str, Any], str]:
+    """Call the Gemini model chain, retrying the whole chain with a cooldown
+    on rate limit / transient errors.
+
+    Settings (chain, key, timeout, inter-model fallback delay, retry base
+    delay, max retries) are snapshotted once at the top of the call; the
+    snapshot covers the whole call including all retry passes. If every
+    model in the chain fails with a fallback-eligible status (429/5xx/
+    transport/RESOURCE_EXHAUSTED), the whole chain is retried up to
+    GEMINI_MAX_RETRIES times, sleeping a cooldown between passes: the
+    largest server-suggested retry delay seen in the pass (if any),
+    otherwise exponential backoff from GEMINI_RETRY_BASE_DELAY_SEC, capped
+    at _MAX_COOLDOWN_SEC. Non-fallback statuses (e.g. 400/401/403) raise
+    immediately without any retry. `on_cooldown(attempt, max_retries, delay)`
+    is invoked (best-effort, exceptions swallowed) right before each
+    cooldown sleep, so callers can notify the user.
+    """
     chain = settings.get("GEMINI_MODEL_CHAIN")
     key = settings.get("GEMINI_API_KEY")
     timeout = settings.get("GEMINI_TIMEOUT_SEC")
     delay = settings.get("GEMINI_FALLBACK_DELAY_SEC")
+    base_delay = settings.get("GEMINI_RETRY_BASE_DELAY_SEC")
+    max_retries = settings.get("GEMINI_MAX_RETRIES")
 
     payload = {
         "contents": contents,
@@ -216,24 +280,47 @@ def call_gemini(contents: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], str]:
         "tools": build_tools_schema(),
     }
 
-    for model in chain:
-        url = _GEMINI_URL_TEMPLATE.format(model)
-        headers = {"x-goog-api-key": key}
-        res, status = http_post(url, payload, headers=headers, timeout=timeout)
+    for attempt in range(max_retries + 1):
+        hinted_delay: Optional[float] = None
 
-        if status == 200:
-            return res, model
+        for index, model in enumerate(chain):
+            url = _GEMINI_URL_TEMPLATE.format(model)
+            headers = {"x-goog-api-key": key}
+            res, status = http_post(url, payload, headers=headers, timeout=timeout)
 
-        if _should_fallback(status, res):
-            _LOGGER.warning(
-                "Gemini 모델 %s 호출 실패(%s), 다음 모델로 전환", model, _fallback_reason(status, res)
-            )
-            time.sleep(delay)
-            continue
+            if status == 200:
+                return res, model
 
-        raise Exception("Gemini API 호출 실패 (모델={}, status={})".format(model, status))
+            if _should_fallback(status, res):
+                _LOGGER.warning(
+                    "Gemini model %s call failed (%s), switching to next model", model, _fallback_reason(status, res)
+                )
+                parsed_delay = _parse_retry_delay(res)
+                if parsed_delay is not None and (hinted_delay is None or parsed_delay > hinted_delay):
+                    hinted_delay = parsed_delay
+                if index < len(chain) - 1:
+                    time.sleep(delay)
+                continue
 
-    raise Exception("모든 Gemini 모델 호출에 실패했습니다 (rate limit 또는 일시 오류).")
+            raise Exception("Gemini API call failed (model={}, status={})".format(model, status))
+
+        if attempt == max_retries:
+            raise Exception("All Gemini models failed (rate limit or transient error).")
+
+        cooldown = min(max(hinted_delay or 0, base_delay * (2 ** attempt)), _MAX_COOLDOWN_SEC)
+        from_server_hint = hinted_delay is not None and cooldown == hinted_delay
+        _LOGGER.warning(
+            "All Gemini models failed on attempt %d/%d, cooling down %.1fs before retry (source=%s)",
+            attempt + 1, max_retries + 1, cooldown, "server hint" if from_server_hint else "exponential backoff",
+        )
+        if on_cooldown is not None:
+            try:
+                on_cooldown(attempt + 1, max_retries, cooldown)
+            except Exception:
+                _LOGGER.debug("on_cooldown callback raised, ignoring", exc_info=True)
+        time.sleep(cooldown)
+
+    raise Exception("All Gemini models failed (rate limit or transient error).")
 
 
 class ParsedReply:

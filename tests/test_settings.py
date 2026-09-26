@@ -82,6 +82,12 @@ class TestLayerPrecedence(_SettingsTestCase):
         with self.assertRaises(KeyError):
             store.get("TOTALLY_UNKNOWN_ENV_KEY")
 
+    def test_gemini_retry_settings_defaults(self):
+        store, missing = self._new_store()
+        self.assertEqual(missing, [])
+        self.assertEqual(store.get("GEMINI_RETRY_BASE_DELAY_SEC"), 60)
+        self.assertEqual(store.get("GEMINI_MAX_RETRIES"), 2)
+
 
 class TestInvalidValues(_SettingsTestCase):
     def test_invalid_env_value_is_warned_and_falls_back_to_default(self):
@@ -112,6 +118,26 @@ class TestBoundaryValidation(_SettingsTestCase):
                     with self.assertRaises(ValueError):
                         parser(raw)
 
+    def test_gemini_retry_base_delay_sec_boundaries(self):
+        parser = _CATALOG_BY_KEY["GEMINI_RETRY_BASE_DELAY_SEC"].parser
+        for raw, expect_ok in (("4", False), ("5", True), ("300", True), ("301", False)):
+            with self.subTest(raw=raw):
+                if expect_ok:
+                    self.assertEqual(parser(raw), int(raw))
+                else:
+                    with self.assertRaises(ValueError):
+                        parser(raw)
+
+    def test_gemini_max_retries_boundaries(self):
+        parser = _CATALOG_BY_KEY["GEMINI_MAX_RETRIES"].parser
+        for raw, expect_ok in (("-1", False), ("0", True), ("5", True), ("6", False)):
+            with self.subTest(raw=raw):
+                if expect_ok:
+                    self.assertEqual(parser(raw), int(raw))
+                else:
+                    with self.assertRaises(ValueError):
+                        parser(raw)
+
     def test_gemini_model_chain_valid(self):
         parser = _CATALOG_BY_KEY["GEMINI_MODEL_CHAIN"].parser
         self.assertEqual(
@@ -134,12 +160,41 @@ class TestBoundaryValidation(_SettingsTestCase):
         with self.assertRaises(ValueError):
             parser("gemini-2.5-flash,")
 
+    def test_gemini_api_key_accepts_dotted_format(self):
+        parser = _CATALOG_BY_KEY["GEMINI_API_KEY"].parser
+        # Accept newer Google API key format with dots
+        self.assertEqual(parser("AQ.fake_test_key_1234567890abcdef"), "AQ.fake_test_key_1234567890abcdef")
+
+    def test_gemini_api_key_accepts_traditional_format(self):
+        parser = _CATALOG_BY_KEY["GEMINI_API_KEY"].parser
+        # Accept traditional format without dots
+        self.assertEqual(parser("A" * 40), "A" * 40)
+
+    def test_gemini_api_key_rejects_disallowed_characters(self):
+        parser = _CATALOG_BY_KEY["GEMINI_API_KEY"].parser
+        # Reject space
+        with self.assertRaises(ValueError):
+            parser("AQ.fake test key")
+        # Reject colon
+        with self.assertRaises(ValueError):
+            parser("AQ:fake_test_key_1234567890abcdef")
+
+    def test_gemini_api_key_rejects_too_short(self):
+        parser = _CATALOG_BY_KEY["GEMINI_API_KEY"].parser
+        with self.assertRaises(ValueError):
+            parser("A" * 19)
+
+    def test_gemini_api_key_rejects_too_long(self):
+        parser = _CATALOG_BY_KEY["GEMINI_API_KEY"].parser
+        with self.assertRaises(ValueError):
+            parser("A" * 129)
+
     def test_bool_parser_accepts_known_forms(self):
         parser = _CATALOG_BY_KEY["WEB_ENABLED"].parser
-        for raw in ("true", "on", "1", "켜기", "yes", "TRUE", "On"):
+        for raw in ("true", "on", "1", "yes", "TRUE", "On"):
             with self.subTest(raw=raw):
                 self.assertIs(parser(raw), True)
-        for raw in ("false", "off", "0", "끄기", "no", "FALSE"):
+        for raw in ("false", "off", "0", "no", "FALSE"):
             with self.subTest(raw=raw):
                 self.assertIs(parser(raw), False)
         with self.assertRaises(ValueError):

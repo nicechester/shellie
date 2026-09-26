@@ -7,7 +7,7 @@ import os
 import re
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from src.agent.config import settings
 from src.agent.core.gemini import call_gemini, parse_response, run_tool
@@ -55,7 +55,7 @@ def process_update(update: Dict[str, Any]) -> None:
 
     allowed = settings.get("ALLOWED_USER_ID")
     if allowed is None or user_id != allowed:
-        _LOGGER.warning("미허가 접근: user_id=%s", user_id)
+        _LOGGER.warning("Unauthorized access: user_id=%s", user_id)
         return
 
     if _handle_settings_command(chat_id, message_id, text):
@@ -91,7 +91,7 @@ def _settings_listing_text() -> str:
         value = row["value"]
         if len(value) > 60:
             value = value[:60] + "…"
-        marker = " [🔒웹 전용]" if not row["telegram_editable"] else ""
+        marker = " [🔒web-only]" if not row["telegram_editable"] else ""
         lines.append(
             "{} = {} [{}]{} ({})".format(
                 row["key"], value, row["source"], marker, row["apply_timing"]
@@ -104,10 +104,10 @@ def _settings_listing_text() -> str:
 def _unknown_key_reply(key: str, known_keys: List[str]) -> str:
     suggestion = difflib.get_close_matches(key, known_keys, n=1)
     if suggestion:
-        return "❓ 알 수 없는 키: {}. 혹시 {}? /settings로 목록을 확인하세요.".format(
+        return "❓ Unknown key: {}. Did you mean {}? Use /settings to list all keys.".format(
             _esc(key), _esc(suggestion[0])
         )
-    return "❓ 알 수 없는 키: {}. /settings로 목록을 확인하세요.".format(_esc(key))
+    return "❓ Unknown key: {}. Use /settings to list all keys.".format(_esc(key))
 
 
 def _get_key_detail(key: str) -> str:
@@ -115,16 +115,16 @@ def _get_key_detail(key: str) -> str:
     if key not in rows:
         return _unknown_key_reply(key, list(rows.keys()))
     row = rows[key]
-    lock_note = "가능" if row["telegram_editable"] else "🔒 웹에서만 수정 가능"
+    lock_note = "allowed" if row["telegram_editable"] else "🔒 web UI only"
     lines = [
         "<b>{}</b>".format(key),
-        "현재값: {}".format(_esc(row["value"])),
-        "출처: {}".format(_esc(row["source"])),
-        "기본값: {}".format(_esc(row["default"])),
-        "제약: {}".format(_esc(row["constraint"])),
-        "적용 시점: {}".format(_esc(row["apply_timing"])),
-        "설명: {}".format(_esc(row["description"])),
-        "Telegram 수정: {}".format(lock_note),
+        "value: {}".format(_esc(row["value"])),
+        "source: {}".format(_esc(row["source"])),
+        "default: {}".format(_esc(row["default"])),
+        "constraint: {}".format(_esc(row["constraint"])),
+        "apply timing: {}".format(_esc(row["apply_timing"])),
+        "description: {}".format(_esc(row["description"])),
+        "Telegram editable: {}".format(lock_note),
     ]
     return "\n".join(lines)
 
@@ -132,43 +132,43 @@ def _get_key_detail(key: str) -> str:
 def _set_usage_reply() -> str:
     keys = [row["key"] for row in settings.rows(mask=False) if row["telegram_editable"]]
     return (
-        "사용법: /set KEY VALUE (빈 값은 허용되지 않습니다. 기본값 복원은 /unset KEY)\n"
-        "수정 가능한 키: {}".format(_esc(", ".join(keys)))
+        "Usage: /set KEY VALUE (empty value not allowed; restore default with /unset KEY)\n"
+        "Editable keys: {}".format(_esc(", ".join(keys)))
     )
 
 
 def _blocked_key_reply(chat_id: int, message_id: Optional[int], key: str, secret: bool) -> str:
     port = settings.get("WEB_PORT")
-    reply = "🔒 {}는 보안상 로컬 웹(http://127.0.0.1:{}/)에서만 변경할 수 있습니다.".format(key, port)
+    reply = "🔒 {} can only be changed via the local web UI (http://127.0.0.1:{}/) for security.".format(key, port)
     if secret:
         if message_id is not None:
             delete_message(chat_id, message_id)
-        reply += " 메시지 삭제를 시도했습니다. 비밀값이 대화에 남았을 수 있으니 키 재발급을 권장합니다."
+        reply += " Attempted to delete the message. The secret may still be visible in chat history — consider rotating it."
     return reply
 
 
 def _format_update_result(key: str, result: Any) -> str:
     if not result.ok:
         if "_persist" in result.errors:
-            return "❌ 저장 실패, 변경이 적용되지 않았습니다."
-        return "⚠️ {}: {}".format(key, _esc(result.errors.get(key, "알 수 없는 오류")))
+            return "❌ Save failed, no changes applied."
+        return "⚠️ {}: {}".format(key, _esc(result.errors.get(key, "unknown error")))
     if not result.applied:
-        return "ℹ️ 변경 없음 (이미 같은 값)"
+        return "ℹ️ No change (already the same value)"
     old_val, new_val = result.changes[key]
     apply_timing = _row_map()[key]["apply_timing"]
-    return "✅ {}: {} → {} (적용: {})".format(key, _esc(old_val), _esc(new_val), _esc(apply_timing))
+    return "✅ {}: {} → {} (apply: {})".format(key, _esc(old_val), _esc(new_val), _esc(apply_timing))
 
 
 def _format_unset_result(key: str, result: Any) -> str:
     if not result.ok:
         if "_persist" in result.errors:
-            return "❌ 저장 실패, 변경이 적용되지 않았습니다."
-        return "⚠️ {}: {}".format(key, _esc(result.errors.get(key, "알 수 없는 오류")))
+            return "❌ Save failed, no changes applied."
+        return "⚠️ {}: {}".format(key, _esc(result.errors.get(key, "unknown error")))
     if not result.applied:
-        return "ℹ️ 변경 없음 (override가 이미 없습니다)"
+        return "ℹ️ No change (no override was set)"
     _, new_val = result.changes[key]
     source = _row_map()[key]["source"]
-    return "✅ {}: override 제거됨 → {} ({})".format(key, _esc(new_val), _esc(source))
+    return "✅ {}: override removed → {} ({})".format(key, _esc(new_val), _esc(source))
 
 
 def _handle_set(chat_id: int, message_id: Optional[int], key: str, value: str) -> str:
@@ -182,7 +182,7 @@ def _handle_set(chat_id: int, message_id: Optional[int], key: str, value: str) -
     if not value:
         return _set_usage_reply()
     if "\n" in value and key != "SYSTEM_PROMPT":
-        return "⚠️ {}: 값에 줄바꿈을 넣을 수 없습니다".format(key)
+        return "⚠️ {}: value cannot contain newlines".format(key)
     result = settings.update({key: value}, actor="telegram")
     return _format_update_result(key, result)
 
@@ -231,7 +231,7 @@ def _handle_settings_command(chat_id: int, message_id: Optional[int], text: str)
         rest = text.split(None, 1)
         key = rest[1].split()[0] if len(rest) > 1 and rest[1].strip() else ""
         if not key:
-            send_message(chat_id, "사용법: /unset KEY")
+            send_message(chat_id, "Usage: /unset KEY")
             return True
         send_message(chat_id, _handle_unset(chat_id, message_id, key.strip().upper()))
         return True
@@ -256,8 +256,8 @@ def _handle_restart(chat_id: int) -> None:
     has_launchd = xpc not in (None, "", "0")
     prefix = ""
     if not (has_systemd or has_launchd):
-        prefix = "⚠️ 서비스 관리자 없이 실행 중입니다. 자동으로 재시작되지 않습니다.\n"
-    send_message(chat_id, prefix + "🔄 프로세스를 종료합니다. 서비스 관리자가 재시동합니다...")
+        prefix = "⚠️ Running without a service manager. Will not restart automatically.\n"
+    send_message(chat_id, prefix + "🔄 Shutting down process. Service manager will restart it...")
     sys.exit(0)
 
 
@@ -274,7 +274,7 @@ def _handle_bypass_command(chat_id: int, text: str) -> bool:
         parts = text.split(None, 1)
         shell_cmd = parts[1] if len(parts) > 1 else ""
         if not shell_cmd.strip():
-            send_message(chat_id, "사용법: /sh <명령어>")
+            send_message(chat_id, "Usage: /sh <command>")
             return True
         _run_shell_bypass(chat_id, shell_cmd)
         return True
@@ -282,13 +282,13 @@ def _handle_bypass_command(chat_id: int, text: str) -> bool:
     if cmd == "/mem":
         send_message(
             chat_id,
-            "🧠 <b>장기 기억 (코어 + 오늘)</b>\n\n<pre>{}</pre>".format(html.escape(read_memory())),
+            "🧠 <b>Long-term memory (core + today)</b>\n\n<pre>{}</pre>".format(html.escape(read_memory())),
         )
         return True
 
     if cmd == "/reset":
         _reset_history()
-        send_message(chat_id, "🔄 대화 맥락을 초기화했습니다.")
+        send_message(chat_id, "🔄 Conversation context cleared.")
         return True
 
     if cmd == "/restart":
@@ -347,6 +347,25 @@ def _trim_history_pairs(context_turns: int) -> None:
         _history = _history[-limit:]
 
 
+def _make_cooldown_notifier(chat_id: int) -> Callable[[int, int, float], None]:
+    """Best-effort Telegram notice sent while call_gemini() is cooling down
+    between whole-chain retry passes. Never recorded into history/context.
+    """
+
+    def _notify(attempt: int, max_retries: int, delay: float) -> None:
+        try:
+            send_message(
+                chat_id,
+                "⏳ Rate limited. Retrying in {}s… ({}/{})".format(
+                    int(delay), attempt, max_retries
+                ),
+            )
+        except Exception:
+            _LOGGER.debug("Failed to send cooldown notice", exc_info=True)
+
+    return _notify
+
+
 def _run_llm_turn(
     chat_id: int,
     contents: List[Dict[str, Any]],
@@ -356,14 +375,15 @@ def _run_llm_turn(
     fc_max_loops = settings.get("FC_MAX_LOOPS")
     loop_count = 0
     last_text = ""
+    on_cooldown = _make_cooldown_notifier(chat_id)
 
     while True:
-        response, _model = call_gemini(contents)
+        response, _model = call_gemini(contents, on_cooldown=on_cooldown)
         parsed = parse_response(response)
 
         if parsed.blocked:
-            reason = parsed.block_reason or "알 수 없음"
-            send_message(chat_id, "⚠️ 응답이 차단되었습니다: {}".format(html.escape(str(reason))))
+            reason = parsed.block_reason or "unknown"
+            send_message(chat_id, "⚠️ Response was blocked: {}".format(html.escape(str(reason))))
             return
 
         if parsed.text:
@@ -371,7 +391,7 @@ def _run_llm_turn(
 
         if parsed.function_calls:
             if loop_count >= fc_max_loops:
-                message = "⚠️ 함수 호출 한도({}회)에 도달했습니다.".format(fc_max_loops)
+                message = "⚠️ Function call limit ({} iterations) reached.".format(fc_max_loops)
                 if last_text:
                     message += "\n" + _markdown_to_html(last_text)
                 send_message(chat_id, message)
@@ -386,9 +406,9 @@ def _run_llm_turn(
             loop_count += 1
             continue
 
-        reply = _markdown_to_html(parsed.text) if parsed.text else "응답이 없습니다."
+        reply = _markdown_to_html(parsed.text) if parsed.text else "No response."
         if parsed.finish_reason == "MAX_TOKENS":
-            reply += "\n\n⚠️ 응답이 최대 토큰 길이에서 잘렸습니다 (MAX_TOKENS)."
+            reply += "\n\n⚠️ Response was truncated at the maximum token limit (MAX_TOKENS)."
         send_message(chat_id, reply)
 
         _history.append(user_turn)
@@ -415,5 +435,5 @@ def _handle_llm(chat_id: int, text: str) -> None:
     try:
         _run_llm_turn(chat_id, contents, user_turn, context_turns)
     except Exception as exc:
-        _LOGGER.exception("LLM 트랙 처리 중 오류")
-        send_message(chat_id, "⚠️ 오류가 발생했습니다: {}".format(html.escape(str(exc))))
+        _LOGGER.exception("Error in LLM track")
+        send_message(chat_id, "⚠️ An error occurred: {}".format(html.escape(str(exc))))

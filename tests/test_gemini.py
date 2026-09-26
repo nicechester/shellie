@@ -14,6 +14,8 @@ def _settings_get(overrides: dict):
         "GEMINI_API_KEY": "test-api-key-1234567890",
         "GEMINI_TIMEOUT_SEC": 30,
         "GEMINI_FALLBACK_DELAY_SEC": 1,
+        "GEMINI_RETRY_BASE_DELAY_SEC": 60,
+        "GEMINI_MAX_RETRIES": 0,
         "SYSTEM_PROMPT": "SYS",
     }
     defaults.update(overrides)
@@ -124,7 +126,7 @@ class CallGeminiFallbackTests(unittest.TestCase):
         with self.assertRaises(Exception) as ctx:
             gemini.call_gemini(self._contents())
 
-        self.assertIn("모든 Gemini 모델", str(ctx.exception))
+        self.assertIn("All Gemini models", str(ctx.exception))
 
     def test_uses_api_key_header_never_in_url(self) -> None:
         res = {"candidates": []}
@@ -147,6 +149,153 @@ class CallGeminiFallbackTests(unittest.TestCase):
         gemini.call_gemini(self._contents())
 
         self.mock_sleep.assert_called_once_with(4)
+
+    def test_retry_after_cooldown_succeeds_on_second_pass(self) -> None:
+        self._configure_settings({
+            "GEMINI_MODEL_CHAIN": ("m1",),
+            "GEMINI_MAX_RETRIES": 1,
+            "GEMINI_RETRY_BASE_DELAY_SEC": 60,
+        })
+        res1 = {"error": {"status": "TOO_MANY"}}
+        res2 = {"candidates": [], "_marker": "second-pass"}
+        self.mock_http_post.side_effect = [(res1, 429), (res2, 200)]
+
+        result, model = gemini.call_gemini(self._contents())
+
+        self.assertEqual(model, "m1")
+        self.assertEqual(result, res2)
+        self.mock_sleep.assert_called_once_with(60)
+
+    def test_server_hint_overrides_exponential_backoff(self) -> None:
+        self._configure_settings({
+            "GEMINI_MODEL_CHAIN": ("m1",),
+            "GEMINI_MAX_RETRIES": 1,
+            "GEMINI_RETRY_BASE_DELAY_SEC": 60,
+        })
+        res1 = {
+            "error": {
+                "status": "TOO_MANY",
+                "details": [{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "90s"}],
+            }
+        }
+        res2 = {"candidates": []}
+        self.mock_http_post.side_effect = [(res1, 429), (res2, 200)]
+
+        gemini.call_gemini(self._contents())
+
+        self.mock_sleep.assert_called_once_with(90.0)
+
+    def test_exponential_backoff_growth_then_raises(self) -> None:
+        self._configure_settings({
+            "GEMINI_MODEL_CHAIN": ("m1",),
+            "GEMINI_MAX_RETRIES": 2,
+            "GEMINI_RETRY_BASE_DELAY_SEC": 60,
+        })
+        res = {"error": {"status": "UNAVAILABLE"}}
+        self.mock_http_post.side_effect = [(res, 503), (res, 503), (res, 503)]
+
+        with self.assertRaises(Exception) as ctx:
+            gemini.call_gemini(self._contents())
+
+        self.assertIn("All Gemini models", str(ctx.exception))
+        self.assertEqual(
+            self.mock_sleep.call_args_list,
+            [mock.call(60), mock.call(120)],
+        )
+
+    def test_cooldown_delay_is_capped(self) -> None:
+        self._configure_settings({
+            "GEMINI_MODEL_CHAIN": ("m1",),
+            "GEMINI_MAX_RETRIES": 2,
+            "GEMINI_RETRY_BASE_DELAY_SEC": 200,
+        })
+        res = {"error": {"status": "TOO_MANY"}}
+        res2 = {"candidates": []}
+        self.mock_http_post.side_effect = [(res, 429), (res, 429), (res2, 200)]
+
+        gemini.call_gemini(self._contents())
+
+        self.assertEqual(
+            self.mock_sleep.call_args_list,
+            [mock.call(200), mock.call(gemini._MAX_COOLDOWN_SEC)],
+        )
+
+    def test_non_fallback_status_raises_without_retry_or_cooldown(self) -> None:
+        self._configure_settings({
+            "GEMINI_MODEL_CHAIN": ("m1",),
+            "GEMINI_MAX_RETRIES": 2,
+        })
+        res = {"error": {"status": "PERMISSION_DENIED", "message": "forbidden"}}
+        self.mock_http_post.side_effect = [(res, 403)]
+
+        with self.assertRaises(Exception):
+            gemini.call_gemini(self._contents())
+
+        self.assertEqual(self.mock_http_post.call_count, 1)
+        self.mock_sleep.assert_not_called()
+
+    def test_on_cooldown_callback_invoked_and_survives_exception(self) -> None:
+        self._configure_settings({
+            "GEMINI_MODEL_CHAIN": ("m1",),
+            "GEMINI_MAX_RETRIES": 1,
+            "GEMINI_RETRY_BASE_DELAY_SEC": 60,
+        })
+        res1 = {"error": {"status": "TOO_MANY"}}
+        res2 = {"candidates": []}
+        self.mock_http_post.side_effect = [(res1, 429), (res2, 200)]
+        on_cooldown = mock.Mock(side_effect=RuntimeError("boom"))
+
+        result, _model = gemini.call_gemini(self._contents(), on_cooldown=on_cooldown)
+
+        on_cooldown.assert_called_once_with(1, 1, 60)
+        self.assertEqual(result, res2)
+
+    def test_no_inter_model_sleep_after_last_model_in_pass(self) -> None:
+        self._configure_settings({
+            "GEMINI_MODEL_CHAIN": ("m1", "m2"),
+            "GEMINI_MAX_RETRIES": 0,
+            "GEMINI_FALLBACK_DELAY_SEC": 4,
+        })
+        res1 = {"error": {"status": "TOO_MANY"}}
+        res2 = {"error": {"status": "TOO_MANY"}}
+        self.mock_http_post.side_effect = [(res1, 429), (res2, 429)]
+
+        with self.assertRaises(Exception):
+            gemini.call_gemini(self._contents())
+
+        self.mock_sleep.assert_called_once_with(4)
+
+
+class ParseRetryDelayTests(unittest.TestCase):
+    """_parse_retry_delay() pure-function behavior; no mocking needed."""
+
+    def test_parses_fractional_seconds_from_retry_info_details(self) -> None:
+        res = {
+            "error": {
+                "details": [{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "18.65s"}],
+            }
+        }
+        self.assertEqual(gemini._parse_retry_delay(res), 18.65)
+
+    def test_parses_integer_seconds_from_retry_info_details(self) -> None:
+        res = {
+            "error": {
+                "details": [{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "18s"}],
+            }
+        }
+        self.assertEqual(gemini._parse_retry_delay(res), 18.0)
+
+    def test_parses_from_message_fallback_when_no_details(self) -> None:
+        res = {"error": {"message": "Quota exceeded. Please retry in 7s."}}
+        self.assertEqual(gemini._parse_retry_delay(res), 7.0)
+
+    def test_returns_none_on_garbage_or_missing_input(self) -> None:
+        self.assertIsNone(gemini._parse_retry_delay({}))
+        self.assertIsNone(gemini._parse_retry_delay({"error": "not-a-dict"}))
+        self.assertIsNone(gemini._parse_retry_delay({"error": {"message": "no delay info here"}}))
+        self.assertIsNone(gemini._parse_retry_delay({"error": {"details": "not-a-list"}}))
+        self.assertIsNone(gemini._parse_retry_delay("not-a-dict"))  # type: ignore[arg-type]
+        self.assertIsNone(gemini._parse_retry_delay(None))  # type: ignore[arg-type]
 
 
 class ParseResponseTests(unittest.TestCase):
@@ -331,10 +480,10 @@ class BuildSystemInstructionTests(unittest.TestCase):
 
         text = instruction["parts"][0]["text"]
         self.assertIn("SYSTEM PROMPT TEXT", text)
-        self.assertIn("[장기 기억]", text)
+        self.assertIn("[long-term memory]", text)
         self.assertIn("MEMCONTENT", text)
-        self.assertIn("[실행 환경]", text)
-        self.assertIn("[스킬 목록]", text)
+        self.assertIn("[execution environment]", text)
+        self.assertIn("[skills]", text)
         self.assertIn("- skills/foo.py: desc", text)
         self.assertIn("cat skills/", text)
 
@@ -351,7 +500,7 @@ class BuildSystemInstructionTests(unittest.TestCase):
             instruction = gemini.build_system_instruction()
 
         text = instruction["parts"][0]["text"]
-        self.assertNotIn("[스킬 목록]", text)
+        self.assertNotIn("[skills]", text)
 
 
 if __name__ == "__main__":
