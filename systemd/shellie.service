@@ -1,0 +1,17 @@
+[Unit]
+Description=Shellie - lightweight Telegram agent
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=%h/shellie
+ExecStart=/usr/bin/python3 -m src.agent
+Environment=PYTHONPATH=.
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=2
+UMask=0077
+
+[Install]
+WantedBy=default.target

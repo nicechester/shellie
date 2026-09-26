@@ -1,0 +1,10 @@
+.env
+*.log
+__pycache__/
+*.pyc
+.update_offset
+.shellie.lock
+.DS_Store
+settings.json
+settings.json.tmp
+settings.json.corrupt-*

@@ -1,0 +1,6 @@
+[project]
+name = "shellie"
+version = "0.1.0"
+description = "Zero-dependency Telegram agent for macOS / Linux / Raspberry Pi (Python standard library only)"
+requires-python = ">=3.8"
+dependencies = []
