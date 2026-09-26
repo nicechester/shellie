@@ -36,7 +36,7 @@ def _acquire_single_instance_lock() -> None:
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (BlockingIOError, OSError):
-        print("다른 인스턴스가 실행 중입니다.")
+        print("Another instance is already running.")
         sys.exit(1)
     _lock_fd = fd
 
@@ -50,7 +50,7 @@ def _handle_termination(signum: int, frame: Any) -> None:
     shell.kill_active()
     manager.stop()
     name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
-    _LOGGER.info("%s 수신, 정상 종료", name)
+    _LOGGER.info("%s received, shutting down cleanly", name)
     sys.exit(0)
 
 
@@ -74,7 +74,7 @@ def _write_offset(value: int) -> None:
             os.fsync(f.fileno())
         os.replace(tmp_path, OFFSET_FILE)
     except OSError:
-        _LOGGER.exception("오프셋 저장 실패")
+        _LOGGER.exception("Failed to save offset")
 
 
 def _handle_token_change() -> bool:
@@ -92,7 +92,7 @@ def _handle_token_change() -> bool:
             new_bot_id = info.get("result", {}).get("id")
             if _bot_id is not None and new_bot_id is not None and new_bot_id != _bot_id:
                 _LOGGER.info(
-                    "봇 토큰 변경 감지(이전 봇 ID=%s, 새 봇 ID=%s), 오프셋을 초기화합니다",
+                    "Bot token change detected (old bot ID=%s, new bot ID=%s), resetting offset",
                     _bot_id, new_bot_id,
                 )
                 try:
@@ -110,19 +110,19 @@ def _handle_token_change() -> bool:
 def _run_setup_required_mode(missing: Any) -> None:
     global _setup_required
     if not settings.get("WEB_ENABLED"):
-        print("다음 필수 설정값이 없습니다: {}".format(", ".join(missing)))
-        print("웹 설정이 꺼져 있어 종료합니다.")
+        print("Missing required settings: {}".format(", ".join(missing)))
+        print("Web UI is disabled; exiting.")
         sys.exit(1)
 
     _setup_required = True
     _LOGGER.info(
-        "설정 필요: http://127.0.0.1:%s/ (누락: %s)",
+        "Setup required: http://127.0.0.1:%s/ (missing: %s)",
         settings.get("WEB_PORT"), ", ".join(missing),
     )
     while not all(settings.get(key) for key in _D10_REQUIRED_KEYS):
         time.sleep(2)
     _setup_required = False
-    _LOGGER.info("필수값 입력 완료, polling 시작")
+    _LOGGER.info("Required values provided, starting polling")
 
 
 def _run_polling_loop() -> None:
@@ -140,11 +140,11 @@ def _run_polling_loop() -> None:
             if "_status" in res:
                 status = res["_status"]
                 if status == 401:
-                    _LOGGER.error("토큰이 유효하지 않습니다(401). 웹에서 수정하세요.")
+                    _LOGGER.error("Invalid token (401). Update it via the web UI.")
                 elif status == 409:
-                    _LOGGER.error("다른 인스턴스가 polling 중이거나 webhook이 설정되어 있습니다(409).")
+                    _LOGGER.error("Another instance is polling or a webhook is set (409).")
                 else:
-                    _LOGGER.warning("getUpdates 실패: status=%s", status)
+                    _LOGGER.warning("getUpdates failed: status=%s", status)
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 60)
                 continue
@@ -158,13 +158,13 @@ def _run_polling_loop() -> None:
                 except SystemExit:
                     raise
                 except Exception:
-                    _LOGGER.exception("update 처리 오류")
+                    _LOGGER.exception("Error processing update")
         except SystemExit:
             raise
         except Exception:
             # Never let a transient bug kill the process; the service
             # manager restart is a last resort, not the first response.
-            _LOGGER.exception("polling 루프에서 예기치 못한 오류 발생")
+            _LOGGER.exception("Unexpected error in polling loop")
             time.sleep(2)
             continue
 
@@ -177,7 +177,7 @@ def main() -> None:
     )
 
     if os.name != "posix":
-        print("지원하지 않는 플랫폼입니다 (POSIX 전용).")
+        print("Unsupported platform (POSIX only).")
         sys.exit(1)
 
     _acquire_single_instance_lock()

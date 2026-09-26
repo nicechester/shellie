@@ -3,9 +3,9 @@
 > 기준 문서: `dev-plan.md` (상세 내용·리스크 ID는 계획서 참조, 설계 수정안 A1은 dev-plan §6)
 > 사용법: 완료 시 `[ ]` → `[x]`, 진행 중이면 항목 뒤에 `(진행 중)` 표기. 부분 완료·보류는 뒤에 짧은 메모를 남긴다.
 >
-> **언어 규칙: 모든 문서 산출물과 코드 주석·docstring은 영어로 작성한다** — `README.md`, `skills/README.md`, 수동 검증 시나리오(5.6), `.env.example` 주석, 그리고 `.py` 파일의 모든 주석/docstring. 단, 텔레그램 응답·웹 UI·로그 등 앱의 사용자 대면 **문자열 리터럴**은 한국어를 유지한다.
+> **언어 규칙: 모든 문서 산출물과 코드 주석·docstring은 영어로 작성한다** — `README.md`, `skills/README.md`, 수동 검증 시나리오(5.6), `.env.example` 주석, 그리고 `.py` 파일의 모든 주석/docstring. 앱의 사용자 대면 **문자열 리터럴**(텔레그램 응답·웹 UI·로그)도 모두 **영어**로 작성한다 (2026-09-26 방향 변경).
 
-**진행 현황:** 전 Phase(0~9) 구현·문서화·최종 검토 완료 (2026-09-25, HTTP MCP·MD 스킬 포함). 남은 것 = ① Chester의 테스트 실행(162개) 및 수용 테스트(docs/VERIFICATION.md), ② 미결 결정 1건: OpenClaw 데이터 이관 여부
+**진행 현황:** 전 Phase(0~9) 구현·문서화·최종 검토 완료 (2026-09-25, HTTP MCP·MD 스킬 포함) + Phase 10 Gemini rate-limit 재시도 쿨다운 추가 (2026-09-26). 남은 것 = ① Chester의 테스트 실행(181개) 및 수용 테스트(docs/VERIFICATION.md), ② 미결 결정 1건: OpenClaw 데이터 이관 여부
 
 ---
 
@@ -23,6 +23,7 @@
 - [x] D10. 필수값 누락 시 — **설정 필요 모드 채택**: 웹만 기동·polling 미시작, 웹에서 채우면 무재시동 시작. 웹 비활성 시 exit(1)
 - [x] D11. 웹 인증 — **로그인 없음 + Host/Origin/Sec-Fetch-Site/CSRF 토큰 필수 검사 채택** (R31/R32 방어)
 - [x] D12. 플랫폼·서비스 계층 — **POSIX 전용 채택**: macOS(launchd) + Linux PC/라즈베리파이(systemd user unit), Windows 제외(기동 시 거부), 범용 wrapper 없음
+- [x] D13. Gemini rate-limit handling — **whole-chain retry with cooldown adopted**: after every model in `GEMINI_MODEL_CHAIN` fails with a fallback-eligible status, retry the whole chain up to `GEMINI_MAX_RETRIES` times, sleeping the server-suggested `retryDelay` hint (if present) or exponential backoff from `GEMINI_RETRY_BASE_DELAY_SEC`, capped at 300s, instead of failing after a single pass
 
 ---
 
@@ -119,6 +120,26 @@
 
 - [x] 9.1 하이브리드 스킬 완료: `.md` 스캔(첫 비공백 줄 `#` 제거·80자 요약, README.md·`_` 접두 제외, 파일명 정렬 유지), system prompt 힌트 갱신(.py 실행 / .md는 cat 후 절차 수행) `[senior]`
 - [x] 9.2 규약·샘플·테스트 완료: skills/README.md "Markdown skills" 섹션, sample_skill.md, test_gemini 6개 추가(총 162개), README §8 하이브리드 설명 `[senior]`
+
+## Phase 10: Gemini rate-limit retry with cooldown (2026-09-26, added)
+
+- [x] 10.1 (English, per D13) `settings.py`: added `GEMINI_RETRY_BASE_DELAY_SEC` (5-300, default 60) and
+  `GEMINI_MAX_RETRIES` (0-5, default 2) to the catalog (now 20 keys) `[senior]`
+- [x] 10.2 `core/gemini.py`: `call_gemini()` now retries the whole model chain up to `GEMINI_MAX_RETRIES`
+  times with a cooldown between passes (server `retryDelay` hint via new `_parse_retry_delay()`, else
+  exponential backoff from `GEMINI_RETRY_BASE_DELAY_SEC`, capped at `_MAX_COOLDOWN_SEC`=300s); no more
+  wasted inter-model sleep after the last model of a pass; non-fallback statuses still raise immediately
+  with no retry; new optional `on_cooldown(attempt, max_retries, delay)` callback fires before each
+  cooldown sleep (exceptions swallowed) `[senior]`
+- [x] 10.3 `telegram/handlers.py`: `_run_llm_turn()` wires `on_cooldown` to a best-effort Telegram
+  notice ("⏳ Rate limited. Retrying in {}s… ({}/{})") sent via `send_message`, never recorded into history;
+  cooldown notice translated from Korean to English on 2026-09-26 per language rule update `[senior]`
+- [x] 10.4 Tests: `test_gemini.py` +11 (`_parse_retry_delay` parsing/defensive cases, retry-then-succeed,
+  server hint vs exponential, cap, non-fallback no-retry, `on_cooldown` wiring incl. exception-safety, no
+  wasted inter-model sleep), `test_settings.py` +3 (defaults + boundary tests for both new keys). Total
+  162 -> 176 `[senior]`
+- [x] 10.5 `GEMINI_API_KEY` validator now also accepts `.` (newer Google key format, e.g. `AQ.`-prefixed);
+  error/constraint strings + README updated, `test_settings.py` +5 format tests. Total 176 -> 181 `[junior]`
 
 ## 수용 테스트 (Definition of Done — 사용자 실행)
 

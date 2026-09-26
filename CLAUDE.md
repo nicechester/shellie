@@ -26,7 +26,7 @@ bypass, 24/7 via launchd/systemd.
    `subprocess process_group=`, `match`). Use `typing.Dict/List/Optional` in
    runtime type expressions; `start_new_session=True` for process groups.
 3. **Language:** all docs, code comments, and docstrings in **English**.
-   App user-facing string literals (Telegram replies, web UI, logs) in **Korean**.
+   App user-facing string literals (Telegram replies, web UI, logs) in **English**.
    Conversation with Chester in Korean.
 4. **Settings are read at CALL time**, never at import time and never cached in
    module constants. Import-time side effects allowed: path constants +
@@ -40,7 +40,7 @@ bypass, 24/7 via launchd/systemd.
 
 - `config.py` — path constants (BASE_DIR, MEMORY_DIR/FILE, SKILLS_DIR,
   OFFSET_FILE, SETTINGS_FILE), pure `parse_dotenv()`, re-exports `settings`.
-- `settings.py` — `SettingSpec` catalog (**18 keys**) + `SettingsStore`
+- `settings.py` — `SettingSpec` catalog (**20 keys**) + `SettingsStore`
   singleton: 3 layers (defaults < .env/os.environ read once at startup <
   settings.json overrides), copy-on-write lock-free reads, serialized
   all-or-nothing `update/unset` with per-key prechecks, atomic 0600 persist,
@@ -58,13 +58,16 @@ bypass, 24/7 via launchd/systemd.
   `read_memory()` injects **core + today only**; older memories are grep-searched
   on demand (hint injected into system prompt).
 - `core/gemini.py` — model-chain fallback (429 / RESOURCE_EXHAUSTED / 5xx /
-  transport → next model; snapshot of chain/key/timeouts at call start),
+  transport → next model; snapshot of chain/key/timeouts at call start), plus
+  whole-chain retry with cooldown (GEMINI_MAX_RETRIES passes, delay = server
+  `retryDelay` hint or exponential backoff from GEMINI_RETRY_BASE_DELAY_SEC,
+  capped at 300s; `on_cooldown` callback for caller notification),
   `ToolEntry` registry (execute_shell dynamic description + append_memory),
   hybrid skills auto-discovery — `skills/*.py` (first docstring line) AND
   `skills/*.md` procedure docs (first non-empty line, `#` stripped, 80 chars;
   README.md and `_`-prefixed excluded); only the one-line summary goes into the
   system prompt, the LLM `cat`s the full .md on demand and follows its steps —
-  `[실행 환경]` block (OS/arch/shell/cwd), robust `parse_response()`
+  `[execution environment]` block (OS/arch/shell/cwd), robust `parse_response()`
   (multi functionCall parts, thought-part skip, blocked/finishReason handling).
 - `core/mcp.py` — HTTP MCP client (Streamable HTTP JSON-RPC): initialize →
   tools/list → tools/call, Mcp-Session-Id support, 300s TTL cache invalidated by
@@ -107,14 +110,14 @@ no login + Host/Origin/CSRF · D12 launchd + systemd user unit, POSIX only.
 
 - Run (Chester only): `./run.sh` or `PYTHONPATH=. python3 -m src.agent`
 - Tests (Chester only): `PYTHONPATH=. python3 -m unittest discover tests -v`
-  (162 tests; some shell tests spawn real short-lived processes)
+  (181 tests; some shell tests spawn real short-lived processes)
 - Service install: `sh launchd/install.sh` (Darwin→launchd, Linux→systemd user
   unit; Linux boot-start needs `loginctl enable-linger $USER`)
 
 ## Status (2026-09-25)
 
 Phases 0–9 all implemented, documented, final-reviewed. Outstanding:
-1. Chester: run the 162 tests + docs/VERIFICATION.md acceptance playbook.
+1. Chester: run the 181 tests + docs/VERIFICATION.md acceptance playbook.
 2. Open decision: whether to migrate OpenClaw data (memories/settings).
 3. Note: project directory is still named `freesec`; renaming it to `shellie`
    is safe (paths are resolved dynamically) but breaks the current session cwd.

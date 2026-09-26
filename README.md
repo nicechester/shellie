@@ -23,7 +23,7 @@ to interact with it:
   the core file plus today's dated file into the system instruction; older
   dated files are not injected but can be found with `grep -ri "<keyword>"
   memory/`.
-- **Runtime-editable settings** — all 18 settings can be changed without a
+- **Runtime-editable settings** — all 20 settings can be changed without a
   restart, either from a local web UI (`http://127.0.0.1:<WEB_PORT>/`) or via
   Telegram `/set`/`/unset` commands. See [§7](#7-settings).
 - **MCP tools (optional)** — configure `MCP_SERVERS` to let the Gemini LLM
@@ -171,7 +171,7 @@ service for you (macOS → launchd, Linux → systemd user unit), and `chmod
 | `/mem` | Bypass | Prints long-term memory: core `MEMORY.md` plus today's dated file (`memory/YYYY-MM-DD.md`) |
 | `/reset` | Bypass | Clears the in-process conversation history (context only, not `MEMORY.md`) |
 | `/restart` | Bypass | Exits the process; the service manager (launchd/systemd) restarts it. Warns if no service manager is detected. Now mainly useful for picking up **code** changes — setting changes already hot-apply |
-| `/settings`, `/get` | Bypass (settings) | Lists all 18 keys with current value (masked if secret), source, and apply timing |
+| `/settings`, `/get` | Bypass (settings) | Lists all 20 keys with current value (masked if secret), source, and apply timing |
 | `/get KEY` | Bypass (settings) | Detail view for one key: value, source, default, constraint, apply timing |
 | `/set KEY VALUE` | Bypass (settings) | Applies an override immediately (rejected for web-only keys) |
 | `/unset KEY` | Bypass (settings) | Removes an override, falling back to the env/default layer |
@@ -194,16 +194,18 @@ does nothing until you restart — and even after a restart, if an override
 for that key already exists in `settings.json`, your new `.env` value stays
 shadowed until you `/unset` that key (or delete `settings.json`).
 
-### 18-key reference
+### 20-key reference
 
 | Key | Default | Range / format | Telegram-editable | Apply timing |
 |---|---|---|---|---|
 | `TELEGRAM_BOT_TOKEN` | *(required)* | `^\d{5,16}:[A-Za-z0-9_-]{30,64}$` | No (web-only, secret) | next poll cycle |
-| `GEMINI_API_KEY` | *(required)* | 20–128 chars, `[A-Za-z0-9_-]` | No (web-only, secret) | immediate |
+| `GEMINI_API_KEY` | *(required)* | 20–128 chars, `[A-Za-z0-9._-]` | No (web-only, secret) | immediate |
 | `ALLOWED_USER_ID` | *(required)* | integer 1 – 2^53−1, cannot equal the bot's own ID | No (web-only) | immediate |
 | `GEMINI_MODEL_CHAIN` | `gemini-2.5-flash,gemini-2.5-pro,gemini-2.5-flash-lite` | 1–5 comma-separated model names, no duplicates | Yes | immediate |
 | `GEMINI_TIMEOUT_SEC` | `60` | 5–300 | Yes | immediate |
 | `GEMINI_FALLBACK_DELAY_SEC` | `1` | 0–10 | Yes | immediate |
+| `GEMINI_RETRY_BASE_DELAY_SEC` | `60` | 5–300 | Yes | immediate |
+| `GEMINI_MAX_RETRIES` | `2` | 0–5 | Yes | immediate |
 | `SYSTEM_PROMPT` | platform-neutral Korean default | 1–4000 chars, multi-line allowed | Yes | immediate |
 | `FC_MAX_LOOPS` | `5` | 1–10 | Yes | immediate |
 | `CONTEXT_TURNS` | `10` | 0–50 (0 = single-shot, no history kept) | Yes | immediate |

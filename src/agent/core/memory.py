@@ -5,7 +5,7 @@ import os
 
 from src.agent.config import MEMORY_DIR, MEMORY_FILE
 
-_NO_MEMORY_MESSAGE = "등록된 메모리가 없습니다."
+_NO_MEMORY_MESSAGE = "No memory entries found."
 
 
 def _today() -> str:
@@ -45,7 +45,7 @@ def append_memory(content: str) -> str:
     normalized = " ".join(content.strip().split())
 
     if not normalized:
-        return "저장할 내용이 없습니다."
+        return "Nothing to save."
 
     line = f"- {normalized}\n"
 
@@ -62,4 +62,4 @@ def append_memory(content: str) -> str:
     with open(path, "a", encoding="utf-8") as f:
         f.write(line)
 
-    return "메모리가 저장되었습니다."
+    return "Memory saved."

@@ -29,7 +29,7 @@ def resolve_shell() -> str:
     configured = settings.get("SHELL_PATH")
     if configured and configured != "auto":
         if not _is_usable_shell(configured):
-            raise ValueError("설정된 셸을 찾을 수 없음: {}".format(configured))
+            raise ValueError("Configured shell not found: {}".format(configured))
         return configured
 
     candidates = []
@@ -50,7 +50,7 @@ def resolve_shell() -> str:
         if _is_usable_shell(candidate):
             return candidate
 
-    raise ValueError("사용 가능한 셸을 찾을 수 없음")
+    raise ValueError("No usable shell found")
 
 
 def _augmented_path(base_path: str) -> str:
@@ -85,7 +85,7 @@ def _truncate(text: str) -> str:
     limit = settings.get("SHELL_OUTPUT_LIMIT")
     if len(text) <= limit:
         return text
-    return text[:limit] + "\n... (출력이 길어 {}자에서 잘림)".format(limit)
+    return text[:limit] + "\n... (output truncated at {} chars)".format(limit)
 
 
 def kill_active() -> None:
@@ -140,7 +140,7 @@ def execute_shell(command: str) -> str:
                     stdout, stderr = proc.communicate()
                 except Exception:
                     stdout, stderr = "", ""
-            message = "에러: 명령어 실행 시간 초과 ({}초 제한).".format(timeout)
+            message = "Error: command timed out ({}s limit).".format(timeout)
             partial = _combine_streams(stdout, stderr)
             if partial:
                 message = message + "\n" + partial
@@ -148,7 +148,7 @@ def execute_shell(command: str) -> str:
 
         body = _combine_streams(stdout, stderr)
         if not body:
-            body = "성공적으로 실행되었습니다 (출력 없음)."
+            body = "Executed successfully (no output)."
         if proc.returncode:
             body = body + "\n[exit {}]".format(proc.returncode)
         return _truncate(body)
@@ -157,7 +157,7 @@ def execute_shell(command: str) -> str:
 
 
 def execution_environment() -> Dict[str, str]:
-    """Never raises; used for the [실행 환경] block and the dynamic tool description."""
+    """Never raises; used for the [execution environment] block and the dynamic tool description."""
     try:
         shell_path = resolve_shell()
     except ValueError as exc:

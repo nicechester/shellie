@@ -69,12 +69,12 @@ def _load_servers() -> List[Dict[str, Any]]:
         data = json.loads(raw)
     except ValueError:
         if not _warned_invalid_config:
-            _LOGGER.warning("MCP_SERVERS 설정이 유효한 JSON이 아니어서 무시합니다")
+            _LOGGER.warning("MCP_SERVERS setting is not valid JSON, ignoring")
             _warned_invalid_config = True
         return []
     if not isinstance(data, list):
         if not _warned_invalid_config:
-            _LOGGER.warning("MCP_SERVERS 설정이 배열이 아니어서 무시합니다")
+            _LOGGER.warning("MCP_SERVERS setting is not a list, ignoring")
             _warned_invalid_config = True
         return []
     _warned_invalid_config = False
@@ -138,12 +138,12 @@ def _ensure_initialized(entry: Dict[str, Any], cache: _ServerCache) -> None:
     cache.initialized = True
 
     if _is_sse(resp_headers):
-        _LOGGER.warning("MCP 서버 %s: SSE 응답은 지원하지 않습니다", name)
+        _LOGGER.warning("MCP server %s: SSE responses are not supported", name)
         cache.usable = False
         return
 
     if not isinstance(data, dict) or status != 200 or isinstance(data.get("error"), dict):
-        _LOGGER.warning("MCP 서버 %s 초기화 실패 (status=%s)", name, status)
+        _LOGGER.warning("MCP server %s initialization failed (status=%s)", name, status)
         cache.usable = False
         return
 
@@ -166,12 +166,12 @@ def _fetch_tools(entry: Dict[str, Any], cache: _ServerCache) -> List[Dict[str, A
     data, status, resp_headers = http_post_h(url, payload, headers=headers, timeout=_REQUEST_TIMEOUT_SEC)
 
     if _is_sse(resp_headers):
-        _LOGGER.warning("MCP 서버 %s: SSE 응답은 지원하지 않습니다", name)
+        _LOGGER.warning("MCP server %s: SSE responses are not supported", name)
         cache.usable = False
         return []
 
     if not isinstance(data, dict) or status != 200 or isinstance(data.get("error"), dict):
-        _LOGGER.warning("MCP 서버 %s 툴 목록 조회 실패 (status=%s)", name, status)
+        _LOGGER.warning("MCP server %s tools/list failed (status=%s)", name, status)
         return []
 
     result = data.get("result")
@@ -262,7 +262,7 @@ def tool_declarations() -> List[Dict[str, Any]]:
         try:
             declarations.extend(_declarations_for_server(entry, new_map))
         except Exception:
-            _LOGGER.exception("MCP 서버 처리 중 예외 발생: %s", entry.get("name"))
+            _LOGGER.exception("Exception processing MCP server: %s", entry.get("name"))
             continue
     _tool_name_map = new_map
     return declarations
@@ -270,15 +270,15 @@ def tool_declarations() -> List[Dict[str, Any]]:
 
 def _format_call_result(server_name: str, data: Any) -> str:
     if not isinstance(data, dict):
-        return "MCP 서버 연결 실패: {}".format(server_name)
+        return "MCP server connection failed: {}".format(server_name)
 
     error = data.get("error")
     if isinstance(error, dict):
-        return "MCP 오류: {}".format(error.get("message", "알 수 없는 오류"))
+        return "MCP error: {}".format(error.get("message", "unknown error"))
 
     result = data.get("result")
     if not isinstance(result, dict):
-        return "MCP 서버 연결 실패: {}".format(server_name)
+        return "MCP server connection failed: {}".format(server_name)
 
     content = result.get("content")
     pieces: List[str] = []
@@ -290,19 +290,19 @@ def _format_call_result(server_name: str, data: Any) -> str:
                 pieces.append(json.dumps(item, ensure_ascii=False))
     text = "\n".join(pieces)
     if result.get("isError"):
-        text = "MCP 툴 오류: {}".format(text)
+        text = "MCP tool error: {}".format(text)
     return text
 
 
 def _try_run_impl(name: str, args: Dict[str, Any]) -> str:
     mapping = _tool_name_map.get(name)
     if mapping is None:
-        return "MCP 오류: 알 수 없는 툴"
+        return "MCP error: unknown tool"
 
     server_name, tool_name = mapping
     cache = _cache.get(server_name)
     if cache is None:
-        return "MCP 서버 연결 실패: {}".format(server_name)
+        return "MCP server connection failed: {}".format(server_name)
 
     entry = cache.entry
     headers = _request_headers(entry, cache)
@@ -328,5 +328,5 @@ def try_run(name: str, args: Dict[str, Any]) -> Optional[str]:
     try:
         return _try_run_impl(name, args)
     except Exception:
-        _LOGGER.exception("MCP 툴 실행 중 예외 발생: %s", name)
-        return "MCP 오류: 알 수 없는 오류"
+        _LOGGER.exception("Exception running MCP tool: %s", name)
+        return "MCP error: unknown error"

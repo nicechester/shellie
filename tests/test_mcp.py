@@ -177,7 +177,7 @@ class TryRunTests(_McpTestCase):
 
     def test_unmapped_mcp_name_returns_error_string(self) -> None:
         result = mcp.try_run("mcp_unknown_tool", {})
-        self.assertEqual(result, "MCP 오류: 알 수 없는 툴")
+        self.assertEqual(result, "MCP error: unknown tool")
 
     def test_tools_call_uses_original_unprefixed_tool_name(self) -> None:
         self._bring_up_server()
@@ -219,21 +219,21 @@ class TryRunTests(_McpTestCase):
             {"result": {"isError": True, "content": [{"type": "text", "text": "boom"}]}}, 200, {}
         )
         result = mcp.try_run("mcp_svc_do_thing", {})
-        self.assertEqual(result, "MCP 툴 오류: boom")
+        self.assertEqual(result, "MCP tool error: boom")
 
     def test_json_rpc_error_object_is_mapped(self) -> None:
         self._bring_up_server()
         self.mock_http.side_effect = None
         self.mock_http.return_value = ({"error": {"code": -1, "message": "bad request"}}, 400, {})
         result = mcp.try_run("mcp_svc_do_thing", {})
-        self.assertEqual(result, "MCP 오류: bad request")
+        self.assertEqual(result, "MCP error: bad request")
 
     def test_transport_failure_returns_connection_message(self) -> None:
         self._bring_up_server()
         self.mock_http.side_effect = None
         self.mock_http.return_value = ({"error": "Connection refused"}, 0, {})
         result = mcp.try_run("mcp_svc_do_thing", {})
-        self.assertEqual(result, "MCP 서버 연결 실패: svc")
+        self.assertEqual(result, "MCP server connection failed: svc")
 
 
 if __name__ == "__main__":
