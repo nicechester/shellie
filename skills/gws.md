@@ -110,6 +110,8 @@ gws calendar events list --params '{"calendarId":"primary","timeMin":"2026-01-01
 
 ## Slides
 
+To create a presentation with content, use `skills/slides_create.py` instead.
+
 Get a presentation:
 ```
 gws slides presentations get --params '{"presentationId":"PRES_ID"}'

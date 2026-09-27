@@ -23,7 +23,24 @@ _history: List[Dict[str, Any]] = []
 _last_activity: float = 0.0
 
 _SETTINGS_TOKENS = ("/settings", "/get", "/set", "/unset")
-_BYPASS_TOKENS = ("/mem", "/restart", "/reset", "/sh")
+_BYPASS_TOKENS = ("/mem", "/restart", "/reset", "/sh", "/help")
+
+_HELP_TEXT = (
+    "<b>Bypass commands</b> (no LLM)\n"
+    "<code>!&lt;cmd&gt;</code> / <code>/sh &lt;cmd&gt;</code> — run shell command\n"
+    "<code>/mem</code> — show long-term memory\n"
+    "<code>/reset</code> — clear conversation history\n"
+    "<code>/restart</code> — restart the process\n"
+    "<code>/help</code> — show this message\n"
+    "\n"
+    "<b>Settings commands</b>\n"
+    "<code>/settings</code> / <code>/get</code> — list all settings\n"
+    "<code>/get KEY</code> — detail for one key\n"
+    "<code>/set KEY VALUE</code> — apply an override\n"
+    "<code>/unset KEY</code> — remove an override\n"
+    "\n"
+    "<b>Anything else</b> — sent to Gemini LLM"
+)
 
 _FENCE_RE = re.compile(r"```(?:[^\n`]*\n)?(.*?)```", re.DOTALL)
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
@@ -293,6 +310,10 @@ def _handle_bypass_command(chat_id: int, text: str) -> bool:
 
     if cmd == "/restart":
         _handle_restart(chat_id)
+        return True
+
+    if cmd == "/help":
+        send_message(chat_id, _HELP_TEXT)
         return True
 
     return False
