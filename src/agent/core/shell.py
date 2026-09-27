@@ -8,7 +8,8 @@ import subprocess
 import sys
 from typing import Dict, Optional
 
-from src.agent.config import BASE_DIR, settings
+from src.agent.config import BASE_DIR, SHELLIE_HOME, settings
+from src.agent.config import parse_dotenv as _parse_dotenv
 
 _active_pgid: Optional[int] = None
 
@@ -53,8 +54,19 @@ def resolve_shell() -> str:
     raise ValueError("No usable shell found")
 
 
+def _dotenv_path_dirs() -> list:
+    """Return extra PATH dirs declared in .env, re-read on every shell call."""
+    dotenv = _parse_dotenv(os.path.join(BASE_DIR, ".env"))
+    raw = dotenv.get("PATH", "")
+    return [d for d in raw.split(os.pathsep) if d] if raw else []
+
+
 def _augmented_path(base_path: str) -> str:
     dirs = base_path.split(os.pathsep) if base_path else []
+    # Prepend dirs from .env PATH (re-read each call, so edits take effect without restart)
+    for d in reversed(_dotenv_path_dirs()):
+        if d not in dirs:
+            dirs.insert(0, d)
     if sys.platform == "darwin":
         extra_dirs = ["/opt/homebrew/bin", "/usr/local/bin"]
     else:

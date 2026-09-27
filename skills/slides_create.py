@@ -15,7 +15,7 @@ import subprocess
 import sys
 import uuid
 
-GWS_DEFAULT = "/Users/chester.kim/.nvm/versions/node/v24.10.0/bin/gws"
+GWS_DEFAULT = "gws"
 # EMU units: 1 inch = 914400
 W, H = 9144000, 5143500  # 10 x 5.625 inches (16:9)
 TITLE_X, TITLE_Y = 457200, 274320

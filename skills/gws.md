@@ -1,6 +1,6 @@
 # Google Workspace CLI (`gws`): Gmail, Drive, Sheets, Docs, Calendar, Slides
 
-CLI binary: `gws` (full path if not on PATH: `/Users/chester.kim/.nvm/versions/node/v24.10.0/bin/gws`)
+CLI binary: `gws` — ensure the Node bin path is in PATH (see `.env`)
 Docs: https://github.com/googleworkspace/cli
 
 ---
