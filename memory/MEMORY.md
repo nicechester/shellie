@@ -1,10 +1,10 @@
-# MEMORY.md — Shellie 코어 장기 기억
+# MEMORY.md — Shellie core long-term memory
 
-이 파일은 코어(영구) 메모리로, 사용자가 직접 관리하는 규칙/정보만 담는다.
-`append_memory`는 더 이상 이 파일에 쓰지 않으며, 새 항목은 오늘 날짜의
-`memory/YYYY-MM-DD.md` 파일에 자동 저장된다. 매 LLM 호출 시 이 파일 전체와
-오늘 날짜 파일만 system instruction에 주입되고, 그 이전 날짜의 기억은
-`grep -ri "<키워드>" memory/`로 검색해야 한다.
+This file is the core (permanent) memory, containing only user-curated rules and information.
+`append_memory` no longer writes to this file; new entries are saved automatically to
+`memory/YYYY-MM-DD.md` for the current date. On every LLM call, this entire file and
+today's dated file are injected into the system instruction; memories from earlier dates
+must be searched with `grep -ri "<keyword>" memory/`.
 
-- 에이전트 이름은 Shellie이다.
+- The agent's name is Shellie.
 - Reply in English.
