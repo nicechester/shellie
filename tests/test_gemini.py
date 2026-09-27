@@ -392,7 +392,8 @@ class ListSkillsTests(unittest.TestCase):
             with open(os.path.join(tmp, "broken.py"), "w", encoding="utf-8") as f:
                 f.write("def broken(:\n    pass\n")
 
-            with mock.patch.object(gemini, "SKILLS_DIR", tmp):
+            with mock.patch.object(gemini, "SKILLS_DIR", tmp), \
+                 mock.patch.object(gemini, "REPO_SKILLS_DIR", "/nonexistent"):
                 result = gemini.list_skills()
 
         lines = result.split("\n")
@@ -405,7 +406,8 @@ class ListSkillsTests(unittest.TestCase):
             with open(os.path.join(tmp, "x.md"), "w", encoding="utf-8") as f:
                 f.write("# Title\n\nSome procedure body.\n")
 
-            with mock.patch.object(gemini, "SKILLS_DIR", tmp):
+            with mock.patch.object(gemini, "SKILLS_DIR", tmp), \
+                 mock.patch.object(gemini, "REPO_SKILLS_DIR", "/nonexistent"):
                 result = gemini.list_skills()
 
         self.assertEqual(result, "- skills/x.md: Title")
@@ -415,7 +417,8 @@ class ListSkillsTests(unittest.TestCase):
             with open(os.path.join(tmp, "x.md"), "w", encoding="utf-8") as f:
                 f.write("Plain text summary line.\nMore body.\n")
 
-            with mock.patch.object(gemini, "SKILLS_DIR", tmp):
+            with mock.patch.object(gemini, "SKILLS_DIR", tmp), \
+                 mock.patch.object(gemini, "REPO_SKILLS_DIR", "/nonexistent"):
                 result = gemini.list_skills()
 
         self.assertEqual(result, "- skills/x.md: Plain text summary line.")
@@ -425,7 +428,8 @@ class ListSkillsTests(unittest.TestCase):
             with open(os.path.join(tmp, "x.md"), "w", encoding="utf-8") as f:
                 f.write("")
 
-            with mock.patch.object(gemini, "SKILLS_DIR", tmp):
+            with mock.patch.object(gemini, "SKILLS_DIR", tmp), \
+                 mock.patch.object(gemini, "REPO_SKILLS_DIR", "/nonexistent"):
                 result = gemini.list_skills()
 
         self.assertEqual(result, "- skills/x.md")
@@ -435,7 +439,8 @@ class ListSkillsTests(unittest.TestCase):
             with open(os.path.join(tmp, "README.md"), "w", encoding="utf-8") as f:
                 f.write("# skills/\n\nShould never appear.\n")
 
-            with mock.patch.object(gemini, "SKILLS_DIR", tmp):
+            with mock.patch.object(gemini, "SKILLS_DIR", tmp), \
+                 mock.patch.object(gemini, "REPO_SKILLS_DIR", "/nonexistent"):
                 result = gemini.list_skills()
 
         self.assertEqual(result, "")
@@ -445,7 +450,8 @@ class ListSkillsTests(unittest.TestCase):
             with open(os.path.join(tmp, "_draft.md"), "w", encoding="utf-8") as f:
                 f.write("# Draft\n\nWork in progress.\n")
 
-            with mock.patch.object(gemini, "SKILLS_DIR", tmp):
+            with mock.patch.object(gemini, "SKILLS_DIR", tmp), \
+                 mock.patch.object(gemini, "REPO_SKILLS_DIR", "/nonexistent"):
                 result = gemini.list_skills()
 
         self.assertEqual(result, "")
@@ -457,7 +463,8 @@ class ListSkillsTests(unittest.TestCase):
             with open(os.path.join(tmp, "beta.md"), "w", encoding="utf-8") as f:
                 f.write("# Beta procedure\n")
 
-            with mock.patch.object(gemini, "SKILLS_DIR", tmp):
+            with mock.patch.object(gemini, "SKILLS_DIR", tmp), \
+                 mock.patch.object(gemini, "REPO_SKILLS_DIR", "/nonexistent"):
                 result = gemini.list_skills()
 
         lines = result.split("\n")

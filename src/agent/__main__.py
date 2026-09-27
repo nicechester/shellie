@@ -8,7 +8,7 @@ import sys
 import time
 from typing import Any, Optional
 
-from src.agent.config import BASE_DIR, OFFSET_FILE, settings
+from src.agent.config import BASE_DIR, OFFSET_FILE, SHELLIE_HOME, settings
 from src.agent.core import shell
 from src.agent.telegram.client import get_me, get_updates, register_prechecks
 from src.agent.telegram.handlers import process_update
@@ -16,7 +16,7 @@ from src.agent.web.server import manager
 
 _LOGGER = logging.getLogger("shellie.main")
 
-_LOCK_PATH = os.path.join(BASE_DIR, ".shellie.lock")
+_LOCK_PATH = os.path.join(SHELLIE_HOME, ".shellie.lock")
 _lock_fd: Optional[int] = None  # kept open for the process lifetime (R50)
 
 _D10_REQUIRED_KEYS = ("TELEGRAM_BOT_TOKEN", "GEMINI_API_KEY", "ALLOWED_USER_ID")

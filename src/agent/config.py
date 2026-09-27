@@ -4,14 +4,27 @@ import os
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
-MEMORY_DIR = os.path.join(BASE_DIR, "memory")
+# User workspace: runtime/user data lives here, separate from the source repo.
+# Override with SHELLIE_HOME env var before starting the process.
+SHELLIE_HOME = os.path.abspath(
+    os.environ.get("SHELLIE_HOME") or os.path.join(os.path.expanduser("~"), ".shellie")
+)
+
+MEMORY_DIR = os.path.join(SHELLIE_HOME, "memory")
 MEMORY_FILE = os.path.join(MEMORY_DIR, "MEMORY.md")
-SKILLS_DIR = os.path.join(BASE_DIR, "skills")
-OFFSET_FILE = os.path.join(BASE_DIR, ".update_offset")
-SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
+SKILLS_DIR = os.path.join(SHELLIE_HOME, "skills")       # user skills (takes priority)
+REPO_SKILLS_DIR = os.path.join(BASE_DIR, "skills")      # built-in repo skills
+OFFSET_FILE = os.path.join(SHELLIE_HOME, ".update_offset")
+SETTINGS_FILE = os.path.join(SHELLIE_HOME, "settings.json")
 
 os.makedirs(MEMORY_DIR, exist_ok=True)
 os.makedirs(SKILLS_DIR, exist_ok=True)
+
+# Seed MEMORY.md from the repo template on first run.
+_MEMORY_TEMPLATE = os.path.join(BASE_DIR, "memory", "MEMORY.md")
+if not os.path.exists(MEMORY_FILE) and os.path.exists(_MEMORY_TEMPLATE):
+    import shutil
+    shutil.copy2(_MEMORY_TEMPLATE, MEMORY_FILE)
 
 
 def parse_dotenv(path: str) -> dict:

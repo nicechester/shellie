@@ -7,7 +7,7 @@ import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from src.agent.config import SKILLS_DIR, settings
+from src.agent.config import REPO_SKILLS_DIR, SKILLS_DIR, settings
 from src.agent.core import mcp, shell
 from src.agent.core.memory import append_memory, read_memory
 from src.agent.utils.http import http_post
@@ -109,10 +109,9 @@ def build_tools_schema() -> List[Dict[str, Any]]:
     return [{"functionDeclarations": declarations}]
 
 
-def _describe_py_skill(name: str) -> str:
+def _describe_py_skill(name: str, path: str) -> str:
     line = "- skills/{}".format(name)
     try:
-        path = os.path.join(SKILLS_DIR, name)
         with open(path, "r", encoding="utf-8") as f:
             source = f.read()
         doc = ast.get_docstring(ast.parse(source))
@@ -125,10 +124,9 @@ def _describe_py_skill(name: str) -> str:
     return line
 
 
-def _describe_md_skill(name: str) -> str:
+def _describe_md_skill(name: str, path: str) -> str:
     line = "- skills/{}".format(name)
     try:
-        path = os.path.join(SKILLS_DIR, name)
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
         for raw_line in content.splitlines():
@@ -144,17 +142,25 @@ def _describe_md_skill(name: str) -> str:
 
 
 def list_skills() -> str:
-    try:
-        names = sorted(os.listdir(SKILLS_DIR))
-    except OSError:
-        return ""
+    # Repo skills are the base; user skills (~/.shellie/skills/) override by name.
+    skill_map: Dict[str, str] = {}  # name -> absolute path
+    for directory in (REPO_SKILLS_DIR, SKILLS_DIR):
+        try:
+            for name in sorted(os.listdir(directory)):
+                if (name.endswith(".py") or name.endswith(".md")) and not name.startswith("_"):
+                    skill_map[name] = os.path.join(directory, name)
+        except OSError:
+            pass
 
     lines: List[str] = []
-    for name in names:
-        if name.endswith(".py") and not name.startswith("_"):
-            lines.append(_describe_py_skill(name))
-        elif name.endswith(".md") and not name.startswith("_") and name.lower() != "readme.md":
-            lines.append(_describe_md_skill(name))
+    for name in sorted(skill_map):
+        if name.lower() == "readme.md":
+            continue
+        path = skill_map[name]
+        if name.endswith(".py"):
+            lines.append(_describe_py_skill(name, path))
+        else:
+            lines.append(_describe_md_skill(name, path))
     return "\n".join(lines)
 
 
