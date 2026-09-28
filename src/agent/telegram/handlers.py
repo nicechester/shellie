@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -387,6 +388,15 @@ def _make_cooldown_notifier(chat_id: int) -> Callable[[int, int, float], None]:
     return _notify
 
 
+def _typing_keepalive(chat_id: int, stop: threading.Event) -> None:
+    """Send sendChatAction every 4s until stop is set. Runs in a daemon thread."""
+    while not stop.wait(4):
+        try:
+            send_chat_action(chat_id)
+        except Exception:
+            _LOGGER.debug("sendChatAction failed in keepalive", exc_info=True)
+
+
 def _run_llm_turn(
     chat_id: int,
     contents: List[Dict[str, Any]],
@@ -453,8 +463,15 @@ def _handle_llm(chat_id: int, text: str) -> None:
 
     send_chat_action(chat_id)
 
+    stop_typing = threading.Event()
+    typing_thread = threading.Thread(
+        target=_typing_keepalive, args=(chat_id, stop_typing), daemon=True
+    )
+    typing_thread.start()
     try:
         _run_llm_turn(chat_id, contents, user_turn, context_turns)
     except Exception as exc:
         _LOGGER.exception("Error in LLM track")
         send_message(chat_id, "⚠️ An error occurred: {}".format(html.escape(str(exc))))
+    finally:
+        stop_typing.set()
