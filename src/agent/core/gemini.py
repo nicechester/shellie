@@ -33,7 +33,7 @@ _RETRY_DELAY_MESSAGE_RE = re.compile(r"retry in ([\d.]+)s", re.IGNORECASE)
 # the same model.
 _RPD_THRESHOLD_SEC = 300
 
-_RPD_MESSAGE_RE = re.compile(r"per.?day|daily|rpd", re.IGNORECASE)
+_RPD_MESSAGE_RE = re.compile(r"per.?day|daily|rpd|exceeded your current quota", re.IGNORECASE)
 
 
 class ToolEntry:
@@ -118,7 +118,8 @@ def build_tools_schema() -> List[Dict[str, Any]]:
         declarations.extend(mcp.tool_declarations())
     except Exception:
         _LOGGER.exception("Exception building MCP tool declarations, using built-in tools only")
-    return [{"functionDeclarations": declarations}]
+    # googleSearch must be a separate top-level entry, not inside functionDeclarations.
+    return [{"googleSearch": {}}, {"functionDeclarations": declarations}]
 
 
 def _describe_py_skill(name: str, path: str) -> str:
@@ -349,7 +350,9 @@ def call_gemini(
         for index, model in enumerate(chain):
             url = _GEMINI_URL_TEMPLATE.format(model)
             req_headers = {"x-goog-api-key": key}
+            _LOGGER.debug("Gemini request model=%s url=%s", model, url)
             res, status, resp_headers = http_post_h(url, payload, headers=req_headers, timeout=timeout)
+            _LOGGER.debug("Gemini raw response model=%s status=%s body=%s", model, status, res)
 
             if status == 200:
                 return res, model
@@ -369,13 +372,15 @@ def call_gemini(
                 else:
                     # RPM/TPM: short-lived rate limit, sleep and retry same model.
                     rpm_sleep = parsed_delay if parsed_delay is not None else delay
+                    hint_source = "server hint" if parsed_delay is not None else "fallback delay (no server hint)"
                     _LOGGER.warning(
-                        "Gemini model %s RPM/TPM limit hit, sleeping %.1fs before retry",
-                        model, rpm_sleep,
+                        "Gemini model %s 429 RPM/TPM, sleeping %.1fs (%s) before retry",
+                        model, rpm_sleep, hint_source,
                     )
                     time.sleep(rpm_sleep)
                     # Retry same model: redo this iteration.
                     res, status, resp_headers = http_post_h(url, payload, headers=req_headers, timeout=timeout)
+                    _LOGGER.debug("Gemini raw response model=%s status=%s body=%s", model, status, res)
                     if status == 200:
                         return res, model
                     # Still failing after one RPM retry — treat as fallback.
@@ -397,6 +402,7 @@ def call_gemini(
                     )
                     time.sleep(backoff)
                     res, status, resp_headers = http_post_h(url, payload, headers=req_headers, timeout=timeout)
+                    _LOGGER.debug("Gemini raw response model=%s status=%s body=%s", model, status, res)
                     if status == 200:
                         return res, model
                     if status not in _FALLBACK_5XX and status != 0:
@@ -427,10 +433,15 @@ def call_gemini(
             raise Exception("All Gemini models failed (rate limit or transient error).")
 
         cooldown = min(max(hinted_delay or 0, base_delay * (2 ** attempt)), _MAX_COOLDOWN_SEC)
-        from_server_hint = hinted_delay is not None and cooldown == hinted_delay
+        if hinted_delay is not None and cooldown == hinted_delay:
+            cooldown_source = "server hint"
+        elif attempt == 0:
+            cooldown_source = "base delay"
+        else:
+            cooldown_source = "exponential backoff (attempt {})".format(attempt + 1)
         _LOGGER.warning(
             "All Gemini models failed on attempt %d/%d, cooling down %.1fs before retry (source=%s)",
-            attempt + 1, max_retries + 1, cooldown, "server hint" if from_server_hint else "exponential backoff",
+            attempt + 1, max_retries + 1, cooldown, cooldown_source,
         )
         if on_cooldown is not None:
             try:
