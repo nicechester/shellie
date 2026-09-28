@@ -96,9 +96,47 @@ def _append_memory_run(args: Dict[str, Any]) -> str:
     return append_memory(str(args.get("content", "")))
 
 
+def call_web_search(query: str) -> str:
+    """Call the search model with google_search grounding and return the answer text."""
+    key = settings.get("GEMINI_API_KEY")
+    timeout = settings.get("GEMINI_TIMEOUT_SEC")
+    model = settings.get("SEARCH_MODEL")[0]
+    url = _GEMINI_URL_TEMPLATE.format(model)
+    payload = {
+        "contents": [{"parts": [{"text": query}]}],
+        "tools": [{"google_search": {}}],
+    }
+    _LOGGER.debug("web search model=%s query=%s", model, query)
+    res, status, _headers = http_post_h(url, payload, headers={"x-goog-api-key": key}, timeout=timeout)
+    _LOGGER.debug("web search response model=%s status=%s", model, status)
+    if status != 200:
+        return "Web search failed (HTTP {})".format(status)
+    parsed = parse_response(res)
+    return parsed.text or "(no result)"
+
+
+def _execute_web_search_declaration() -> Dict[str, Any]:
+    return {
+        "name": "execute_web_search",
+        "description": "Search the web for current information using Google Search grounding.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "query": {"type": "STRING", "description": "Search query"},
+            },
+            "required": ["query"],
+        },
+    }
+
+
+def _execute_web_search_run(args: Dict[str, Any]) -> str:
+    return call_web_search(str(args.get("query", "")))
+
+
 TOOL_REGISTRY: List[ToolEntry] = [
     ToolEntry("execute_shell", _execute_shell_declaration, _execute_shell_run),
     ToolEntry("append_memory", _append_memory_declaration, _append_memory_run),
+    ToolEntry("execute_web_search", _execute_web_search_declaration, _execute_web_search_run),
 ]
 
 
@@ -118,8 +156,7 @@ def build_tools_schema() -> List[Dict[str, Any]]:
         declarations.extend(mcp.tool_declarations())
     except Exception:
         _LOGGER.exception("Exception building MCP tool declarations, using built-in tools only")
-    # googleSearch must be a separate top-level entry, not inside functionDeclarations.
-    return [{"googleSearch": {}}, {"functionDeclarations": declarations}]
+    return [{"functionDeclarations": declarations}]
 
 
 def _describe_py_skill(name: str, path: str) -> str:

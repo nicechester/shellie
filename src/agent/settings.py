@@ -228,8 +228,7 @@ class SettingSpec:
 
 _DEFAULT_SYSTEM_PROMPT = (
     "You are Shellie, a personal assistant running on the user's own computer. "
-    "You have built-in Google Search capability — use it directly for current events, "
-    "news, stock prices, weather, and any other real-time information. "
+    "Answer questions directly from your own knowledge whenever possible. "
     "Only call execute_shell when the task genuinely requires running something on this machine "
     "(e.g. file operations, running scripts, checking local system state). "
     "Use append_memory only when the user explicitly asks you to remember something."
@@ -363,6 +362,13 @@ CATALOG: Tuple[SettingSpec, ...] = (
             '"headers":{"Authorization":"Bearer ..."}}]'
         ),
         constraint=_MCP_SERVERS_CONSTRAINT,
+    ),
+    SettingSpec(
+        "SEARCH_MODEL", "str", _parse_model_chain,
+        default=("gemma-4-26b-a4b-it",),
+        apply_timing="immediate (next web search)",
+        description="Model used for execute_web_search (google_search grounding)",
+        constraint="Single model name",
     ),
 )
 

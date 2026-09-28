@@ -17,6 +17,7 @@ def _settings_get(overrides: dict):
         "GEMINI_RETRY_BASE_DELAY_SEC": 60,
         "GEMINI_MAX_RETRIES": 0,
         "SYSTEM_PROMPT": "SYS",
+        "SEARCH_MODEL": ("search-model",),
     }
     defaults.update(overrides)
 
@@ -587,8 +588,7 @@ class ToolsRegistryTests(unittest.TestCase):
         ):
             schema = gemini.build_tools_schema()
 
-        fc_entry = next(e for e in schema if "functionDeclarations" in e)
-        declarations = fc_entry["functionDeclarations"]
+        declarations = schema[0]["functionDeclarations"]
         exec_decl = next(d for d in declarations if d["name"] == "execute_shell")
         self.assertIn("Linux", exec_decl["description"])
         self.assertIn("x86_64", exec_decl["description"])
@@ -687,6 +687,41 @@ class ListSkillsTests(unittest.TestCase):
         lines = result.split("\n")
         self.assertIn("- skills/alpha.py: Alpha skill summary.", lines)
         self.assertIn("- skills/beta.md: Beta procedure", lines)
+
+
+class CallWebSearchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        settings_patcher = mock.patch.object(gemini, "settings")
+        http_post_patcher = mock.patch.object(gemini, "http_post_h")
+        self.mock_settings = settings_patcher.start()
+        self.mock_http_post = http_post_patcher.start()
+        self.addCleanup(settings_patcher.stop)
+        self.addCleanup(http_post_patcher.stop)
+        self.mock_settings.get.side_effect = _settings_get({})
+
+    def test_success_returns_text(self) -> None:
+        res = {"candidates": [{"content": {"parts": [{"text": "Bitcoin is $100k."}]}, "finishReason": "STOP"}]}
+        self.mock_http_post.return_value = (res, 200, {})
+
+        result = gemini.call_web_search("bitcoin price")
+
+        self.assertEqual(result, "Bitcoin is $100k.")
+        args, kwargs = self.mock_http_post.call_args
+        self.assertIn("search-model", args[0])
+        self.assertNotIn("key=", args[0])
+        self.assertEqual(kwargs["headers"]["x-goog-api-key"], "test-api-key-1234567890")
+        self.assertEqual(args[1]["tools"], [{"google_search": {}}])
+
+    def test_http_error_returns_error_string(self) -> None:
+        self.mock_http_post.return_value = ({}, 500, {})
+        result = gemini.call_web_search("query")
+        self.assertEqual(result, "Web search failed (HTTP 500)")
+
+    def test_empty_text_returns_no_result(self) -> None:
+        res = {"candidates": [{"content": {"parts": [{"text": ""}]}, "finishReason": "STOP"}]}
+        self.mock_http_post.return_value = (res, 200, {})
+        result = gemini.call_web_search("query")
+        self.assertEqual(result, "(no result)")
 
 
 class BuildSystemInstructionTests(unittest.TestCase):
