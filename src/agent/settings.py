@@ -265,7 +265,7 @@ CATALOG: Tuple[SettingSpec, ...] = (
     ),
     SettingSpec(
         "GEMINI_TIMEOUT_SEC", "int", _make_int_parser(5, 300),
-        default=60, apply_timing="immediate",
+        default=120, apply_timing="immediate",
         description="Gemini API call timeout (seconds)",
         constraint="5~300",
     ),

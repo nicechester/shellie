@@ -23,7 +23,7 @@ _MAX_COOLDOWN_SEC = 300
 
 # Short exponential backoff for 5xx/transport errors (transient overload).
 # Retries the same model up to this many times before falling back.
-_5XX_RETRY_BASE_SEC = 1
+_5XX_RETRY_BASE_SEC = 10
 _5XX_MAX_RETRIES = 3
 
 _RETRY_DELAY_MESSAGE_RE = re.compile(r"retry in ([\d.]+)s", re.IGNORECASE)

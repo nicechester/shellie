@@ -25,7 +25,7 @@ _history: List[Dict[str, Any]] = []
 _last_activity: float = 0.0
 
 _SETTINGS_TOKENS = ("/settings", "/get", "/set", "/unset")
-_BYPASS_TOKENS = ("/mem", "/restart", "/reset", "/sh", "/help", "/queue")
+_BYPASS_TOKENS = ("/mem", "/restart", "/reset", "/sh", "/help", "/queue", "/kill", "/systemlog")
 
 _HELP_TEXT = (
     "<b>Bypass commands</b> (no LLM)\n"
@@ -34,6 +34,8 @@ _HELP_TEXT = (
     "<code>/reset</code> — clear conversation history\n"
     "<code>/restart</code> — restart the process\n"
     "<code>/queue</code> — show task queue status\n"
+    "<code>/kill</code> — drain queue and discard pending tasks\n"
+    "<code>/systemlog [N]</code> — show last N lines of agent.log (default 50)\n"
     "<code>/help</code> — show this message\n"
     "\n"
     "<b>Settings commands</b>\n"
@@ -53,6 +55,18 @@ _CODE_RE = re.compile(r"`([^`]+?)`")
 def _reset_history() -> None:
     global _history
     _history = []
+
+
+def _drain_queue() -> int:
+    drained = 0
+    while True:
+        try:
+            _task_queue.get_nowait()
+            _task_queue.task_done()
+            drained += 1
+        except queue.Empty:
+            break
+    return drained
 
 
 def process_update(update: Dict[str, Any]) -> None:
@@ -267,7 +281,6 @@ def _handle_settings_command(chat_id: int, message_id: Optional[int], text: str)
 def _queue_status_text() -> str:
     depth = _task_queue.qsize()
     active = _queue_active_item
-    cooldown_until = _queue_cooldown_until
     lines = ["<b>Queue status</b>"]
     if active is not None:
         preview = html.escape(active.text[:80])
@@ -275,9 +288,6 @@ def _queue_status_text() -> str:
     else:
         lines.append("💤 대기 중 (idle)")
     lines.append("대기 항목: {}".format(depth))
-    remaining = cooldown_until - time.time()
-    if remaining > 0:
-        lines.append("⏳ 429 쿨다운: {}초 남음".format(int(remaining)))
     return "\n".join(lines)
 
 
@@ -326,7 +336,30 @@ def _handle_bypass_command(chat_id: int, text: str) -> bool:
 
     if cmd == "/reset":
         _reset_history()
-        send_message(chat_id, "🔄 Conversation context cleared.")
+        drained = _drain_queue()
+        msg = "🔄 Conversation context cleared."
+        if drained:
+            msg += " (대기 항목 {}개 삭제됨)".format(drained)
+        send_message(chat_id, msg)
+        return True
+
+    if cmd == "/kill":
+        drained = _drain_queue()
+        active = _queue_active_item
+        active_note = " 현재 처리 중인 항목은 완료 후 중단됩니다." if active else ""
+        send_message(chat_id, "🗑️ 대기 항목 {}개 삭제됨.{}".format(drained, active_note))
+        return True
+
+    if cmd == "/systemlog":
+        parts = text.split(None, 1)
+        try:
+            n = int(parts[1]) if len(parts) > 1 else 50
+            n = max(1, min(n, 500))
+        except ValueError:
+            n = 50
+        log_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), "agent.log")
+        output = execute_shell("tail -{} {}".format(n, log_path))
+        send_message(chat_id, "<pre>{}</pre>".format(html.escape(output)))
         return True
 
     if cmd == "/restart":
@@ -376,7 +409,6 @@ def _markdown_to_html(text: str) -> str:
 # serially by a single worker thread.
 # ---------------------------------------------------------------------------
 
-_QUEUE_RPM_COOLDOWN_SEC = 60
 
 
 class _QueueItem:
@@ -389,7 +421,6 @@ class _QueueItem:
 
 _task_queue: queue.Queue = queue.Queue()  # unbounded
 _queue_active_item: Optional[_QueueItem] = None  # worker thread only (read by /queue on main)
-_queue_cooldown_until: float = 0.0  # worker thread only (read by /queue on main)
 
 
 def start_queue_worker() -> None:
@@ -398,7 +429,7 @@ def start_queue_worker() -> None:
 
 
 def _queue_worker() -> None:
-    global _queue_active_item, _queue_cooldown_until
+    global _queue_active_item
     while True:
         item: _QueueItem = _task_queue.get()
         _queue_active_item = item
@@ -416,36 +447,11 @@ def _queue_worker() -> None:
 
 
 def _process_llm_item(item: _QueueItem) -> None:
-    """Process one LLM queue item, retrying on RPM 429 with cooldown.
-    Raises only on non-retryable failures (RPD exhaustion / non-429 errors).
+    """Process one LLM queue item. call_gemini already handles all retries
+    internally (RPM sleep + exponential backoff across the whole chain).
+    If it still raises, propagate so the worker can notify the user.
     """
-    global _queue_cooldown_until
-    while True:
-        try:
-            _handle_llm(item.chat_id, item.text)
-            return
-        except Exception as exc:
-            msg = str(exc)
-            # call_gemini raises "All Gemini models failed" when the whole
-            # chain is exhausted. Treat as RPM cooldown and retry.
-            # Any other exception (RPD exhaustion propagated, non-429) is re-raised.
-            if "All Gemini models failed" in msg:
-                _queue_cooldown_until = time.time() + _QUEUE_RPM_COOLDOWN_SEC
-                _LOGGER.warning(
-                    "Queue: all models failed (RPM), cooling down %ds before retry",
-                    _QUEUE_RPM_COOLDOWN_SEC,
-                )
-                try:
-                    send_message(
-                        item.chat_id,
-                        "⏳ 모든 모델이 한도에 도달했습니다. {}초 후 재시도합니다…".format(_QUEUE_RPM_COOLDOWN_SEC),
-                    )
-                except Exception:
-                    _LOGGER.debug("Failed to send RPM cooldown notice", exc_info=True)
-                time.sleep(_QUEUE_RPM_COOLDOWN_SEC)
-                _queue_cooldown_until = 0.0
-                continue
-            raise
+    _handle_llm(item.chat_id, item.text)
 
 
 def _trimmed_history(context_turns: int) -> List[Dict[str, Any]]:
@@ -474,7 +480,7 @@ def _make_cooldown_notifier(chat_id: int) -> Callable[[int, int, float], None]:
         try:
             send_message(
                 chat_id,
-                "⏳ Rate limited. Retrying in {}s… ({}/{})".format(
+                "⏳ 모든 모델 응답 실패. {}초 후 재시도… ({}/{})".format(
                     int(delay), attempt, max_retries
                 ),
             )

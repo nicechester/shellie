@@ -202,7 +202,7 @@ shadowed until you `/unset` that key (or delete `settings.json`).
 | `GEMINI_API_KEY` | *(required)* | 20–128 chars, `[A-Za-z0-9._-]` | No (web-only, secret) | immediate |
 | `ALLOWED_USER_ID` | *(required)* | integer 1 – 2^53−1, cannot equal the bot's own ID | No (web-only) | immediate |
 | `GEMINI_MODEL_CHAIN` | `gemini-2.5-flash,gemini-2.5-pro,gemini-2.5-flash-lite` | 1–5 comma-separated model names, no duplicates | Yes | immediate |
-| `GEMINI_TIMEOUT_SEC` | `60` | 5–300 | Yes | immediate |
+| `GEMINI_TIMEOUT_SEC` | `120` | 5–300 | Yes | immediate |
 | `GEMINI_FALLBACK_DELAY_SEC` | `1` | 0–10 | Yes | immediate |
 | `GEMINI_RETRY_BASE_DELAY_SEC` | `60` | 5–300 | Yes | immediate |
 | `GEMINI_MAX_RETRIES` | `2` | 0–5 | Yes | immediate |
