@@ -26,6 +26,62 @@ _MAX_COOLDOWN_SEC = 300
 _5XX_RETRY_BASE_SEC = 10
 _5XX_MAX_RETRIES = 3
 
+# Live retry/cooldown status, for display purposes only (e.g. web UI / bypass
+# commands). Updated by the task-queue worker thread as call_gemini
+# progresses; never consulted for retry/backoff/fallback decisions.
+_RETRY_STATUS: Dict[str, Any] = {
+    "phase": "idle",
+    "reason": None,
+    "model": None,
+    "until": None,
+    "attempt": None,
+    "max_attempts": None,
+    "updated_at": time.time(),
+}
+
+
+def _set_retry_status(
+    phase: str,
+    reason: Optional[str] = None,
+    model: Optional[str] = None,
+    delay: Optional[float] = None,
+    attempt: Optional[int] = None,
+    max_attempts: Optional[int] = None,
+) -> None:
+    """Publish the current retry/cooldown state for display via get_retry_status().
+
+    Builds a brand-new dict and rebinds the module global _RETRY_STATUS in one
+    step (copy-on-write); the rebind is atomic under the GIL, so readers on any
+    thread never observe a partially-updated dict. The only writer is the
+    task-queue worker thread; if that ever changes, last-writer-wins. Never
+    raises.
+    """
+    try:
+        now = time.time()
+        until = now + float(delay) if delay is not None else None
+        global _RETRY_STATUS
+        _RETRY_STATUS = {
+            "phase": phase,
+            "reason": reason,
+            "model": model,
+            "until": until,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "updated_at": now,
+        }
+    except Exception:
+        _LOGGER.debug("Exception setting retry status, ignoring", exc_info=True)
+
+
+def get_retry_status() -> Dict[str, Any]:
+    """Return a copy of the current retry/cooldown status.
+
+    Safe to call from any thread; the caller may freely mutate the returned
+    dict without affecting the module's internal state.
+    """
+    return dict(_RETRY_STATUS)
+
+
 _RETRY_DELAY_MESSAGE_RE = re.compile(r"retry in ([\d.]+)s", re.IGNORECASE)
 
 # Retry delays at or above this threshold are treated as RPD (Requests Per Day)
@@ -351,6 +407,7 @@ def _parse_retry_delay(res: Dict[str, Any]) -> Optional[float]:
 def call_gemini(
     contents: List[Dict[str, Any]],
     on_cooldown: Optional[Callable[[int, int, float], None]] = None,
+    allow_tools: bool = True,
 ) -> Tuple[Dict[str, Any], str]:
     """Call the Gemini model chain, retrying the whole chain with a cooldown
     on rate limit / transient errors.
@@ -366,8 +423,26 @@ def call_gemini(
     at _MAX_COOLDOWN_SEC. Non-fallback statuses (e.g. 400/401/403) raise
     immediately without any retry. `on_cooldown(attempt, max_retries, delay)`
     is invoked (best-effort, exceptions swallowed) right before each
-    cooldown sleep, so callers can notify the user.
+    cooldown sleep, so callers can notify the user. When `allow_tools` is
+    False, function calling is disabled for this call (mode "NONE") while
+    the tool declarations stay in the payload so history referencing prior
+    functionCall/functionResponse parts remains valid.
+
+    Live retry/cooldown state is published for display via
+    get_retry_status(); it is reset to idle when the call returns or raises.
     """
+    try:
+        return _call_gemini_impl(contents, on_cooldown, allow_tools)
+    finally:
+        _set_retry_status("idle")
+
+
+def _call_gemini_impl(
+    contents: List[Dict[str, Any]],
+    on_cooldown: Optional[Callable[[int, int, float], None]],
+    allow_tools: bool,
+) -> Tuple[Dict[str, Any], str]:
+    """Implementation of call_gemini; see call_gemini for semantics."""
     chain = settings.get("GEMINI_MODEL_CHAIN")
     key = settings.get("GEMINI_API_KEY")
     timeout = settings.get("GEMINI_TIMEOUT_SEC")
@@ -380,11 +455,14 @@ def call_gemini(
         "systemInstruction": build_system_instruction(),
         "tools": build_tools_schema(),
     }
+    if not allow_tools:
+        payload["toolConfig"] = {"functionCallingConfig": {"mode": "NONE"}}
 
     for attempt in range(max_retries + 1):
         hinted_delay: Optional[float] = None
 
         for index, model in enumerate(chain):
+            _set_retry_status("calling", model=model)
             url = _GEMINI_URL_TEMPLATE.format(model)
             req_headers = {"x-goog-api-key": key}
             _LOGGER.debug("Gemini request model=%s url=%s", model, url)
@@ -414,7 +492,11 @@ def call_gemini(
                         "Gemini model %s 429 RPM/TPM, sleeping %.1fs (%s) before retry",
                         model, rpm_sleep, hint_source,
                     )
+                    _set_retry_status(
+                        "cooldown", reason="429_rpm", model=model, delay=rpm_sleep, attempt=1, max_attempts=1
+                    )
                     time.sleep(rpm_sleep)
+                    _set_retry_status("calling", model=model)
                     # Retry same model: redo this iteration.
                     res, status, resp_headers = http_post_h(url, payload, headers=req_headers, timeout=timeout)
                     _LOGGER.debug("Gemini raw response model=%s status=%s body=%s", model, status, res)
@@ -437,7 +519,16 @@ def call_gemini(
                         "Gemini model %s transient error (HTTP %s), retry %d/%d in %.1fs",
                         model, status, retry, _5XX_MAX_RETRIES, backoff,
                     )
+                    _set_retry_status(
+                        "cooldown",
+                        reason="5xx" if status in _FALLBACK_5XX else "transport",
+                        model=model,
+                        delay=backoff,
+                        attempt=retry,
+                        max_attempts=_5XX_MAX_RETRIES,
+                    )
                     time.sleep(backoff)
+                    _set_retry_status("calling", model=model)
                     res, status, resp_headers = http_post_h(url, payload, headers=req_headers, timeout=timeout)
                     _LOGGER.debug("Gemini raw response model=%s status=%s body=%s", model, status, res)
                     if status == 200:
@@ -479,6 +570,9 @@ def call_gemini(
         _LOGGER.warning(
             "All Gemini models failed on attempt %d/%d, cooling down %.1fs before retry (source=%s)",
             attempt + 1, max_retries + 1, cooldown, cooldown_source,
+        )
+        _set_retry_status(
+            "cooldown", reason="chain_cooldown", model=None, delay=cooldown, attempt=attempt + 1, max_attempts=max_retries
         )
         if on_cooldown is not None:
             try:

@@ -204,7 +204,7 @@ class TestWebServer(unittest.TestCase):
         )
         self.assertEqual(resp.status, 400)
         self.assertEqual(self.store.get("SHELL_TIMEOUT_SEC"), 45)
-        self.assertEqual(self.store.get("FC_MAX_LOOPS"), 5)
+        self.assertEqual(self.store.get("FC_MAX_LOOPS"), 15)
 
     # ---- POST /settings: body handling -------------------------------------
 

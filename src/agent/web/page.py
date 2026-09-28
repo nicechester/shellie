@@ -11,7 +11,7 @@ _NUMBER_RANGES: Dict[str, Tuple[int, int]] = {
     "ALLOWED_USER_ID": (1, 9007199254740991),
     "GEMINI_TIMEOUT_SEC": (5, 300),
     "GEMINI_FALLBACK_DELAY_SEC": (0, 10),
-    "FC_MAX_LOOPS": (1, 10),
+    "FC_MAX_LOOPS": (1, 50),
     "CONTEXT_TURNS": (0, 50),
     "IDLE_RESET_MINUTES": (0, 1440),
     "SHELL_TIMEOUT_SEC": (1, 600),

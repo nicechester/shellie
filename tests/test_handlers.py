@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import time
 import unittest
 from unittest import mock
 
@@ -9,8 +8,11 @@ from src.agent.settings import Result
 from src.agent.telegram import handlers
 
 
-def _fc_response(calls, finish_reason="STOP"):
-    parts = [{"functionCall": {"name": name, "args": args}} for name, args in calls]
+def _fc_response(calls, finish_reason="STOP", text=None):
+    parts = []
+    if text is not None:
+        parts.append({"text": text})
+    parts.extend({"functionCall": {"name": name, "args": args}} for name, args in calls)
     return {
         "candidates": [
             {"content": {"role": "model", "parts": parts}, "finishReason": finish_reason}
@@ -67,7 +69,6 @@ class HandlersTestCase(unittest.TestCase):
         handlers._reset_history()
         handlers._last_activity = 0.0
         handlers._queue_active_item = None
-        handlers._queue_cooldown_until = 0.0
         # Drain any leftover items from a previous test.
         while not handlers._task_queue.empty():
             try:
@@ -113,7 +114,6 @@ class HandlersTestCase(unittest.TestCase):
         handlers._reset_history()
         handlers._last_activity = 0.0
         handlers._queue_active_item = None
-        handlers._queue_cooldown_until = 0.0
 
     def _drain_queue(self) -> None:
         """Process all queued LLM items synchronously by calling _handle_llm directly."""
@@ -312,20 +312,139 @@ class FunctionCallLoopTests(HandlersTestCase):
         names = [part["functionResponse"]["name"] for part in function_response_turn["parts"]]
         self.assertEqual(names, ["execute_shell", "append_memory"])
 
-    def test_loop_stops_at_fc_max_loops_with_limit_message(self) -> None:
+    def test_limit_reached_triggers_tools_disabled_wrapup_and_preserves_history(self) -> None:
         self._settings_values["FC_MAX_LOOPS"] = 2
-        fc_resp = _fc_response([("execute_shell", {"command": "ls"})])
-        self.mock_call_gemini.return_value = (fc_resp, "m1")
-        self.mock_run_tool.return_value = "output"
+        fc_ls = _fc_response([("execute_shell", {"command": "ls"})])
+        fc_pwd = _fc_response([("execute_shell", {"command": "pwd"})])
+        fc_whoami = _fc_response([("execute_shell", {"command": "whoami"})])
+        summary_resp = _text_response("summary")
+        self.mock_call_gemini.side_effect = [
+            (fc_ls, "m1"), (fc_pwd, "m1"), (fc_whoami, "m1"), (summary_resp, "m1"),
+        ]
+        self.mock_run_tool.side_effect = ["ls-output", "pwd-output"]
 
         handlers.process_update(self._update("loop forever"))
         self._drain_queue()
 
+        self.assertEqual(self.mock_call_gemini.call_count, 4)
+        self.assertEqual(self.mock_run_tool.call_count, 2)  # pending whoami never runs
+
+        last_call_kwargs = self.mock_call_gemini.call_args_list[-1][1]
+        self.assertIs(last_call_kwargs["allow_tools"], False)
+
         reply = self.mock_send_message.call_args[0][1]
-        self.assertIn("Function call limit", reply)
-        self.assertIn("2", reply)
-        self.assertEqual(self.mock_call_gemini.call_count, 3)  # fc_max_loops + 1
-        self.assertEqual(self.mock_run_tool.call_count, 2)
+        self.assertIn("도구 호출 한도(2회)", reply)
+        self.assertIn("summary", reply)
+
+        self.assertEqual(len(handlers._history), 2)
+        self.assertEqual(handlers._history[1]["parts"], [{"text": "summary"}])
+
+        last_call_contents = self.mock_call_gemini.call_args_list[-1][0][0]
+        final_turn = last_call_contents[-1]
+        self.assertEqual(final_turn["role"], "user")
+        self.assertTrue(final_turn["parts"][-1]["text"].startswith("[system]"))
+
+    def test_repeated_identical_calls_and_results_trigger_loop_detection(self) -> None:
+        self._settings_values["FC_MAX_LOOPS"] = 15
+        fc_ls = _fc_response([("execute_shell", {"command": "ls"})])
+        wrap_resp = _text_response("wrap")
+        self.mock_call_gemini.side_effect = [
+            (fc_ls, "m1"), (fc_ls, "m1"), (fc_ls, "m1"), (wrap_resp, "m1"),
+        ]
+        self.mock_run_tool.return_value = "same"
+
+        handlers.process_update(self._update("loop identical"))
+        self._drain_queue()
+
+        self.assertEqual(self.mock_run_tool.call_count, 3)
+        self.assertEqual(self.mock_call_gemini.call_count, 4)
+
+        last_call_kwargs = self.mock_call_gemini.call_args_list[-1][1]
+        self.assertIs(last_call_kwargs["allow_tools"], False)
+
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("3회 연속 반복", reply)
+        self.assertIn("wrap", reply)
+        self.assertEqual(len(handlers._history), 2)
+
+    def test_identical_calls_with_changing_results_are_not_flagged(self) -> None:
+        fc_ls = _fc_response([("execute_shell", {"command": "ls"})])
+        done_resp = _text_response("done")
+        self.mock_call_gemini.side_effect = [
+            (fc_ls, "m1"), (fc_ls, "m1"), (fc_ls, "m1"), (done_resp, "m1"),
+        ]
+        self.mock_run_tool.side_effect = ["a", "b", "c"]
+
+        handlers.process_update(self._update("poll status"))
+        self._drain_queue()
+
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertEqual(reply, "done")
+        for call in self.mock_call_gemini.call_args_list:
+            self.assertNotIn("allow_tools", call[1])
+
+    def test_reordered_parallel_batch_counts_as_repeat(self) -> None:
+        batch_a = _fc_response([("execute_shell", {"command": "ls"}), ("execute_shell", {"command": "pwd"})])
+        batch_b = _fc_response([("execute_shell", {"command": "pwd"}), ("execute_shell", {"command": "ls"})])
+        wrap_resp = _text_response("wrap")
+        self.mock_call_gemini.side_effect = [
+            (batch_a, "m1"), (batch_b, "m1"), (batch_a, "m1"), (wrap_resp, "m1"),
+        ]
+
+        def _run_tool_side_effect(name, args):
+            return "ls-output" if args.get("command") == "ls" else "pwd-output"
+
+        self.mock_run_tool.side_effect = _run_tool_side_effect
+
+        handlers.process_update(self._update("parallel loop"))
+        self._drain_queue()
+
+        # 3 iterations executed before the loop detector fires on the 3rd.
+        self.assertEqual(self.mock_call_gemini.call_count, 4)
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("3회 연속 반복", reply)
+
+    def test_wrapup_failure_falls_back_to_last_text(self) -> None:
+        self._settings_values["FC_MAX_LOOPS"] = 1
+        fc_with_text = _fc_response([("execute_shell", {"command": "ls"})], text="partial")
+        fc_pending = _fc_response([("execute_shell", {"command": "pwd"})])
+        self.mock_call_gemini.side_effect = [
+            (fc_with_text, "m1"),
+            (fc_pending, "m1"),
+            Exception("boom"),
+        ]
+        self.mock_run_tool.return_value = "ls-output"
+
+        handlers.process_update(self._update("cap with partial text"))
+        self._drain_queue()
+
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("도구 호출 한도(1회)", reply)
+        self.assertIn("partial", reply)
+        self.assertNotIn("boom", reply)
+
+        self.assertEqual(len(handlers._history), 2)
+        self.assertEqual(handlers._history[1]["parts"], [{"text": "partial"}])
+
+    def test_wrapup_without_any_text_sends_notice_and_keeps_no_history(self) -> None:
+        self._settings_values["FC_MAX_LOOPS"] = 1
+        fc_pending_1 = _fc_response([("execute_shell", {"command": "ls"})])
+        fc_pending_2 = _fc_response([("execute_shell", {"command": "pwd"})])
+        empty_wrapup = _text_response("")
+        self.mock_call_gemini.side_effect = [
+            (fc_pending_1, "m1"),
+            (fc_pending_2, "m1"),
+            (empty_wrapup, "m1"),
+        ]
+        self.mock_run_tool.return_value = "ls-output"
+
+        handlers.process_update(self._update("cap with no text at all"))
+        self._drain_queue()
+
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("도구 호출 한도(1회)", reply)
+        self.assertIn("(요약 응답을 생성하지 못했습니다.)", reply)
+        self.assertEqual(handlers._history, [])
 
     def test_blocked_response_sends_blocked_message_and_history_not_retained(self) -> None:
         self.mock_call_gemini.return_value = (_blocked_response("SAFETY"), "m1")
@@ -403,37 +522,19 @@ class QueueTests(HandlersTestCase):
         reply = self.mock_send_message.call_args[0][1]
         self.assertIn("what is the weather today", reply)
 
-    def test_queue_status_shows_cooldown_remaining(self) -> None:
-        handlers._queue_cooldown_until = time.time() + 45
-        handlers.process_update(self._update("/queue"))
-        reply = self.mock_send_message.call_args[0][1]
-        self.assertIn("429", reply)
-        self.assertIn("쿨다운", reply)
-
-    def test_process_llm_item_retries_on_all_models_failed(self) -> None:
-        """_process_llm_item retries after RPM cooldown when call_gemini raises."""
-        ok_resp = _text_response("done")
-        call_count = {"n": 0}
-
-        def _handle_llm_side_effect(chat_id, text):
-            call_count["n"] += 1
-            if call_count["n"] == 1:
-                raise Exception("All Gemini models failed (rate limit or transient error).")
-            # Second call: simulate success by calling real _run_llm_turn path
-            # via mock_call_gemini returning ok_resp.
-
+    def test_process_llm_item_delegates_to_handle_llm(self) -> None:
+        """_process_llm_item calls _handle_llm; retry/cooldown now lives in call_gemini."""
         sleep_patcher = mock.patch.object(handlers.time, "sleep")
-        handle_llm_patcher = mock.patch.object(handlers, "_handle_llm", side_effect=_handle_llm_side_effect)
-        with sleep_patcher as mock_sleep, handle_llm_patcher:
+        handle_llm_patcher = mock.patch.object(handlers, "_handle_llm")
+        with sleep_patcher as mock_sleep, handle_llm_patcher as mock_handle_llm:
             item = handlers._QueueItem(chat_id=1, text="test")
-            # Run _process_llm_item; it will retry once then succeed (no exception on 2nd call)
             handlers._process_llm_item(item)
 
-        self.assertEqual(call_count["n"], 2)
-        mock_sleep.assert_called_once_with(handlers._QUEUE_RPM_COOLDOWN_SEC)
+        mock_handle_llm.assert_called_once_with(1, "test")
+        mock_sleep.assert_not_called()
 
-    def test_process_llm_item_raises_on_non_rpm_exception(self) -> None:
-        """_process_llm_item re-raises non-RPM exceptions immediately."""
+    def test_process_llm_item_propagates_exceptions(self) -> None:
+        """_process_llm_item exceptions propagate to the worker, which notifies the user."""
         def _fail(chat_id, text):
             raise ValueError("bad input")
 
@@ -441,6 +542,124 @@ class QueueTests(HandlersTestCase):
             item = handlers._QueueItem(chat_id=1, text="test")
             with self.assertRaises(ValueError):
                 handlers._process_llm_item(item)
+
+    def test_queue_status_retry_idle_adds_no_retry_lines(self) -> None:
+        """Idle retry status adds no emoji lines."""
+        with mock.patch.object(handlers, "get_retry_status", return_value={"phase": "idle"}):
+            handlers.process_update(self._update("/queue"))
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertNotIn("📡", reply)
+        self.assertNotIn("⏳", reply)
+
+    def test_queue_status_retry_calling_shows_model(self) -> None:
+        """Calling phase with model shows emoji and model name."""
+        with mock.patch.object(handlers, "get_retry_status",
+                              return_value={"phase": "calling", "model": "gemini-x"}):
+            handlers.process_update(self._update("/queue"))
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("📡 모델 호출 중: <code>gemini-x</code>", reply)
+
+    def test_queue_status_retry_rpm_cooldown_shows_remaining(self) -> None:
+        """RPM cooldown shows remaining seconds and attempt counter."""
+        with mock.patch.object(handlers.time, "time", return_value=1000.0), \
+             mock.patch.object(handlers, "get_retry_status",
+                              return_value={
+                                  "phase": "cooldown",
+                                  "reason": "429_rpm",
+                                  "until": 1030.0,
+                                  "attempt": 1,
+                                  "max_attempts": 1,
+                                  "model": "m1"
+                              }):
+            handlers.process_update(self._update("/queue"))
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("429(RPM) 쿨다운: 30초 남음", reply)
+        self.assertIn("재시도 1/1", reply)
+
+    def test_queue_status_retry_5xx_shows_attempt(self) -> None:
+        """5xx cooldown shows remaining seconds and attempt counter with 회차."""
+        with mock.patch.object(handlers.time, "time", return_value=1000.0), \
+             mock.patch.object(handlers, "get_retry_status",
+                              return_value={
+                                  "phase": "cooldown",
+                                  "reason": "5xx",
+                                  "until": 1020.0,
+                                  "attempt": 2,
+                                  "max_attempts": 3,
+                                  "model": "m1"
+                              }):
+            handlers.process_update(self._update("/queue"))
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("서버 오류(5xx) 재시도 대기: 20초 남음", reply)
+        self.assertIn("2/3회차", reply)
+
+    def test_queue_status_retry_transport_shows_network_error(self) -> None:
+        """Transport error cooldown shows network error message."""
+        with mock.patch.object(handlers.time, "time", return_value=1000.0), \
+             mock.patch.object(handlers, "get_retry_status",
+                              return_value={
+                                  "phase": "cooldown",
+                                  "reason": "transport",
+                                  "until": 1015.0,
+                                  "attempt": 1,
+                                  "max_attempts": 3,
+                                  "model": "m1"
+                              }):
+            handlers.process_update(self._update("/queue"))
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("네트워크 오류 재시도 대기", reply)
+
+    def test_queue_status_retry_chain_cooldown_shows_pass_counter(self) -> None:
+        """Chain cooldown shows pass counter without model name."""
+        with mock.patch.object(handlers.time, "time", return_value=1000.0), \
+             mock.patch.object(handlers, "get_retry_status",
+                              return_value={
+                                  "phase": "cooldown",
+                                  "reason": "chain_cooldown",
+                                  "until": 1120.0,
+                                  "attempt": 1,
+                                  "max_attempts": 2,
+                                  "model": None
+                              }):
+            handlers.process_update(self._update("/queue"))
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("모든 모델 실패, 전체 재시도 대기: 120초 남음 (1/2)", reply)
+
+    def test_queue_status_retry_remaining_clamped_at_zero(self) -> None:
+        """Remaining seconds clamped at zero when until is in the past."""
+        with mock.patch.object(handlers.time, "time", return_value=1000.0), \
+             mock.patch.object(handlers, "get_retry_status",
+                              return_value={
+                                  "phase": "cooldown",
+                                  "reason": "transport",
+                                  "until": 990.0,
+                                  "attempt": 1,
+                                  "max_attempts": 1,
+                                  "model": "m1"
+                              }):
+            handlers.process_update(self._update("/queue"))
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("0초 남음", reply)
+
+    def test_queue_status_retry_model_name_escaped(self) -> None:
+        """Model name with HTML special chars is escaped."""
+        with mock.patch.object(handlers, "get_retry_status",
+                              return_value={
+                                  "phase": "calling",
+                                  "model": "<b>x"
+                              }):
+            handlers.process_update(self._update("/queue"))
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("&lt;b&gt;x", reply)
+        self.assertNotIn("<b>x", reply)
+
+    def test_queue_status_retry_malformed_status_does_not_crash(self) -> None:
+        """Malformed status (e.g. until as string) does not crash, reply is still sent."""
+        with mock.patch.object(handlers, "get_retry_status",
+                              return_value={"phase": "cooldown", "until": "bad"}):
+            handlers.process_update(self._update("/queue"))
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("대기 항목", reply)
 
 
 if __name__ == "__main__":

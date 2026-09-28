@@ -61,6 +61,7 @@ class CallGeminiFallbackTests(unittest.TestCase):
         ):
             self.addCleanup(patcher.stop)
 
+        self.addCleanup(gemini._set_retry_status, "idle")
         self._configure_settings({})
 
     def _configure_settings(self, overrides: dict) -> None:
@@ -225,6 +226,27 @@ class CallGeminiFallbackTests(unittest.TestCase):
 
         self.assertIn("All Gemini models", str(ctx.exception))
 
+    def test_allow_tools_false_sets_function_calling_mode_none(self) -> None:
+        res = {"candidates": []}
+        self.mock_http_post.return_value = (res, 200, {})
+
+        gemini.call_gemini(self._contents(), allow_tools=False)
+
+        args, _kwargs = self.mock_http_post.call_args
+        payload = args[1]
+        self.assertEqual(payload["toolConfig"], {"functionCallingConfig": {"mode": "NONE"}})
+        self.assertIn("tools", payload)
+
+    def test_default_payload_has_no_tool_config(self) -> None:
+        res = {"candidates": []}
+        self.mock_http_post.return_value = (res, 200, {})
+
+        gemini.call_gemini(self._contents())
+
+        args, _kwargs = self.mock_http_post.call_args
+        payload = args[1]
+        self.assertNotIn("toolConfig", payload)
+
     def test_uses_api_key_header_never_in_url(self) -> None:
         res = {"candidates": []}
         self.mock_http_post.return_value = (res, 200, {})
@@ -378,6 +400,164 @@ class CallGeminiFallbackTests(unittest.TestCase):
             gemini.call_gemini(self._contents())
 
         self.mock_sleep.assert_called_once_with(4)
+
+    def test_retry_status_idle_before_and_after_successful_call(self) -> None:
+        """get_retry_status returns idle before and after successful call; http-time snapshot shows calling."""
+        res = {"candidates": []}
+        self.mock_http_post.return_value = (res, 200, {})
+
+        snapshots = []
+        def _capture_during_request(url, payload, **kwargs):
+            snapshots.append(gemini.get_retry_status())
+            return (res, 200, {})
+        self.mock_http_post.side_effect = _capture_during_request
+
+        # Before call
+        self.assertEqual(gemini.get_retry_status()["phase"], "idle")
+
+        # Call
+        gemini.call_gemini(self._contents())
+
+        # After call
+        self.assertEqual(gemini.get_retry_status()["phase"], "idle")
+
+        # During request: phase is calling with model m1
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(snapshots[0]["phase"], "calling")
+        self.assertEqual(snapshots[0]["model"], "m1")
+
+    def test_retry_status_rpm_cooldown_during_sleep(self) -> None:
+        """RPM 429 cooldown: one sleep snapshot with phase cooldown, reason 429_rpm, model m1, attempt 1/1."""
+        res_ok = {"candidates": []}
+        self.mock_http_post.side_effect = [(self._rpm_429("30s"), 429, {}), (res_ok, 200, {})]
+
+        snapshots = []
+        self.mock_sleep.side_effect = lambda s: snapshots.append(gemini.get_retry_status())
+
+        result, model = gemini.call_gemini(self._contents())
+
+        self.assertEqual(model, "m1")
+        self.assertEqual(len(snapshots), 1)
+        snap = snapshots[0]
+        self.assertEqual(snap["phase"], "cooldown")
+        self.assertEqual(snap["reason"], "429_rpm")
+        self.assertEqual(snap["model"], "m1")
+        self.assertEqual(snap["attempt"], 1)
+        self.assertEqual(snap["max_attempts"], 1)
+        self.assertAlmostEqual(snap["until"] - snap["updated_at"], 30.0, delta=1.0)
+
+    def test_retry_status_5xx_cooldown_attempts_increment(self) -> None:
+        """503 retries on m1: 3 sleep snapshots with reason 5xx, model m1, attempts [1,2,3]."""
+        res_503 = {"error": {"code": 503, "status": "UNAVAILABLE"}}
+        res_ok = {"candidates": []}
+        side = [(res_503, 503, {})] * (1 + gemini._5XX_MAX_RETRIES) + [(res_ok, 200, {})]
+        self.mock_http_post.side_effect = side
+
+        snapshots = []
+        def _capture_sleep(s):
+            snapshots.append(gemini.get_retry_status())
+        self.mock_sleep.side_effect = _capture_sleep
+
+        result, model = gemini.call_gemini(self._contents())
+
+        # m1 exhausts its retry budget, so the success comes from m2.
+        self.assertEqual(model, "m2")
+        # 3 5xx sleeps, then 1 inter-model delay sleep
+        self.assertEqual(len(snapshots), 4)
+
+        # First 3 sleeps are 5xx reason
+        for i in range(3):
+            snap = snapshots[i]
+            self.assertEqual(snap["reason"], "5xx", f"snapshot {i}")
+            self.assertEqual(snap["model"], "m1", f"snapshot {i}")
+            self.assertEqual(snap["attempt"], i + 1, f"snapshot {i}")
+            self.assertEqual(snap["max_attempts"], gemini._5XX_MAX_RETRIES, f"snapshot {i}")
+            expected_delay = gemini._5XX_RETRY_BASE_SEC * (2 ** i)
+            self.assertAlmostEqual(snap["until"] - snap["updated_at"], expected_delay, delta=1.0, msg=f"snapshot {i}")
+
+        # 4th sleep is inter-model fallback delay (stays "calling", model m1)
+        snap4 = snapshots[3]
+        self.assertEqual(snap4["phase"], "calling")
+        self.assertEqual(snap4["model"], "m1")
+
+    def test_retry_status_transport_reason_for_status_zero(self) -> None:
+        """Status 0 (transport failure): single sleep snapshot with reason transport."""
+        res_err = {"error": "transport failure"}
+        res_ok = {"candidates": []}
+        side = [(res_err, 0, {})] * (1 + gemini._5XX_MAX_RETRIES) + [(res_ok, 200, {})]
+        self.mock_http_post.side_effect = side
+
+        snapshots = []
+        self.mock_sleep.side_effect = lambda s: snapshots.append(gemini.get_retry_status())
+
+        result, model = gemini.call_gemini(self._contents())
+
+        # m1 exhausts its retry budget, so the success comes from m2.
+        self.assertEqual(model, "m2")
+        # First transport retry, then inter-model delay
+        self.assertGreaterEqual(len(snapshots), 1)
+        # Find transport reason in snapshots
+        transport_snaps = [s for s in snapshots if s.get("reason") == "transport"]
+        self.assertGreater(len(transport_snaps), 0)
+
+    def test_retry_status_chain_cooldown_matches_on_cooldown_args(self) -> None:
+        """Chain cooldown: on_cooldown receives phase cooldown, reason chain_cooldown, model None, attempt/max matching."""
+        self._configure_settings({
+            "GEMINI_MODEL_CHAIN": ("m1",),
+            "GEMINI_MAX_RETRIES": 1,
+            "GEMINI_RETRY_BASE_DELAY_SEC": 60,
+        })
+        res_ok = {"candidates": []}
+        self.mock_http_post.side_effect = [(self._rpd_429(), 429, {}), (res_ok, 200, {})]
+
+        cooldown_snapshots = []
+        def _on_cooldown(attempt, max_retries, delay):
+            cooldown_snapshots.append(gemini.get_retry_status())
+
+        result, model = gemini.call_gemini(self._contents(), on_cooldown=_on_cooldown)
+
+        self.assertEqual(model, "m1")
+        self.assertEqual(len(cooldown_snapshots), 1)
+        snap = cooldown_snapshots[0]
+        self.assertEqual(snap["phase"], "cooldown")
+        self.assertEqual(snap["reason"], "chain_cooldown")
+        self.assertIsNone(snap["model"])
+        self.assertEqual(snap["attempt"], 1)
+        self.assertEqual(snap["max_attempts"], 1)
+        self.assertAlmostEqual(snap["until"] - snap["updated_at"], 60.0, delta=1.0)
+        # Idle after the call
+        self.assertEqual(gemini.get_retry_status()["phase"], "idle")
+
+    def test_retry_status_reset_to_idle_after_final_failure(self) -> None:
+        """All models fail: status is idle after raising."""
+        res = {"error": {"code": 503, "status": "UNAVAILABLE"}}
+        per_model = 1 + gemini._5XX_MAX_RETRIES
+        self.mock_http_post.side_effect = [(res, 503, {})] * (per_model * 2)
+
+        with self.assertRaises(Exception):
+            gemini.call_gemini(self._contents())
+
+        self.assertEqual(gemini.get_retry_status()["phase"], "idle")
+
+    def test_retry_status_reset_to_idle_after_non_fallback_raise(self) -> None:
+        """400 error raises immediately; status is idle after."""
+        res = {"error": {"status": "INVALID_ARGUMENT", "message": "bad request"}}
+        self.mock_http_post.side_effect = [(res, 400, {})]
+
+        with self.assertRaises(Exception):
+            gemini.call_gemini(self._contents())
+
+        self.assertEqual(gemini.get_retry_status()["phase"], "idle")
+
+    def test_get_retry_status_returns_copy(self) -> None:
+        """Mutating returned dict does not affect next get_retry_status()."""
+        status1 = gemini.get_retry_status()
+        status1["phase"] = "mutated"
+        status1["_dummy"] = "added"
+
+        status2 = gemini.get_retry_status()
+        self.assertNotEqual(status2.get("phase"), "mutated")
+        self.assertNotIn("_dummy", status2)
 
 
 class ParseRetryDelayTests(unittest.TestCase):
