@@ -264,6 +264,7 @@ def _handle_settings_command(chat_id: int, message_id: Optional[int], text: str)
 
 def _run_shell_bypass(chat_id: int, command: str) -> None:
     send_chat_action(chat_id)
+    send_message(chat_id, "⚙️ <code>{}</code>".format(html.escape(command)))
     output = execute_shell(command)
     send_message(chat_id, "<pre>{}</pre>".format(html.escape(output)))
 
@@ -429,10 +430,14 @@ def _run_llm_turn(
                 return
 
             contents.append(parsed.raw_content)
-            response_parts = [
-                {"functionResponse": {"name": name, "response": {"output": run_tool(name, args)}}}
-                for name, args in parsed.function_calls
-            ]
+            response_parts = []
+            for name, args in parsed.function_calls:
+                _LOGGER.info("tool_call name=%s args=%r", name, args)
+                result = run_tool(name, args)
+                _LOGGER.info("tool_result name=%s result=%r", name, result[:200] if isinstance(result, str) else result)
+                response_parts.append(
+                    {"functionResponse": {"name": name, "response": {"output": result}}}
+                )
             contents.append({"role": "user", "parts": response_parts})
             loop_count += 1
             continue

@@ -150,7 +150,7 @@ def send_chat_action(chat_id: int, action: str = "typing") -> None:
     try:
         http_post(url, payload)
     except Exception:
-        pass
+        _LOGGER.debug("send_chat_action failed", exc_info=True)
 
 
 def delete_message(chat_id: int, message_id: int) -> bool:

@@ -10,7 +10,7 @@ from typing import Any, Optional
 
 from src.agent.config import BASE_DIR, OFFSET_FILE, SHELLIE_HOME, settings
 from src.agent.core import shell
-from src.agent.telegram.client import get_me, get_updates, register_prechecks
+from src.agent.telegram.client import get_me, get_updates, register_prechecks, send_message
 from src.agent.telegram.handlers import process_update
 from src.agent.web.server import manager
 
@@ -125,9 +125,21 @@ def _run_setup_required_mode(missing: Any) -> None:
     _LOGGER.info("Required values provided, starting polling")
 
 
+def _notify_startup() -> None:
+    """Best-effort: send a startup notice to the allowed user."""
+    user_id = settings.get("ALLOWED_USER_ID")
+    if not user_id:
+        return
+    try:
+        send_message(user_id, "✅ Shellie started.", parse_mode=None)
+    except Exception:
+        _LOGGER.debug("Failed to send startup notification", exc_info=True)
+
+
 def _run_polling_loop() -> None:
     global _polling_active
     _polling_active = True
+    _notify_startup()
     offset = _read_offset()
     backoff = 1
 

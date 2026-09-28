@@ -467,6 +467,18 @@ class IsRpdLimitTests(unittest.TestCase):
         res = {"error": {"message": "Rate limit exceeded, retry in 30s.", "details": []}}
         self.assertFalse(gemini._is_rpd_limit(res, None))
 
+    def test_account_quota_exhausted_message_is_rpd(self) -> None:
+        """Account-level RPD: no QuotaFailure detail, only google.rpc.Help link."""
+        res = {
+            "error": {
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "message": "You exceeded your current quota, please check your plan and billing details.",
+                "details": [{"@type": "type.googleapis.com/google.rpc.Help", "links": []}],
+            }
+        }
+        self.assertTrue(gemini._is_rpd_limit(res, None))
+
     def test_short_delay_with_rpd_quota_id_is_still_rpd(self) -> None:
         # Real RPD responses have short retryDelay (18-50s), not hours.
         # The delay value must NOT affect the result.
@@ -575,7 +587,8 @@ class ToolsRegistryTests(unittest.TestCase):
         ):
             schema = gemini.build_tools_schema()
 
-        declarations = schema[0]["functionDeclarations"]
+        fc_entry = next(e for e in schema if "functionDeclarations" in e)
+        declarations = fc_entry["functionDeclarations"]
         exec_decl = next(d for d in declarations if d["name"] == "execute_shell")
         self.assertIn("Linux", exec_decl["description"])
         self.assertIn("x86_64", exec_decl["description"])
