@@ -4,10 +4,16 @@ import os
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
-# User workspace: runtime/user data lives here, separate from the source repo.
+# Config/context directory: settings, memories, offset file live here.
 # Override with SHELLIE_HOME env var before starting the process.
 SHELLIE_HOME = os.path.abspath(
     os.environ.get("SHELLIE_HOME") or os.path.join(os.path.expanduser("~"), ".shellie")
+)
+
+# User workspace: job outputs, generated code, documents saved here (separate from config).
+# Override with SHELLIE_WORKSPACE env var before starting the process.
+SHELLIE_WORKSPACE = os.path.abspath(
+    os.environ.get("SHELLIE_WORKSPACE") or os.path.join(os.path.expanduser("~"), "workspace")
 )
 
 MEMORY_DIR = os.path.join(SHELLIE_HOME, "memory")
@@ -19,6 +25,7 @@ SETTINGS_FILE = os.path.join(SHELLIE_HOME, "settings.json")
 
 os.makedirs(MEMORY_DIR, exist_ok=True)
 os.makedirs(SKILLS_DIR, exist_ok=True)
+os.makedirs(SHELLIE_WORKSPACE, exist_ok=True)
 
 # Seed MEMORY.md from the repo template on first run.
 _MEMORY_TEMPLATE = os.path.join(BASE_DIR, "memory", "MEMORY.md")

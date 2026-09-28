@@ -39,9 +39,10 @@ bypass, 24/7 via launchd/systemd.
   `addCleanup(register_precheck, key, None)`.
 - `core/shell.py` — POSIX shell engine: resolution chain (SHELL_PATH `auto` →
   /bin/zsh on darwin → $SHELL → login shell → /bin/sh; `/etc/shells` + X_OK
-  validated), `Popen([shell, "-c", cmd], start_new_session=True)`, timeout →
-  killpg SIGTERM → 2s → SIGKILL, `kill_active()` for SIGTERM handler, per-OS
-  PATH augmentation, output = stdout + `[stderr]` + `[exit N]`, truncation.
+  validated), `Popen([shell, "-c", cmd], start_new_session=True)` with cwd =
+  SHELLIE_WORKSPACE (user workspace, not repo root; separate from config dir),
+  timeout → killpg SIGTERM → 2s → SIGKILL, `kill_active()` for SIGTERM handler,
+  per-OS PATH augmentation, output = stdout + `[stderr]` + `[exit N]`, truncation.
 - `core/memory.py` — core `memory/MEMORY.md` (permanent, never auto-written) +
   dated files `memory/YYYY-MM-DD.md` (append_memory target, one-line entries).
   `read_memory()` injects **core + today only**; older memories are grep-searched
@@ -124,6 +125,9 @@ Phases 0–9 all implemented. Recent changes:
   owns all retry/cooldown logic.
 - Added `/kill`, `/systemlog [N]` bypass commands; `/reset` now also drains queue.
 - `execute_web_search` tool added (google_search grounding via SEARCH_MODEL).
+- Workspace directory split: SHELLIE_HOME (~/.shellie/) for config/context;
+  SHELLIE_WORKSPACE (~/workspace) for job outputs/generated code; cwd set to
+  SHELLIE_WORKSPACE; both configurable via env vars; issue #3.
 - Issue #13 open: OpenAI-compatible LLM backend support.
 
 Outstanding:

@@ -8,7 +8,7 @@ import subprocess
 import sys
 from typing import Dict, Optional
 
-from src.agent.config import BASE_DIR, SHELLIE_HOME, settings
+from src.agent.config import BASE_DIR, SHELLIE_WORKSPACE, settings
 from src.agent.config import parse_dotenv as _parse_dotenv
 
 _active_pgid: Optional[int] = None
@@ -127,7 +127,7 @@ def execute_shell(command: str) -> str:
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        cwd=BASE_DIR,
+        cwd=SHELLIE_WORKSPACE,
         env=_child_env(),
         encoding="utf-8",
         errors="replace",
@@ -178,5 +178,5 @@ def execution_environment() -> Dict[str, str]:
         "os": platform.system(),
         "arch": platform.machine(),
         "shell": shell_path,
-        "cwd": BASE_DIR,
+        "cwd": SHELLIE_WORKSPACE,
     }

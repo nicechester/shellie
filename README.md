@@ -65,6 +65,24 @@ manager (no custom supervisor process).
    `GEMINI_API_KEY`, and `ALLOWED_USER_ID`. Restrict the file:
    `chmod 600 .env`.
 
+### Directories (config vs. workspace)
+
+Shellie uses two separate directories:
+
+- **`SHELLIE_HOME`** (default: `~/.shellie/`) — configuration and context:
+  settings.json, memory files, user skills, offset file
+- **`SHELLIE_WORKSPACE`** (default: `~/workspace/`) — work products: job
+  outputs, generated code, documents created by the LLM
+
+You can configure both:
+
+```sh
+SHELLIE_HOME=~/.config/shellie SHELLIE_WORKSPACE=~/my-work PYTHONPATH=. python3 -m src.agent
+```
+
+This keeps configuration organized separately from the transient outputs of
+work done by prompts, and both are outside the Shellie repository tree.
+
 **Alternative — no `.env` at all:** if you start the agent without the three
 required values set anywhere, it enters **setup-required mode**: polling does
 not start, but the local web UI comes up at `http://127.0.0.1:8321/` (the
