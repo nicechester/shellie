@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import difflib
 import html
+import json
 import logging
 import os
 import queue
@@ -9,10 +10,10 @@ import re
 import sys
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from src.agent.config import settings
-from src.agent.core.gemini import call_gemini, parse_response, run_tool
+from src.agent.core.gemini import call_gemini, get_retry_status, parse_response, run_tool
 from src.agent.core.memory import read_memory
 from src.agent.core.shell import execute_shell
 from src.agent.telegram.client import delete_message, send_chat_action, send_message
@@ -278,6 +279,50 @@ def _handle_settings_command(chat_id: int, message_id: Optional[int], text: str)
 # ---------------------------------------------------------------------------
 
 
+def _retry_status_lines(status: Dict[str, Any]) -> List[str]:
+    try:
+        phase = status.get("phase")
+        if phase == "idle" or phase is None:
+            return []
+
+        model_html = html.escape(str(status.get("model") or ""))
+        remaining = "{:.0f}".format(max(0.0, (status.get("until") or 0.0) - time.time()))
+        a = status.get("attempt")
+        m = status.get("max_attempts")
+        reason = status.get("reason")
+
+        lines: List[str] = []
+
+        if phase == "calling":
+            if model_html:
+                lines.append("📡 모델 호출 중: <code>{}</code>".format(model_html))
+            else:
+                lines.append("📡 모델 호출 중")
+        elif phase == "cooldown":
+            if reason == "429_rpm":
+                lines.append("⏳ 429(RPM) 쿨다운: {}초 남음 — <code>{}</code> 재시도 {}/{}".format(
+                    remaining, model_html, a, m
+                ))
+            elif reason == "5xx":
+                lines.append("⏳ 서버 오류(5xx) 재시도 대기: {}초 남음 — <code>{}</code> {}/{}회차".format(
+                    remaining, model_html, a, m
+                ))
+            elif reason == "transport":
+                lines.append("⏳ 네트워크 오류 재시도 대기: {}초 남음 — <code>{}</code> {}/{}회차".format(
+                    remaining, model_html, a, m
+                ))
+            elif reason == "chain_cooldown":
+                lines.append("⏳ 모든 모델 실패, 전체 재시도 대기: {}초 남음 ({}/{})".format(
+                    remaining, a, m
+                ))
+            else:
+                lines.append("⏳ 재시도 대기: {}초 남음".format(remaining))
+
+        return lines
+    except Exception:
+        return []
+
+
 def _queue_status_text() -> str:
     depth = _task_queue.qsize()
     active = _queue_active_item
@@ -287,6 +332,7 @@ def _queue_status_text() -> str:
         lines.append("🔄 처리 중: <code>{}</code>".format(preview))
     else:
         lines.append("💤 대기 중 (idle)")
+    lines.extend(_retry_status_lines(get_retry_status()))
     lines.append("대기 항목: {}".format(depth))
     return "\n".join(lines)
 
@@ -499,6 +545,99 @@ def _typing_keepalive(chat_id: int, stop: threading.Event) -> None:
             _LOGGER.debug("sendChatAction failed in keepalive", exc_info=True)
 
 
+# ---------------------------------------------------------------------------
+# Function-call loop limit handling (issue #9): a hard iteration cap and a
+# same-call/same-result repeat detector both hand off to a tools-disabled
+# wrap-up turn instead of silently dropping the conversation.
+# ---------------------------------------------------------------------------
+
+_FC_REPEAT_LIMIT = 3
+
+_FC_WRAPUP_LIMIT_NOTE = (
+    "[system] Tool-call budget exhausted ({} iterations). Tools are now disabled. "
+    "Using only the tool results gathered so far, give the user your best final answer: "
+    "what was done, what was found, and what remains unfinished."
+)
+_FC_WRAPUP_LOOP_NOTE = (
+    "[system] The same tool calls returned the same results {} times in a row, so tool use "
+    "has been stopped. Using the results gathered so far, give the user your best final "
+    "answer and briefly explain what blocked progress."
+)
+
+_FC_LIMIT_NOTICE = "⚠️ 도구 호출 한도({}회)에 도달해 작업을 중단했습니다. 지금까지의 결과로 정리합니다."
+_FC_LOOP_NOTICE = "⚠️ 동일한 도구 호출이 {}회 연속 반복되어 작업을 중단했습니다."
+_FC_NO_TEXT_FALLBACK = "(요약 응답을 생성하지 못했습니다.)"
+
+
+def _iteration_signature(calls_and_results: List[Tuple[str, Dict[str, Any], Any]]) -> Tuple[Any, ...]:
+    """Order-independent signature of one iteration's (name, args, result)
+    triples, so reordered parallel batches still match. Results are included
+    on purpose so real polling (same command, changing output) is not
+    flagged as a repeat.
+    """
+    entries = []
+    for name, args, result in calls_and_results:
+        args_json = json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
+        result_key = result if isinstance(result, str) else repr(result)
+        entries.append((name, args_json, result_key))
+    return tuple(sorted(entries))
+
+
+def _fc_wrapup(
+    chat_id: int,
+    contents: List[Dict[str, Any]],
+    user_turn: Dict[str, Any],
+    context_turns: int,
+    reason: str,
+    n: int,
+    last_text: str,
+    on_cooldown: Callable[[int, int, float], None],
+) -> None:
+    """Send one tools-disabled final-answer request using the tool results
+    gathered so far, then reply and (if any text is produced) save history.
+    Never runs tools; never raises.
+    """
+    if reason == "loop":
+        note = _FC_WRAPUP_LOOP_NOTE.format(n)
+        notice = _FC_LOOP_NOTICE.format(n)
+    else:
+        note = _FC_WRAPUP_LIMIT_NOTE.format(n)
+        notice = _FC_LIMIT_NOTICE.format(n)
+
+    # contents[-1] is the functionResponse user turn just appended by the
+    # caller — a locally-built dict, safe to mutate. Never creates a second
+    # consecutive user turn.
+    contents[-1]["parts"].append({"text": note})
+
+    final_text = last_text
+    finish_reason: Optional[str] = None
+    wrapup_model: Optional[str] = None
+    try:
+        response, wrapup_model = call_gemini(contents, on_cooldown=on_cooldown, allow_tools=False)
+    except Exception:
+        _LOGGER.warning("fc_wrapup_failed reason=%s", reason, exc_info=True)
+    else:
+        parsed = parse_response(response)
+        finish_reason = parsed.finish_reason
+        if not parsed.blocked and parsed.text:
+            final_text = parsed.text
+        _LOGGER.info("fc_wrapup reason=%s model=%s text_len=%d", reason, wrapup_model, len(final_text))
+
+    reply = notice
+    if final_text:
+        reply += "\n\n" + _markdown_to_html(final_text)
+    else:
+        reply += "\n\n" + _FC_NO_TEXT_FALLBACK
+    if finish_reason == "MAX_TOKENS":
+        reply += "\n\n⚠️ Response was truncated at the maximum token limit (MAX_TOKENS)."
+    send_message(chat_id, reply)
+
+    if final_text:
+        _history.append(user_turn)
+        _history.append({"role": "model", "parts": [{"text": final_text}]})
+        _trim_history_pairs(context_turns)
+
+
 def _run_llm_turn(
     chat_id: int,
     contents: List[Dict[str, Any]],
@@ -509,6 +648,10 @@ def _run_llm_turn(
     loop_count = 0
     last_text = ""
     on_cooldown = _make_cooldown_notifier(chat_id)
+
+    trace: List[str] = []
+    prev_sig: Optional[Tuple[Any, ...]] = None
+    repeat_count = 0
 
     while True:
         response, _model = call_gemini(contents, on_cooldown=on_cooldown)
@@ -524,14 +667,19 @@ def _run_llm_turn(
 
         if parsed.function_calls:
             if loop_count >= fc_max_loops:
-                message = "⚠️ Function call limit ({} iterations) reached.".format(fc_max_loops)
-                if last_text:
-                    message += "\n" + _markdown_to_html(last_text)
-                send_message(chat_id, message)
+                _LOGGER.warning(
+                    "fc_limit_reached loops=%d max=%d pending=%s trace=%s",
+                    loop_count, fc_max_loops, [name for name, _ in parsed.function_calls], trace,
+                )
+                _fc_wrapup(
+                    chat_id, contents, user_turn, context_turns,
+                    reason="limit", n=fc_max_loops, last_text=last_text, on_cooldown=on_cooldown,
+                )
                 return
 
             contents.append(parsed.raw_content)
             response_parts = []
+            triples: List[Tuple[str, Dict[str, Any], Any]] = []
             for name, args in parsed.function_calls:
                 _LOGGER.info("tool_call name=%s args=%r", name, args)
                 result = run_tool(name, args)
@@ -539,9 +687,33 @@ def _run_llm_turn(
                 response_parts.append(
                     {"functionResponse": {"name": name, "response": {"output": result}}}
                 )
+                triples.append((name, args, result))
             contents.append({"role": "user", "parts": response_parts})
             loop_count += 1
+
+            trace.append(",".join(name for name, _, _ in triples))
+            sig = _iteration_signature(triples)
+            repeat_count = repeat_count + 1 if sig == prev_sig else 1
+            prev_sig = sig
+
+            if repeat_count >= _FC_REPEAT_LIMIT:
+                calls_desc = [
+                    "{}({})".format(name, json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)[:200])
+                    for name, args, _ in triples
+                ]
+                _LOGGER.warning(
+                    "fc_loop_detected loops=%d repeats=%d calls=%s trace=%s",
+                    loop_count, repeat_count, calls_desc, trace,
+                )
+                _fc_wrapup(
+                    chat_id, contents, user_turn, context_turns,
+                    reason="loop", n=repeat_count, last_text=last_text, on_cooldown=on_cooldown,
+                )
+                return
             continue
+
+        if loop_count > 0:
+            _LOGGER.info("fc_turn_done loops=%d trace=%s", loop_count, trace)
 
         reply = _markdown_to_html(parsed.text) if parsed.text else "No response."
         if parsed.finish_reason == "MAX_TOKENS":

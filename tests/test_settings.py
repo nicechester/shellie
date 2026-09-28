@@ -286,7 +286,7 @@ class TestUpdate(_SettingsTestCase):
         )
         self.assertFalse(result.ok)
         self.assertEqual(store.get("SHELL_TIMEOUT_SEC"), 45)
-        self.assertEqual(store.get("FC_MAX_LOOPS"), 5)
+        self.assertEqual(store.get("FC_MAX_LOOPS"), 15)
         self.assertEqual(store.revision, 0)
 
     def test_noop_value_excluded_from_applied(self):
@@ -322,6 +322,17 @@ class TestUpdate(_SettingsTestCase):
         result = store.update({"TELEGRAM_BOT_TOKEN": new_token}, actor="web")
         self.assertTrue(result.ok)
         self.assertEqual(store.get("TELEGRAM_BOT_TOKEN"), new_token)
+
+    def test_fc_max_loops_range_50_accepted_51_rejected(self):
+        store, _ = self._new_store()
+        result = store.update({"FC_MAX_LOOPS": "51"}, actor="web")
+        self.assertFalse(result.ok)
+        self.assertIn("FC_MAX_LOOPS", result.errors)
+        self.assertEqual(store.get("FC_MAX_LOOPS"), 15)
+
+        result = store.update({"FC_MAX_LOOPS": "50"}, actor="web")
+        self.assertTrue(result.ok)
+        self.assertEqual(store.get("FC_MAX_LOOPS"), 50)
 
 
 class TestUnset(_SettingsTestCase):
@@ -381,7 +392,7 @@ class TestPersistence(_SettingsTestCase):
             result = store.update({"FC_MAX_LOOPS": "9"}, actor="web")
         self.assertFalse(result.ok)
         self.assertIn("_persist", result.errors)
-        self.assertEqual(store.get("FC_MAX_LOOPS"), 5)
+        self.assertEqual(store.get("FC_MAX_LOOPS"), 15)
         self.assertEqual(store.revision, 0)
         self.assertFalse(os.path.exists(self.settings_path))
 
@@ -500,7 +511,7 @@ class TestPrecheck(_SettingsTestCase):
         result = store.update({"FC_MAX_LOOPS": "9"}, actor="web")
         self.assertFalse(result.ok)
         self.assertIn("FC_MAX_LOOPS", result.errors)
-        self.assertEqual(store.get("FC_MAX_LOOPS"), 5)
+        self.assertEqual(store.get("FC_MAX_LOOPS"), 15)
         self.assertEqual(store.revision, 0)
         self.assertFalse(os.path.exists(self.settings_path))
 

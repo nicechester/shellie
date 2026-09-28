@@ -294,10 +294,10 @@ CATALOG: Tuple[SettingSpec, ...] = (
         constraint="1–4000 chars, multi-line allowed",
     ),
     SettingSpec(
-        "FC_MAX_LOOPS", "int", _make_int_parser(1, 10),
-        default=5, apply_timing="immediate",
-        description="Maximum function-calling loop iterations",
-        constraint="1~10",
+        "FC_MAX_LOOPS", "int", _make_int_parser(1, 50),
+        default=15, apply_timing="immediate",
+        description="Maximum function-calling loop iterations per message (repeat-loop detection and wrap-up apply)",
+        constraint="1~50",
     ),
     SettingSpec(
         "CONTEXT_TURNS", "int", _make_int_parser(0, 50),
