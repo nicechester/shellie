@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from src.agent.config import REPO_SKILLS_DIR, SKILLS_DIR, settings
 from src.agent.core import mcp, shell
 from src.agent.core.memory import append_memory, read_memory
-from src.agent.utils.http import http_post
+from src.agent.utils.http import http_post_h
 
 _LOGGER = logging.getLogger("shellie.gemini")
 
@@ -21,7 +21,19 @@ _FALLBACK_5XX = (500, 502, 503, 504)
 # Cap for a single cooldown sleep between whole-chain retry passes.
 _MAX_COOLDOWN_SEC = 300
 
+# Short exponential backoff for 5xx/transport errors (transient overload).
+# Retries the same model up to this many times before falling back.
+_5XX_RETRY_BASE_SEC = 1
+_5XX_MAX_RETRIES = 3
+
 _RETRY_DELAY_MESSAGE_RE = re.compile(r"retry in ([\d.]+)s", re.IGNORECASE)
+
+# Retry delays at or above this threshold are treated as RPD (Requests Per Day)
+# exhaustion → fall back to next model. Below this → RPM/TPM → sleep and retry
+# the same model.
+_RPD_THRESHOLD_SEC = 300
+
+_RPD_MESSAGE_RE = re.compile(r"per.?day|daily|rpd", re.IGNORECASE)
 
 
 class ToolEntry:
@@ -216,6 +228,51 @@ def _fallback_reason(status: int, res: Dict[str, Any]) -> str:
     return "unknown error"
 
 
+def _parse_retry_delay_with_headers(res: Dict[str, Any], resp_headers: Dict[str, str]) -> Optional[float]:
+    """Like _parse_retry_delay but also checks the Retry-After response header."""
+    delay = _parse_retry_delay(res)
+    retry_after = resp_headers.get("retry-after")
+    if retry_after:
+        try:
+            header_delay = float(retry_after)
+            if delay is None or header_delay > delay:
+                delay = header_delay
+        except ValueError:
+            pass
+    return delay
+
+
+_RPD_QUOTA_ID_RE = re.compile(r"PerDay", re.IGNORECASE)
+
+
+def _is_rpd_limit(res: Dict[str, Any], delay: Optional[float]) -> bool:
+    """Return True if a 429 looks like an RPD (per-day) exhaustion.
+
+    Primary signal: a QuotaFailure violation whose quotaId contains "PerDay".
+    Fallback: error message contains "per day", "daily", or "rpd" keywords.
+    The retry delay is NOT a reliable signal — RPD retryDelay is the same
+    order of magnitude as RPM (seconds, not hours).
+    """
+    try:
+        error = res.get("error") if isinstance(res, dict) else None
+        if isinstance(error, dict):
+            for detail in (error.get("details") or []):
+                if not isinstance(detail, dict):
+                    continue
+                if "QuotaFailure" not in detail.get("@type", ""):
+                    continue
+                for v in (detail.get("violations") or []):
+                    quota_id = v.get("quotaId", "") if isinstance(v, dict) else ""
+                    if _RPD_QUOTA_ID_RE.search(quota_id):
+                        return True
+            message = error.get("message", "")
+            if isinstance(message, str) and _RPD_MESSAGE_RE.search(message):
+                return True
+    except Exception:
+        _LOGGER.debug("Exception parsing RPD limit details, assuming RPM", exc_info=True)
+    return False
+
+
 def _parse_retry_delay(res: Dict[str, Any]) -> Optional[float]:
     """Best-effort extraction of a server-suggested retry delay (seconds) from
     a Gemini 429 error body. Fully defensive: never raises, returns None if
@@ -291,17 +348,73 @@ def call_gemini(
 
         for index, model in enumerate(chain):
             url = _GEMINI_URL_TEMPLATE.format(model)
-            headers = {"x-goog-api-key": key}
-            res, status = http_post(url, payload, headers=headers, timeout=timeout)
+            req_headers = {"x-goog-api-key": key}
+            res, status, resp_headers = http_post_h(url, payload, headers=req_headers, timeout=timeout)
 
             if status == 200:
                 return res, model
+
+            if status == 429:
+                parsed_delay = _parse_retry_delay_with_headers(res, resp_headers)
+                if _is_rpd_limit(res, parsed_delay):
+                    # RPD exhaustion: this model is done for the day, fall back.
+                    _LOGGER.warning(
+                        "Gemini model %s RPD limit hit, falling back to next model", model
+                    )
+                    if parsed_delay is not None and (hinted_delay is None or parsed_delay > hinted_delay):
+                        hinted_delay = parsed_delay
+                    if index < len(chain) - 1:
+                        time.sleep(delay)
+                    continue
+                else:
+                    # RPM/TPM: short-lived rate limit, sleep and retry same model.
+                    rpm_sleep = parsed_delay if parsed_delay is not None else delay
+                    _LOGGER.warning(
+                        "Gemini model %s RPM/TPM limit hit, sleeping %.1fs before retry",
+                        model, rpm_sleep,
+                    )
+                    time.sleep(rpm_sleep)
+                    # Retry same model: redo this iteration.
+                    res, status, resp_headers = http_post_h(url, payload, headers=req_headers, timeout=timeout)
+                    if status == 200:
+                        return res, model
+                    # Still failing after one RPM retry — treat as fallback.
+                    parsed_delay2 = _parse_retry_delay_with_headers(res, resp_headers)
+                    if parsed_delay2 is not None and (hinted_delay is None or parsed_delay2 > hinted_delay):
+                        hinted_delay = parsed_delay2
+                    if index < len(chain) - 1:
+                        time.sleep(delay)
+                    continue
+
+            if status in _FALLBACK_5XX or status == 0:
+                # Transient overload/transport error: retry same model with short
+                # exponential backoff before giving up and falling back.
+                for retry in range(1, _5XX_MAX_RETRIES + 1):
+                    backoff = _5XX_RETRY_BASE_SEC * (2 ** (retry - 1))
+                    _LOGGER.warning(
+                        "Gemini model %s transient error (HTTP %s), retry %d/%d in %.1fs",
+                        model, status, retry, _5XX_MAX_RETRIES, backoff,
+                    )
+                    time.sleep(backoff)
+                    res, status, resp_headers = http_post_h(url, payload, headers=req_headers, timeout=timeout)
+                    if status == 200:
+                        return res, model
+                    if status not in _FALLBACK_5XX and status != 0:
+                        break  # non-transient error, stop retrying
+                # All same-model retries exhausted, fall back to next model.
+                _LOGGER.warning(
+                    "Gemini model %s still failing after %d retries, falling back",
+                    model, _5XX_MAX_RETRIES,
+                )
+                if index < len(chain) - 1:
+                    time.sleep(delay)
+                continue
 
             if _should_fallback(status, res):
                 _LOGGER.warning(
                     "Gemini model %s call failed (%s), switching to next model", model, _fallback_reason(status, res)
                 )
-                parsed_delay = _parse_retry_delay(res)
+                parsed_delay = _parse_retry_delay_with_headers(res, resp_headers)
                 if parsed_delay is not None and (hinted_delay is None or parsed_delay > hinted_delay):
                     hinted_delay = parsed_delay
                 if index < len(chain) - 1:

@@ -33,7 +33,7 @@ class CallGeminiFallbackTests(unittest.TestCase):
         self.api_key = "test-api-key-1234567890"
 
         settings_patcher = mock.patch.object(gemini, "settings")
-        http_post_patcher = mock.patch.object(gemini, "http_post")
+        http_post_patcher = mock.patch.object(gemini, "http_post_h")
         sleep_patcher = mock.patch.object(gemini.time, "sleep")
         read_memory_patcher = mock.patch.object(gemini, "read_memory", return_value="mem")
         list_skills_patcher = mock.patch.object(gemini, "list_skills", return_value="")
@@ -68,10 +68,42 @@ class CallGeminiFallbackTests(unittest.TestCase):
     def _contents(self):
         return [{"role": "user", "parts": [{"text": "hi"}]}]
 
-    def test_429_falls_back_to_second_model(self) -> None:
-        res1 = {"error": {"status": "TOO_MANY"}}
+    def _rpd_429(self) -> dict:
+        """Real-world RPD 429 shape with QuotaFailure.quotaId containing PerDay."""
+        return {
+            "error": {
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                        "violations": [{"quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier", "quotaValue": "20"}],
+                    },
+                    {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "30s"},
+                ],
+            }
+        }
+
+    def _rpm_429(self, delay_s: str = "50s") -> dict:
+        """Real-world RPM 429 shape with QuotaFailure.quotaId containing PerMinute."""
+        return {
+            "error": {
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                        "violations": [{"quotaId": "GenerateRequestsPerMinutePerProjectPerModel-FreeTier", "quotaValue": "5"}],
+                    },
+                    {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": delay_s},
+                ],
+            }
+        }
+
+    def test_429_rpd_falls_back_to_second_model(self) -> None:
+        """RPD 429 (PerDay quotaId) falls back to the next model immediately."""
         res2 = {"candidates": [], "_marker": "second"}
-        self.mock_http_post.side_effect = [(res1, 429), (res2, 200)]
+        self.mock_http_post.side_effect = [(self._rpd_429(), 429, {}), (res2, 200, {})]
 
         result, model = gemini.call_gemini(self._contents())
 
@@ -81,29 +113,91 @@ class CallGeminiFallbackTests(unittest.TestCase):
         second_url = self.mock_http_post.call_args_list[1][0][0]
         self.assertIn("m2", second_url)
 
-    def test_resource_exhausted_body_on_non_200_falls_back(self) -> None:
-        res1 = {"error": {"status": "RESOURCE_EXHAUSTED"}}
-        res2 = {"candidates": []}
-        self.mock_http_post.side_effect = [(res1, 403), (res2, 200)]
+    def test_429_rpm_retries_same_model_then_succeeds(self) -> None:
+        """RPM 429 (PerMinute quotaId) sleeps the retryDelay and retries the same model."""
+        res2 = {"candidates": [], "_marker": "retry"}
+        self.mock_http_post.side_effect = [(self._rpm_429("30s"), 429, {}), (res2, 200, {})]
+
+        result, model = gemini.call_gemini(self._contents())
+
+        self.assertEqual(model, "m1")
+        self.assertEqual(result, res2)
+        self.assertEqual(self.mock_http_post.call_count, 2)
+        self.assertIn("m1", self.mock_http_post.call_args_list[0][0][0])
+        self.assertIn("m1", self.mock_http_post.call_args_list[1][0][0])
+        self.mock_sleep.assert_called_once_with(30.0)
+
+    def test_429_rpm_retry_fails_falls_back_to_second_model(self) -> None:
+        """RPM 429 that still fails after one retry falls back to next model."""
+        res2 = {"candidates": [], "_marker": "second"}
+        self.mock_http_post.side_effect = [
+            (self._rpm_429("5s"), 429, {}),
+            (self._rpm_429("5s"), 429, {}),
+            (res2, 200, {}),
+        ]
 
         result, model = gemini.call_gemini(self._contents())
 
         self.assertEqual(model, "m2")
         self.assertEqual(result, res2)
 
-    def test_503_falls_back(self) -> None:
-        res1 = {"error": {"status": "UNAVAILABLE"}}
+    def test_resource_exhausted_body_on_non_200_falls_back(self) -> None:
+        """RESOURCE_EXHAUSTED on non-429 status (e.g. 403) always falls back."""
+        res1 = {"error": {"status": "RESOURCE_EXHAUSTED"}}
         res2 = {"candidates": []}
-        self.mock_http_post.side_effect = [(res1, 503), (res2, 200)]
+        self.mock_http_post.side_effect = [(res1, 403, {}), (res2, 200, {})]
+
+        result, model = gemini.call_gemini(self._contents())
+
+        self.assertEqual(model, "m2")
+        self.assertEqual(result, res2)
+
+    def test_503_retries_same_model_then_succeeds(self) -> None:
+        """503 retries the same model with short backoff before succeeding."""
+        res_503 = {"error": {"code": 503, "status": "UNAVAILABLE"}}
+        res_ok = {"candidates": []}
+        self.mock_http_post.side_effect = [(res_503, 503, {}), (res_ok, 200, {})]
+
+        _result, model = gemini.call_gemini(self._contents())
+
+        self.assertEqual(model, "m1")
+        # First retry sleep is _5XX_RETRY_BASE_SEC * 2^0 = 1
+        self.mock_sleep.assert_called_once_with(gemini._5XX_RETRY_BASE_SEC)
+
+    def test_503_exhausts_retries_then_falls_back_to_second_model(self) -> None:
+        """503 that persists through all same-model retries falls back to next model."""
+        res_503 = {"error": {"code": 503, "status": "UNAVAILABLE"}}
+        res_ok = {"candidates": []}
+        # 1 initial + _5XX_MAX_RETRIES same-model retries, then m2 succeeds
+        side = [(res_503, 503, {})] * (1 + gemini._5XX_MAX_RETRIES) + [(res_ok, 200, {})]
+        self.mock_http_post.side_effect = side
+
+        _result, model = gemini.call_gemini(self._contents())
+
+        self.assertEqual(model, "m2")
+        # Sleeps: 1s, 2s, 4s (backoff) then fallback_delay (1s) before m2
+        expected_sleeps = [
+            mock.call(gemini._5XX_RETRY_BASE_SEC * (2 ** i))
+            for i in range(gemini._5XX_MAX_RETRIES)
+        ] + [mock.call(1)]  # GEMINI_FALLBACK_DELAY_SEC between models
+        self.assertEqual(self.mock_sleep.call_args_list, expected_sleeps)
+
+    def test_503_falls_back(self) -> None:
+        """503 that persists falls back after retries (covered by exhausts test above)."""
+        res_503 = {"error": {"code": 503, "status": "UNAVAILABLE"}}
+        res_ok = {"candidates": []}
+        side = [(res_503, 503, {})] * (1 + gemini._5XX_MAX_RETRIES) + [(res_ok, 200, {})]
+        self.mock_http_post.side_effect = side
 
         _result, model = gemini.call_gemini(self._contents())
 
         self.assertEqual(model, "m2")
 
     def test_status_zero_falls_back(self) -> None:
-        res1 = {"error": "transport failure"}
-        res2 = {"candidates": []}
-        self.mock_http_post.side_effect = [(res1, 0), (res2, 200)]
+        res_err = {"error": "transport failure"}
+        res_ok = {"candidates": []}
+        side = [(res_err, 0, {})] * (1 + gemini._5XX_MAX_RETRIES) + [(res_ok, 200, {})]
+        self.mock_http_post.side_effect = side
 
         _result, model = gemini.call_gemini(self._contents())
 
@@ -111,7 +205,7 @@ class CallGeminiFallbackTests(unittest.TestCase):
 
     def test_400_raises_immediately_without_second_call(self) -> None:
         res1 = {"error": {"status": "INVALID_ARGUMENT", "message": "bad request"}}
-        self.mock_http_post.side_effect = [(res1, 400)]
+        self.mock_http_post.side_effect = [(res1, 400, {})]
 
         with self.assertRaises(Exception) as ctx:
             gemini.call_gemini(self._contents())
@@ -120,8 +214,10 @@ class CallGeminiFallbackTests(unittest.TestCase):
         self.assertNotIn(self.api_key, str(ctx.exception))
 
     def test_all_models_fail_raises_final_exception(self) -> None:
-        res = {"error": {"status": "UNAVAILABLE"}}
-        self.mock_http_post.side_effect = [(res, 503), (res, 503)]
+        res = {"error": {"code": 503, "status": "UNAVAILABLE"}}
+        # Each model needs 1 initial + _5XX_MAX_RETRIES attempts
+        per_model = (1 + gemini._5XX_MAX_RETRIES)
+        self.mock_http_post.side_effect = [(res, 503, {})] * (per_model * 2)  # 2 models
 
         with self.assertRaises(Exception) as ctx:
             gemini.call_gemini(self._contents())
@@ -130,7 +226,7 @@ class CallGeminiFallbackTests(unittest.TestCase):
 
     def test_uses_api_key_header_never_in_url(self) -> None:
         res = {"candidates": []}
-        self.mock_http_post.return_value = (res, 200)
+        self.mock_http_post.return_value = (res, 200, {})
 
         gemini.call_gemini(self._contents())
 
@@ -140,25 +236,36 @@ class CallGeminiFallbackTests(unittest.TestCase):
         self.assertNotIn(self.api_key, url)
         self.assertEqual(headers["x-goog-api-key"], self.api_key)
 
-    def test_fallback_delay_uses_configured_seconds(self) -> None:
+    def test_fallback_delay_used_for_rpm_sleep_when_no_hint(self) -> None:
+        """When no retryDelay hint is present, RPM sleep falls back to GEMINI_FALLBACK_DELAY_SEC."""
         self._configure_settings({"GEMINI_FALLBACK_DELAY_SEC": 4})
-        res1 = {"error": {"status": "TOO_MANY"}}
+        # RPM 429 with no RetryInfo detail
+        res1 = {
+            "error": {
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [{
+                    "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                    "violations": [{"quotaId": "GenerateRequestsPerMinutePerProjectPerModel-FreeTier"}],
+                }],
+            }
+        }
         res2 = {"candidates": []}
-        self.mock_http_post.side_effect = [(res1, 429), (res2, 200)]
+        self.mock_http_post.side_effect = [(res1, 429, {}), (res2, 200, {})]
 
         gemini.call_gemini(self._contents())
 
         self.mock_sleep.assert_called_once_with(4)
 
     def test_retry_after_cooldown_succeeds_on_second_pass(self) -> None:
+        """After all models fail (RPD), the whole chain is retried after cooldown."""
         self._configure_settings({
             "GEMINI_MODEL_CHAIN": ("m1",),
             "GEMINI_MAX_RETRIES": 1,
             "GEMINI_RETRY_BASE_DELAY_SEC": 60,
         })
-        res1 = {"error": {"status": "TOO_MANY"}}
         res2 = {"candidates": [], "_marker": "second-pass"}
-        self.mock_http_post.side_effect = [(res1, 429), (res2, 200)]
+        self.mock_http_post.side_effect = [(self._rpd_429(), 429, {}), (res2, 200, {})]
 
         result, model = gemini.call_gemini(self._contents())
 
@@ -167,6 +274,7 @@ class CallGeminiFallbackTests(unittest.TestCase):
         self.mock_sleep.assert_called_once_with(60)
 
     def test_server_hint_overrides_exponential_backoff(self) -> None:
+        """RPD 429 with a server retryDelay hint larger than base_delay uses the hint for cooldown."""
         self._configure_settings({
             "GEMINI_MODEL_CHAIN": ("m1",),
             "GEMINI_MAX_RETRIES": 1,
@@ -174,12 +282,19 @@ class CallGeminiFallbackTests(unittest.TestCase):
         })
         res1 = {
             "error": {
-                "status": "TOO_MANY",
-                "details": [{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "90s"}],
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                        "violations": [{"quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier"}],
+                    },
+                    {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "90s"},
+                ],
             }
         }
         res2 = {"candidates": []}
-        self.mock_http_post.side_effect = [(res1, 429), (res2, 200)]
+        self.mock_http_post.side_effect = [(res1, 429, {}), (res2, 200, {})]
 
         gemini.call_gemini(self._contents())
 
@@ -191,17 +306,18 @@ class CallGeminiFallbackTests(unittest.TestCase):
             "GEMINI_MAX_RETRIES": 2,
             "GEMINI_RETRY_BASE_DELAY_SEC": 60,
         })
-        res = {"error": {"status": "UNAVAILABLE"}}
-        self.mock_http_post.side_effect = [(res, 503), (res, 503), (res, 503)]
+        res = {"error": {"code": 503, "status": "UNAVAILABLE"}}
+        # Each chain pass: 1 initial + _5XX_MAX_RETRIES same-model retries; 3 passes total
+        per_pass = 1 + gemini._5XX_MAX_RETRIES
+        self.mock_http_post.side_effect = [(res, 503, {})] * (per_pass * 3)
 
         with self.assertRaises(Exception) as ctx:
             gemini.call_gemini(self._contents())
 
         self.assertIn("All Gemini models", str(ctx.exception))
-        self.assertEqual(
-            self.mock_sleep.call_args_list,
-            [mock.call(60), mock.call(120)],
-        )
+        # Chain-retry cooldown sleeps: 60, 120 (exponential backoff between passes)
+        chain_cooldown_calls = [c for c in self.mock_sleep.call_args_list if c == mock.call(60) or c == mock.call(120)]
+        self.assertEqual(chain_cooldown_calls, [mock.call(60), mock.call(120)])
 
     def test_cooldown_delay_is_capped(self) -> None:
         self._configure_settings({
@@ -209,9 +325,8 @@ class CallGeminiFallbackTests(unittest.TestCase):
             "GEMINI_MAX_RETRIES": 2,
             "GEMINI_RETRY_BASE_DELAY_SEC": 200,
         })
-        res = {"error": {"status": "TOO_MANY"}}
         res2 = {"candidates": []}
-        self.mock_http_post.side_effect = [(res, 429), (res, 429), (res2, 200)]
+        self.mock_http_post.side_effect = [(self._rpd_429(), 429, {}), (self._rpd_429(), 429, {}), (res2, 200, {})]
 
         gemini.call_gemini(self._contents())
 
@@ -226,7 +341,7 @@ class CallGeminiFallbackTests(unittest.TestCase):
             "GEMINI_MAX_RETRIES": 2,
         })
         res = {"error": {"status": "PERMISSION_DENIED", "message": "forbidden"}}
-        self.mock_http_post.side_effect = [(res, 403)]
+        self.mock_http_post.side_effect = [(res, 403, {})]
 
         with self.assertRaises(Exception):
             gemini.call_gemini(self._contents())
@@ -240,9 +355,8 @@ class CallGeminiFallbackTests(unittest.TestCase):
             "GEMINI_MAX_RETRIES": 1,
             "GEMINI_RETRY_BASE_DELAY_SEC": 60,
         })
-        res1 = {"error": {"status": "TOO_MANY"}}
         res2 = {"candidates": []}
-        self.mock_http_post.side_effect = [(res1, 429), (res2, 200)]
+        self.mock_http_post.side_effect = [(self._rpd_429(), 429, {}), (res2, 200, {})]
         on_cooldown = mock.Mock(side_effect=RuntimeError("boom"))
 
         result, _model = gemini.call_gemini(self._contents(), on_cooldown=on_cooldown)
@@ -251,14 +365,13 @@ class CallGeminiFallbackTests(unittest.TestCase):
         self.assertEqual(result, res2)
 
     def test_no_inter_model_sleep_after_last_model_in_pass(self) -> None:
+        """No inter-model fallback sleep after the last model in a pass."""
         self._configure_settings({
             "GEMINI_MODEL_CHAIN": ("m1", "m2"),
             "GEMINI_MAX_RETRIES": 0,
             "GEMINI_FALLBACK_DELAY_SEC": 4,
         })
-        res1 = {"error": {"status": "TOO_MANY"}}
-        res2 = {"error": {"status": "TOO_MANY"}}
-        self.mock_http_post.side_effect = [(res1, 429), (res2, 429)]
+        self.mock_http_post.side_effect = [(self._rpd_429(), 429, {}), (self._rpd_429(), 429, {})]
 
         with self.assertRaises(Exception):
             gemini.call_gemini(self._contents())
@@ -296,6 +409,97 @@ class ParseRetryDelayTests(unittest.TestCase):
         self.assertIsNone(gemini._parse_retry_delay({"error": {"details": "not-a-list"}}))
         self.assertIsNone(gemini._parse_retry_delay("not-a-dict"))  # type: ignore[arg-type]
         self.assertIsNone(gemini._parse_retry_delay(None))  # type: ignore[arg-type]
+
+
+class IsRpdLimitTests(unittest.TestCase):
+    """_is_rpd_limit() detects RPD via QuotaFailure.quotaId containing 'PerDay'."""
+
+    def _rpd_res(self, quota_id: str = "GenerateRequestsPerDayPerProjectPerModel-FreeTier") -> dict:
+        return {
+            "error": {
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                        "violations": [{"quotaId": quota_id, "quotaValue": "20"}],
+                    }
+                ],
+            }
+        }
+
+    def _rpm_res(self) -> dict:
+        return {
+            "error": {
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                        "violations": [{"quotaId": "GenerateRequestsPerMinutePerProjectPerModel-FreeTier", "quotaValue": "5"}],
+                    }
+                ],
+            }
+        }
+
+    def test_quota_id_perday_is_rpd(self) -> None:
+        self.assertTrue(gemini._is_rpd_limit(self._rpd_res(), None))
+
+    def test_quota_id_perday_case_insensitive(self) -> None:
+        self.assertTrue(gemini._is_rpd_limit(self._rpd_res("generateRequestsperDAYperProject"), None))
+
+    def test_quota_id_perminute_is_not_rpd(self) -> None:
+        self.assertFalse(gemini._is_rpd_limit(self._rpm_res(), None))
+
+    def test_no_quota_failure_detail_is_not_rpd(self) -> None:
+        res = {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "details": []}}
+        self.assertFalse(gemini._is_rpd_limit(res, None))
+
+    def test_per_day_message_fallback_is_rpd(self) -> None:
+        res = {"error": {"message": "Quota exceeded for requests per day.", "details": []}}
+        self.assertTrue(gemini._is_rpd_limit(res, None))
+
+    def test_daily_message_fallback_is_rpd(self) -> None:
+        res = {"error": {"message": "Daily quota limit reached.", "details": []}}
+        self.assertTrue(gemini._is_rpd_limit(res, None))
+
+    def test_generic_message_is_not_rpd(self) -> None:
+        res = {"error": {"message": "Rate limit exceeded, retry in 30s.", "details": []}}
+        self.assertFalse(gemini._is_rpd_limit(res, None))
+
+    def test_short_delay_with_rpd_quota_id_is_still_rpd(self) -> None:
+        # Real RPD responses have short retryDelay (18-50s), not hours.
+        # The delay value must NOT affect the result.
+        self.assertTrue(gemini._is_rpd_limit(self._rpd_res(), 30.0))
+
+    def test_short_delay_with_rpm_quota_id_is_not_rpd(self) -> None:
+        self.assertFalse(gemini._is_rpd_limit(self._rpm_res(), 50.0))
+
+
+class ParseRetryDelayWithHeadersTests(unittest.TestCase):
+    """_parse_retry_delay_with_headers() picks the larger of body vs header."""
+
+    def test_header_wins_when_larger(self) -> None:
+        res = {"error": {"message": "retry in 10s"}}
+        self.assertEqual(gemini._parse_retry_delay_with_headers(res, {"retry-after": "120"}), 120.0)
+
+    def test_body_wins_when_larger(self) -> None:
+        res = {
+            "error": {
+                "details": [{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "90s"}]
+            }
+        }
+        self.assertEqual(gemini._parse_retry_delay_with_headers(res, {"retry-after": "30"}), 90.0)
+
+    def test_header_only(self) -> None:
+        self.assertEqual(gemini._parse_retry_delay_with_headers({}, {"retry-after": "45"}), 45.0)
+
+    def test_no_hint_returns_none(self) -> None:
+        self.assertIsNone(gemini._parse_retry_delay_with_headers({}, {}))
+
+    def test_non_numeric_header_ignored(self) -> None:
+        res = {"error": {"message": "retry in 5s"}}
+        self.assertEqual(gemini._parse_retry_delay_with_headers(res, {"retry-after": "Wed, 01 Jan 2025 00:00:00 GMT"}), 5.0)
 
 
 class ParseResponseTests(unittest.TestCase):
