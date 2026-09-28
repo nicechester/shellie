@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 import unittest
 from unittest import mock
 
@@ -65,6 +66,15 @@ class HandlersTestCase(unittest.TestCase):
     def setUp(self) -> None:
         handlers._reset_history()
         handlers._last_activity = 0.0
+        handlers._queue_active_item = None
+        handlers._queue_cooldown_until = 0.0
+        # Drain any leftover items from a previous test.
+        while not handlers._task_queue.empty():
+            try:
+                handlers._task_queue.get_nowait()
+                handlers._task_queue.task_done()
+            except Exception:
+                break
 
         patches = {
             "settings": mock.patch.object(handlers, "settings"),
@@ -102,6 +112,22 @@ class HandlersTestCase(unittest.TestCase):
     def tearDown(self) -> None:
         handlers._reset_history()
         handlers._last_activity = 0.0
+        handlers._queue_active_item = None
+        handlers._queue_cooldown_until = 0.0
+
+    def _drain_queue(self) -> None:
+        """Process all queued LLM items synchronously by calling _handle_llm directly."""
+        while not handlers._task_queue.empty():
+            try:
+                item = handlers._task_queue.get_nowait()
+            except Exception:
+                break
+            try:
+                handlers._handle_llm(item.chat_id, item.text)
+            except Exception:  # noqa: BLE001 - intentional in test drain helper
+                pass
+            finally:
+                handlers._task_queue.task_done()
 
     def _update(self, text, chat_id=1, user_id=111, message_id=42):
         return {
@@ -273,6 +299,7 @@ class FunctionCallLoopTests(HandlersTestCase):
         self.mock_run_tool.side_effect = ["ls-output", "mem-output"]
 
         handlers.process_update(self._update("do things"))
+        self._drain_queue()
 
         self.assertEqual(self.mock_run_tool.call_count, 2)
         self.mock_run_tool.assert_any_call("execute_shell", {"command": "ls"})
@@ -292,6 +319,7 @@ class FunctionCallLoopTests(HandlersTestCase):
         self.mock_run_tool.return_value = "output"
 
         handlers.process_update(self._update("loop forever"))
+        self._drain_queue()
 
         reply = self.mock_send_message.call_args[0][1]
         self.assertIn("Function call limit", reply)
@@ -302,6 +330,7 @@ class FunctionCallLoopTests(HandlersTestCase):
     def test_blocked_response_sends_blocked_message_and_history_not_retained(self) -> None:
         self.mock_call_gemini.return_value = (_blocked_response("SAFETY"), "m1")
         handlers.process_update(self._update("something"))
+        self._drain_queue()
         reply = self.mock_send_message.call_args[0][1]
         self.assertIn("blocked", reply)
         self.assertEqual(handlers._history, [])
@@ -313,10 +342,12 @@ class HistoryManagementTests(HandlersTestCase):
 
         self.mock_call_gemini.return_value = (_text_response("reply-1"), "m1")
         handlers.process_update(self._update("msg1"))
+        self._drain_queue()
         self.assertEqual(len(handlers._history), 2)
 
         self.mock_call_gemini.return_value = (_text_response("reply-2"), "m1")
         handlers.process_update(self._update("msg2"))
+        self._drain_queue()
         self.assertEqual(len(handlers._history), 2)
         self.assertEqual(handlers._history[0]["parts"][0]["text"], "msg2")
 
@@ -325,6 +356,7 @@ class HistoryManagementTests(HandlersTestCase):
         self.mock_call_gemini.return_value = (_text_response("reply"), "m1")
 
         handlers.process_update(self._update("msg1"))
+        self._drain_queue()
 
         self.assertEqual(handlers._history, [])
         first_call_contents = self.mock_call_gemini.call_args_list[0][0][0]
@@ -339,10 +371,76 @@ class HistoryManagementTests(HandlersTestCase):
         self.mock_call_gemini.return_value = (_text_response("reply"), "m1")
 
         handlers.process_update(self._update("new message"))
+        self._drain_queue()
 
         # Only the newest turn pair should remain; the stale history was reset first.
         self.assertEqual(len(handlers._history), 2)
         self.assertEqual(handlers._history[0]["parts"][0]["text"], "new message")
+
+
+class QueueTests(HandlersTestCase):
+    def test_llm_message_is_enqueued_not_called_directly(self) -> None:
+        handlers.process_update(self._update("hello"))
+        self.mock_call_gemini.assert_not_called()
+        self.assertEqual(handlers._task_queue.qsize(), 1)
+
+    def test_queue_status_idle(self) -> None:
+        handlers.process_update(self._update("/queue"))
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("idle", reply)
+        self.assertIn("0", reply)
+
+    def test_queue_status_shows_depth(self) -> None:
+        handlers.process_update(self._update("msg1"))
+        handlers.process_update(self._update("msg2"))
+        handlers.process_update(self._update("/queue"))
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("2", reply)
+
+    def test_queue_status_shows_active_item_preview(self) -> None:
+        handlers._queue_active_item = handlers._QueueItem(chat_id=1, text="what is the weather today")
+        handlers.process_update(self._update("/queue"))
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("what is the weather today", reply)
+
+    def test_queue_status_shows_cooldown_remaining(self) -> None:
+        handlers._queue_cooldown_until = time.time() + 45
+        handlers.process_update(self._update("/queue"))
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("429", reply)
+        self.assertIn("쿨다운", reply)
+
+    def test_process_llm_item_retries_on_all_models_failed(self) -> None:
+        """_process_llm_item retries after RPM cooldown when call_gemini raises."""
+        ok_resp = _text_response("done")
+        call_count = {"n": 0}
+
+        def _handle_llm_side_effect(chat_id, text):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise Exception("All Gemini models failed (rate limit or transient error).")
+            # Second call: simulate success by calling real _run_llm_turn path
+            # via mock_call_gemini returning ok_resp.
+
+        sleep_patcher = mock.patch.object(handlers.time, "sleep")
+        handle_llm_patcher = mock.patch.object(handlers, "_handle_llm", side_effect=_handle_llm_side_effect)
+        with sleep_patcher as mock_sleep, handle_llm_patcher:
+            item = handlers._QueueItem(chat_id=1, text="test")
+            # Run _process_llm_item; it will retry once then succeed (no exception on 2nd call)
+            handlers._process_llm_item(item)
+
+        self.assertEqual(call_count["n"], 2)
+        mock_sleep.assert_called_once_with(handlers._QUEUE_RPM_COOLDOWN_SEC)
+
+    def test_process_llm_item_raises_on_non_rpm_exception(self) -> None:
+        """_process_llm_item re-raises non-RPM exceptions immediately."""
+        def _fail(chat_id, text):
+            raise ValueError("bad input")
+
+        with mock.patch.object(handlers, "_handle_llm", side_effect=_fail):
+            item = handlers._QueueItem(chat_id=1, text="test")
+            with self.assertRaises(ValueError):
+                handlers._process_llm_item(item)
 
 
 if __name__ == "__main__":
