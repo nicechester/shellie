@@ -11,7 +11,7 @@ from typing import Any, Optional
 from src.agent.config import BASE_DIR, OFFSET_FILE, SHELLIE_HOME, settings
 from src.agent.core import shell
 from src.agent.telegram.client import get_me, get_updates, register_prechecks, send_message
-from src.agent.telegram.handlers import process_update
+from src.agent.telegram.handlers import process_update, start_queue_worker
 from src.agent.web.server import manager
 
 _LOGGER = logging.getLogger("shellie.main")
@@ -210,6 +210,8 @@ def main() -> None:
     }
 
     manager.start()
+
+    start_queue_worker()
 
     if missing:
         _run_setup_required_mode(missing)

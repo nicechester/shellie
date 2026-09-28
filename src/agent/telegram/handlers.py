@@ -4,6 +4,7 @@ import difflib
 import html
 import logging
 import os
+import queue
 import re
 import sys
 import threading
@@ -19,12 +20,12 @@ from src.agent.telegram.client import delete_message, send_chat_action, send_mes
 _LOGGER = logging.getLogger("shellie.telegram.handlers")
 
 # Gemini contents history (user/model turns only). Settings and bypass
-# commands are never added here (P6). Main thread only.
+# commands are never added here (P6). Worker thread only after queue introduced.
 _history: List[Dict[str, Any]] = []
 _last_activity: float = 0.0
 
 _SETTINGS_TOKENS = ("/settings", "/get", "/set", "/unset")
-_BYPASS_TOKENS = ("/mem", "/restart", "/reset", "/sh", "/help")
+_BYPASS_TOKENS = ("/mem", "/restart", "/reset", "/sh", "/help", "/queue")
 
 _HELP_TEXT = (
     "<b>Bypass commands</b> (no LLM)\n"
@@ -32,6 +33,7 @@ _HELP_TEXT = (
     "<code>/mem</code> — show long-term memory\n"
     "<code>/reset</code> — clear conversation history\n"
     "<code>/restart</code> — restart the process\n"
+    "<code>/queue</code> — show task queue status\n"
     "<code>/help</code> — show this message\n"
     "\n"
     "<b>Settings commands</b>\n"
@@ -80,7 +82,7 @@ def process_update(update: Dict[str, Any]) -> None:
         return
     if _handle_bypass_command(chat_id, text):
         return
-    _handle_llm(chat_id, text)
+    _task_queue.put(_QueueItem(chat_id, text))
 
 
 def _first_token_command(text: str) -> str:
@@ -262,6 +264,23 @@ def _handle_settings_command(chat_id: int, message_id: Optional[int], text: str)
 # ---------------------------------------------------------------------------
 
 
+def _queue_status_text() -> str:
+    depth = _task_queue.qsize()
+    active = _queue_active_item
+    cooldown_until = _queue_cooldown_until
+    lines = ["<b>Queue status</b>"]
+    if active is not None:
+        preview = html.escape(active.text[:80])
+        lines.append("🔄 처리 중: <code>{}</code>".format(preview))
+    else:
+        lines.append("💤 대기 중 (idle)")
+    lines.append("대기 항목: {}".format(depth))
+    remaining = cooldown_until - time.time()
+    if remaining > 0:
+        lines.append("⏳ 429 쿨다운: {}초 남음".format(int(remaining)))
+    return "\n".join(lines)
+
+
 def _run_shell_bypass(chat_id: int, command: str) -> None:
     send_chat_action(chat_id)
     send_message(chat_id, "⚙️ <code>{}</code>".format(html.escape(command)))
@@ -318,6 +337,10 @@ def _handle_bypass_command(chat_id: int, text: str) -> bool:
         send_message(chat_id, _HELP_TEXT)
         return True
 
+    if cmd == "/queue":
+        send_message(chat_id, _queue_status_text())
+        return True
+
     return False
 
 
@@ -349,8 +372,80 @@ def _markdown_to_html(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# LLM track (task 3.5): function-calling loop + retained context.
+# Task queue: LLM messages are enqueued by process_update and processed
+# serially by a single worker thread.
 # ---------------------------------------------------------------------------
+
+_QUEUE_RPM_COOLDOWN_SEC = 60
+
+
+class _QueueItem:
+    __slots__ = ("chat_id", "text")
+
+    def __init__(self, chat_id: int, text: str) -> None:
+        self.chat_id = chat_id
+        self.text = text
+
+
+_task_queue: queue.Queue = queue.Queue()  # unbounded
+_queue_active_item: Optional[_QueueItem] = None  # worker thread only (read by /queue on main)
+_queue_cooldown_until: float = 0.0  # worker thread only (read by /queue on main)
+
+
+def start_queue_worker() -> None:
+    t = threading.Thread(target=_queue_worker, daemon=True, name="shellie-queue-worker")
+    t.start()
+
+
+def _queue_worker() -> None:
+    global _queue_active_item, _queue_cooldown_until
+    while True:
+        item: _QueueItem = _task_queue.get()
+        _queue_active_item = item
+        try:
+            _process_llm_item(item)
+        except Exception:
+            _LOGGER.exception("Unexpected error in queue worker for chat_id=%s", item.chat_id)
+            try:
+                send_message(item.chat_id, "⚠️ 처리 중 오류가 발생했습니다.")
+            except Exception:
+                _LOGGER.debug("Failed to send worker error notice", exc_info=True)
+        finally:
+            _queue_active_item = None
+            _task_queue.task_done()
+
+
+def _process_llm_item(item: _QueueItem) -> None:
+    """Process one LLM queue item, retrying on RPM 429 with cooldown.
+    Raises only on non-retryable failures (RPD exhaustion / non-429 errors).
+    """
+    global _queue_cooldown_until
+    while True:
+        try:
+            _handle_llm(item.chat_id, item.text)
+            return
+        except Exception as exc:
+            msg = str(exc)
+            # call_gemini raises "All Gemini models failed" when the whole
+            # chain is exhausted. Treat as RPM cooldown and retry.
+            # Any other exception (RPD exhaustion propagated, non-429) is re-raised.
+            if "All Gemini models failed" in msg:
+                _queue_cooldown_until = time.time() + _QUEUE_RPM_COOLDOWN_SEC
+                _LOGGER.warning(
+                    "Queue: all models failed (RPM), cooling down %ds before retry",
+                    _QUEUE_RPM_COOLDOWN_SEC,
+                )
+                try:
+                    send_message(
+                        item.chat_id,
+                        "⏳ 모든 모델이 한도에 도달했습니다. {}초 후 재시도합니다…".format(_QUEUE_RPM_COOLDOWN_SEC),
+                    )
+                except Exception:
+                    _LOGGER.debug("Failed to send RPM cooldown notice", exc_info=True)
+                time.sleep(_QUEUE_RPM_COOLDOWN_SEC)
+                _queue_cooldown_until = 0.0
+                continue
+            raise
 
 
 def _trimmed_history(context_turns: int) -> List[Dict[str, Any]]:
