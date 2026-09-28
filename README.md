@@ -74,10 +74,16 @@ Shellie uses two separate directories:
 - **`SHELLIE_WORKSPACE`** (default: `~/workspace/`) — work products: job
   outputs, generated code, documents created by the LLM
 
-You can configure both:
+You can configure both via environment variables or `.env` file:
 
 ```sh
+# Via command line
 SHELLIE_HOME=~/.config/shellie SHELLIE_WORKSPACE=~/my-work PYTHONPATH=. python3 -m src.agent
+
+# Via .env file (read at startup)
+echo "SHELLIE_HOME=/path/to/config" >> .env
+echo "SHELLIE_WORKSPACE=/path/to/workspace" >> .env
+PYTHONPATH=. python3 -m src.agent
 ```
 
 This keeps configuration organized separately from the transient outputs of

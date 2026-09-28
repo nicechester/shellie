@@ -4,16 +4,41 @@ import os
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
+
+def _get_env_value(key: str, default: str) -> str:
+    """Get env value from os.environ or .env file at the repo root, read-once at startup."""
+    if key in os.environ:
+        return os.environ[key]
+    dotenv_path = os.path.join(BASE_DIR, ".env")
+    if os.path.exists(dotenv_path):
+        with open(dotenv_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                env_key, env_value = line.split("=", 1)
+                if env_key.strip() == key:
+                    env_value = env_value.strip()
+                    if (env_value.startswith('"') and env_value.endswith('"')) or (
+                        env_value.startswith("'") and env_value.endswith("'")
+                    ):
+                        env_value = env_value[1:-1]
+                    return env_value
+    return default
+
+
 # Config/context directory: settings, memories, offset file live here.
-# Override with SHELLIE_HOME env var before starting the process.
+# Read from os.environ, .env (repo root), or default to ~/.shellie
 SHELLIE_HOME = os.path.abspath(
-    os.environ.get("SHELLIE_HOME") or os.path.join(os.path.expanduser("~"), ".shellie")
+    _get_env_value("SHELLIE_HOME", os.path.join(os.path.expanduser("~"), ".shellie"))
 )
 
 # User workspace: job outputs, generated code, documents saved here (separate from config).
-# Override with SHELLIE_WORKSPACE env var before starting the process.
+# Read from os.environ, .env (repo root), or default to ~/workspace
 SHELLIE_WORKSPACE = os.path.abspath(
-    os.environ.get("SHELLIE_WORKSPACE") or os.path.join(os.path.expanduser("~"), "workspace")
+    _get_env_value("SHELLIE_WORKSPACE", os.path.join(os.path.expanduser("~"), "workspace"))
 )
 
 MEMORY_DIR = os.path.join(SHELLIE_HOME, "memory")
