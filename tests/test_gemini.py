@@ -668,6 +668,25 @@ class IsRpdLimitTests(unittest.TestCase):
     def test_short_delay_with_rpm_quota_id_is_not_rpd(self) -> None:
         self.assertFalse(gemini._is_rpd_limit(self._rpm_res(), 50.0))
 
+    def test_rpm_quota_id_with_generic_quota_message_is_not_rpd(self) -> None:
+        """Regression: quotaId is authoritative. RPM quotaId + generic message
+        must not be misclassified as RPD just because the message contains
+        'exceeded your current quota'."""
+        res = {
+            "error": {
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "message": "You exceeded your current quota, please check your plan and billing details.",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                        "violations": [{"quotaId": "GenerateRequestsPerMinutePerProjectPerModel-FreeTier"}],
+                    }
+                ],
+            }
+        }
+        self.assertFalse(gemini._is_rpd_limit(res, None))
+
 
 class ParseRetryDelayWithHeadersTests(unittest.TestCase):
     """_parse_retry_delay_with_headers() picks the larger of body vs header."""
