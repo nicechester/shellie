@@ -7,9 +7,10 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 from typing import Dict, List, Optional, Tuple
 
-from src.agent.config import BASE_DIR, SHELLIE_WORKSPACE, settings
+from src.agent.config import BASE_DIR, SHELLIE_HOME, SHELLIE_WORKSPACE, settings
 from src.agent.config import parse_dotenv as _parse_dotenv
 
 _active_pgid: Optional[int] = None
@@ -24,6 +25,15 @@ _QUOTING_HINT = (
     "To embed a single quote inside a single-quoted string, close and reopen quotes ('\\''), "
     "or wrap the whole argument in double quotes instead."
 )
+
+# Shell-mode `cd` persistence (issue #18 follow-up): a private env var name
+# used to pass the pwd-tracking temp file path to the child shell, and an
+# EXIT trap that writes the child's final $PWD to that file. This trap is
+# only ever prefixed onto shell-mode session commands (see execute_shell_in);
+# LLM tool calls and one-off `!`/`/sh` commands (execute_shell) never get it.
+_PWD_FILE_ENV = "__SHELLIE_PWD_FILE"
+_PWD_TRAP = "trap 'printf \"%s\" \"$PWD\" > \"$" + _PWD_FILE_ENV + "\"' EXIT; "
+_POSIX_SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "yash"}
 
 
 def _is_usable_shell(path: str) -> bool:
@@ -170,26 +180,49 @@ def _preflight_command(shell_path: str, command: str) -> Tuple[str, Optional[str
     return command, None
 
 
-def execute_shell(command: str) -> str:
+def _supports_pwd_trap(shell_path: str) -> bool:
+    """Whether shell_path is a POSIX-trap-compatible shell (trap ... EXIT
+    with $PWD works the same way). fish/tcsh and other non-POSIX shells are
+    excluded — commands there simply run untracked (last dir, no cd persistence).
+    """
+    return os.path.basename(shell_path) in _POSIX_SHELLS
+
+
+def _execute(command: str, cwd: str, pwd_file: Optional[str] = None) -> Tuple[str, bool]:
+    """Run one command in a fresh shell rooted at cwd. Returns (output, timed_out).
+
+    When pwd_file is given and the resolved shell supports it, the command is
+    prefixed with an EXIT trap that writes the child's final $PWD to pwd_file
+    (issue #18 follow-up: shell-mode `cd` persistence). This prefixing only
+    ever happens for shell-mode sessions via execute_shell_in — LLM tool
+    calls and one-off `!`/`/sh` commands (execute_shell) never get it, and the
+    quote-repair preflight always runs on the original, un-prefixed command.
+    """
     global _active_pgid
 
     try:
         shell = resolve_shell()
     except ValueError as exc:
-        return str(exc)
+        return str(exc), False
 
     timeout = settings.get("SHELL_TIMEOUT_SEC")
 
     command, repair_note = _preflight_command(shell, command)
 
+    env = _child_env()
+    to_run = command
+    if pwd_file and _supports_pwd_trap(shell):
+        env[_PWD_FILE_ENV] = pwd_file
+        to_run = _PWD_TRAP + command
+
     proc = subprocess.Popen(
-        [shell, "-c", command],
+        [shell, "-c", to_run],
         start_new_session=True,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        cwd=SHELLIE_WORKSPACE,
-        env=_child_env(),
+        cwd=cwd,
+        env=env,
         encoding="utf-8",
         errors="replace",
     )
@@ -217,7 +250,7 @@ def execute_shell(command: str) -> str:
             partial = _combine_streams(stdout, stderr)
             if partial:
                 message = message + "\n" + partial
-            return _truncate(message)
+            return _truncate(message), True
 
         body = _combine_streams(stdout, stderr)
         if not body:
@@ -228,9 +261,56 @@ def execute_shell(command: str) -> str:
             body = body + "\n[exit {}]".format(proc.returncode)
         if repair_note:
             body = repair_note + "\n" + body
-        return _truncate(body)
+        return _truncate(body), False
     finally:
         _active_pgid = None
+
+
+def execute_shell(command: str) -> str:
+    return _execute(command, SHELLIE_WORKSPACE)[0]
+
+
+def execute_shell_in(command: str, cwd: Optional[str]) -> Tuple[str, str]:
+    """Run command in a shell-mode session rooted at cwd, tracking `cd` across
+    calls via an EXIT-trap-written pwd file. Returns (output, new_cwd); new_cwd
+    is always an existing directory (falls back to SHELLIE_WORKSPACE with a
+    note if cwd no longer exists).
+    """
+    note = None
+    if not cwd or not os.path.isdir(cwd):
+        if cwd:
+            note = "[note] Previous directory no longer exists; back to the workspace."
+        cwd = SHELLIE_WORKSPACE
+
+    pwd_file: Optional[str] = None
+    try:
+        fd, pwd_file = tempfile.mkstemp(prefix=".shellie-pwd-", dir=SHELLIE_HOME)
+        os.close(fd)
+    except OSError:
+        pwd_file = None
+
+    try:
+        out, timed_out = _execute(command, cwd, pwd_file)
+        new_cwd = cwd
+        if pwd_file and not timed_out:
+            try:
+                with open(pwd_file, "rb") as f:
+                    raw = f.read()
+            except OSError:
+                raw = b""
+            candidate = raw.decode("utf-8", "surrogateescape")
+            if candidate and os.path.isabs(candidate) and os.path.isdir(candidate):
+                new_cwd = candidate
+    finally:
+        if pwd_file:
+            try:
+                os.unlink(pwd_file)
+            except OSError:
+                pass
+
+    if note:
+        out = note + "\n" + out
+    return out, new_cwd
 
 
 def execution_environment() -> Dict[str, str]:

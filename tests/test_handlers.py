@@ -79,6 +79,7 @@ class HandlersTestCase(unittest.TestCase):
         handlers._pending_upload_notes.clear()
         handlers._ls_index.clear()
         handlers._ls_next_id = 1
+        handlers._shell_session = None
         # Drain any leftover items from a previous test.
         while not handlers._task_queue.empty():
             try:
@@ -102,6 +103,7 @@ class HandlersTestCase(unittest.TestCase):
             "edit_message_text": mock.patch.object(handlers, "edit_message_text"),
             "answer_callback_query": mock.patch.object(handlers, "answer_callback_query"),
             "execute_shell": mock.patch.object(handlers, "execute_shell"),
+            "execute_shell_in": mock.patch.object(handlers, "execute_shell_in"),
             "read_memory": mock.patch.object(handlers, "read_memory"),
             "call_gemini": mock.patch.object(handlers, "call_gemini"),
             "run_tool": mock.patch.object(handlers, "run_tool"),
@@ -118,6 +120,8 @@ class HandlersTestCase(unittest.TestCase):
         self.mock_edit_message_text = self.mocks["edit_message_text"]
         self.mock_answer_callback_query = self.mocks["answer_callback_query"]
         self.mock_execute_shell = self.mocks["execute_shell"]
+        self.mock_execute_shell_in = self.mocks["execute_shell_in"]
+        self.mock_execute_shell_in.return_value = ("out", "/ws/sub")
         self.mock_read_memory = self.mocks["read_memory"]
         self.mock_call_gemini = self.mocks["call_gemini"]
         self.mock_run_tool = self.mocks["run_tool"]
@@ -131,6 +135,7 @@ class HandlersTestCase(unittest.TestCase):
             "FC_MAX_CONTINUATIONS": 2,
         }
         self.mock_settings.get.side_effect = lambda key: self._settings_values[key]
+        self.mock_send_message.return_value = {"ok": True, "result": {"message_id": 500}}
 
     def tearDown(self) -> None:
         handlers._reset_history()
@@ -141,6 +146,7 @@ class HandlersTestCase(unittest.TestCase):
         handlers._pending_upload_notes.clear()
         handlers._ls_index.clear()
         handlers._ls_next_id = 1
+        handlers._shell_session = None
 
     def _drain_queue(self) -> None:
         """Process all queued LLM items synchronously by calling _handle_llm directly."""
@@ -238,6 +244,7 @@ class BypassCommandTests(HandlersTestCase):
         self.mock_execute_shell.return_value = "hi"
         handlers.process_update(self._update("!echo hi"))
         self.mock_execute_shell.assert_called_once_with("echo hi")
+        self.mock_execute_shell_in.assert_not_called()
         self.mock_call_gemini.assert_not_called()
         reply = self.mock_send_message.call_args[0][1]
         self.assertEqual(reply, "<pre>hi</pre>")
@@ -1491,6 +1498,369 @@ class BrowseCommandTests(HandlersTestCase):
         handlers._ls_next_id = 2
         handlers.process_update(self._update("/file_1", user_id=222))
         self.mock_send_message.assert_not_called()
+
+
+class ShellModeTests(HandlersTestCase):
+    """`!!` and `/shell` shell mode with an in-place terminal message (issue #18)."""
+
+    def _enter(self, chat_id=1):
+        handlers.process_update(self._update("!!", chat_id=chat_id))
+
+    def test_enter_shell_mode(self) -> None:
+        self._enter()
+
+        self.mock_send_message.assert_called_once()
+        args, kwargs = self.mock_send_message.call_args
+        self.assertEqual(args[0], 1)
+        self.assertIn("reply_markup", kwargs)
+        self.assertIn(handlers._SHELL_EXIT_DATA, str(kwargs["reply_markup"]))
+
+        self.assertIsNotNone(handlers._shell_session)
+        self.assertEqual(handlers._shell_session.message_id, 500)
+        self.assertEqual(handlers._shell_session.cwd, handlers.SHELLIE_WORKSPACE)
+        self.mock_call_gemini.assert_not_called()
+        self.mock_execute_shell.assert_not_called()
+        self.mock_execute_shell_in.assert_not_called()
+
+    def test_command_while_active_runs_and_updates_terminal(self) -> None:
+        self._enter()
+        self.mock_execute_shell_in.return_value = ("<b>done</b>", handlers.SHELLIE_WORKSPACE)
+
+        handlers.process_update(self._update("ls -la", message_id=42))
+
+        self.mock_execute_shell_in.assert_called_once_with("ls -la", handlers.SHELLIE_WORKSPACE)
+        self.mock_execute_shell.assert_not_called()
+        self.assertEqual(self.mock_edit_message_text.call_count, 2)
+        for call in self.mock_edit_message_text.call_args_list:
+            self.assertEqual(call[0][0], 1)
+            self.assertEqual(call[0][1], 500)
+
+        final_text = self.mock_edit_message_text.call_args_list[-1][0][2]
+        prompt = handlers._prompt_path(handlers.SHELLIE_WORKSPACE)
+        self.assertIn("{}$ ls -la".format(prompt), final_text)
+        self.assertIn("&lt;b&gt;done&lt;/b&gt;", final_text)
+
+        self.mock_delete_message.assert_called_once_with(1, 42)
+        self.assertEqual(handlers._task_queue.qsize(), 0)
+        self.mock_call_gemini.assert_not_called()
+
+    def test_bang_prefixed_command_drops_single_bang(self) -> None:
+        self._enter()
+        self.mock_execute_shell_in.return_value = ("ok", handlers.SHELLIE_WORKSPACE)
+
+        handlers.process_update(self._update("!pwd"))
+
+        self.mock_execute_shell_in.assert_called_once_with("pwd", handlers.SHELLIE_WORKSPACE)
+
+    def test_bin_ls_and_queue_run_as_shell_commands(self) -> None:
+        self._enter()
+        self.mock_execute_shell_in.return_value = ("ok", handlers.SHELLIE_WORKSPACE)
+
+        handlers.process_update(self._update("/bin/ls"))
+        self.mock_execute_shell_in.assert_called_with("/bin/ls", handlers.SHELLIE_WORKSPACE)
+
+        self.mock_execute_shell_in.reset_mock()
+        handlers.process_update(self._update("/queue"))
+        self.mock_execute_shell_in.assert_called_with("/queue", handlers.SHELLIE_WORKSPACE)
+
+    def test_cwd_persists_across_commands(self) -> None:
+        self._enter()
+        self.mock_execute_shell_in.return_value = ("out", "/ws/sub")
+
+        handlers.process_update(self._update("cd sub", message_id=42))
+
+        self.mock_execute_shell_in.assert_called_once_with("cd sub", handlers.SHELLIE_WORKSPACE)
+        self.assertEqual(handlers._shell_session.cwd, "/ws/sub")
+
+        self.mock_execute_shell_in.reset_mock()
+        self.mock_execute_shell_in.return_value = ("out2", "/ws/sub")
+        handlers.process_update(self._update("pwd", message_id=43))
+
+        self.mock_execute_shell_in.assert_called_once_with("pwd", "/ws/sub")
+        self.assertEqual(handlers._shell_session.cwd, "/ws/sub")
+
+    def test_header_shows_current_cwd(self) -> None:
+        self._enter()
+        self.mock_execute_shell_in.return_value = ("out", "/ws/sub")
+
+        handlers.process_update(self._update("cd sub", message_id=42))
+
+        final_text = self.mock_edit_message_text.call_args_list[-1][0][2]
+        self.assertIn("/ws/sub", final_text)
+        self.assertNotIn("does not persist", final_text)
+
+    def test_header_html_escapes_cwd(self) -> None:
+        self._enter()
+        self.mock_execute_shell_in.return_value = ("out", "/ws/a&b<c")
+
+        handlers.process_update(self._update("cd weird", message_id=42))
+
+        final_text = self.mock_edit_message_text.call_args_list[-1][0][2]
+        self.assertIn("/ws/a&amp;b&lt;c", final_text)
+        self.assertNotIn("/ws/a&b<c", final_text)
+
+    def test_prompt_line_abbreviates_home_directory(self) -> None:
+        self._enter()
+        session = handlers._shell_session
+        session.cwd = os.path.join(os.path.expanduser("~"), "workspace")
+
+        text = handlers._render_terminal(session)
+
+        self.assertIn("~/workspace$ ", text)
+
+    def test_prompt_line_keeps_non_home_path_as_is(self) -> None:
+        self._enter()
+        session = handlers._shell_session
+        session.cwd = "/var/data/proj"
+
+        text = handlers._render_terminal(session)
+
+        self.assertIn("/var/data/proj$ ", text)
+
+    def test_entry_keeps_prompt_from_before_the_command_ran(self) -> None:
+        self._enter()
+        session = handlers._shell_session
+        session.cwd = "/ws/start"
+        self.mock_execute_shell_in.return_value = ("out", "/ws/after-cd")
+
+        handlers.process_update(self._update("cd after-cd", message_id=42))
+
+        prompt_cwd, cmd, out = session.entries[-1]
+        self.assertEqual(prompt_cwd, "/ws/start")
+        self.assertEqual(cmd, "cd after-cd")
+        self.assertEqual(out, "out")
+        final_text = self.mock_edit_message_text.call_args_list[-1][0][2]
+        self.assertIn("/ws/start$ cd after-cd", final_text)
+
+    def test_double_bang_while_active_exits(self) -> None:
+        self._enter()
+        self.mock_edit_message_text.reset_mock()
+        self.mock_send_message.reset_mock()
+
+        handlers.process_update(self._update("!!"))
+
+        self.mock_edit_message_text.assert_called_once()
+        edit_args, edit_kwargs = self.mock_edit_message_text.call_args
+        self.assertEqual(edit_kwargs.get("reply_markup"), {"inline_keyboard": []})
+        self.assertIn("[exited]", edit_args[2])
+
+        self.assertTrue(any("Shell mode off" in t for t in self._sent_texts()))
+        self.assertIsNone(handlers._shell_session)
+
+    def test_exit_word_while_active_exits(self) -> None:
+        self._enter()
+        handlers.process_update(self._update("exit"))
+        self.assertIsNone(handlers._shell_session)
+
+    def test_exit_word_while_inactive_goes_to_llm(self) -> None:
+        handlers.process_update(self._update("exit"))
+        self.assertEqual(handlers._task_queue.qsize(), 1)
+        self.mock_execute_shell.assert_not_called()
+        self.mock_execute_shell_in.assert_not_called()
+
+    def test_exit_now_while_active_runs_as_command(self) -> None:
+        self._enter()
+        self.mock_execute_shell_in.return_value = ("ok", handlers.SHELLIE_WORKSPACE)
+
+        handlers.process_update(self._update("exit now"))
+
+        self.mock_execute_shell_in.assert_called_once_with("exit now", handlers.SHELLIE_WORKSPACE)
+        self.assertIsNotNone(handlers._shell_session)
+
+    def test_reset_while_active_clears_session(self) -> None:
+        self._enter()
+
+        handlers.process_update(self._update("/reset"))
+
+        self.assertIsNone(handlers._shell_session)
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("Shell mode off", reply)
+        self.mock_execute_shell.assert_not_called()
+        self.mock_execute_shell_in.assert_not_called()
+
+    def test_callback_exit_while_active(self) -> None:
+        self._enter()
+
+        handlers.process_update(self._callback_update(handlers._SHELL_EXIT_DATA))
+
+        self.assertIsNone(handlers._shell_session)
+        self.mock_answer_callback_query.assert_called_once_with("cq1", "Shell mode off")
+
+    def test_callback_exit_while_inactive(self) -> None:
+        handlers.process_update(self._callback_update(handlers._SHELL_EXIT_DATA))
+        self.mock_answer_callback_query.assert_called_once_with("cq1", "Shell mode is not active.")
+
+    def test_callback_exit_unauthorized_is_silent(self) -> None:
+        self._enter()
+
+        handlers.process_update(self._callback_update(handlers._SHELL_EXIT_DATA, user_id=222))
+
+        self.mock_answer_callback_query.assert_not_called()
+        self.assertIsNotNone(handlers._shell_session)
+
+    def test_dir_callback_unaffected_by_shell_mode(self) -> None:
+        self._enter()
+        handlers._ls_index[1] = ("/ws/sub", True)
+        handlers._ls_next_id = 2
+
+        with mock.patch.object(files, "resolve_dir", return_value=("/ws/sub", None)), \
+                mock.patch.object(files, "list_dir", return_value=([], 0, None)):
+            handlers.process_update(self._callback_update("d:1"))
+
+        self.mock_answer_callback_query.assert_called_once_with("cq1")
+        self.assertIsNotNone(handlers._shell_session)
+
+    def test_different_chat_id_goes_to_normal_flow(self) -> None:
+        self._enter(chat_id=1)
+
+        handlers.process_update(self._update("hello", chat_id=2, user_id=111))
+
+        self.assertEqual(handlers._task_queue.qsize(), 1)
+        self.mock_execute_shell.assert_not_called()
+        self.mock_execute_shell_in.assert_not_called()
+
+    def test_trimming_drops_oldest_entries(self) -> None:
+        self._enter()
+        session = handlers._shell_session
+        base_len = len(handlers._render_terminal(session))
+        term_max = base_len + 250
+
+        with mock.patch.object(handlers, "_TERM_MAX", term_max):
+            self.mock_execute_shell_in.side_effect = lambda cmd, cwd: ("x" * 100, cwd)
+            for i in range(5):
+                handlers.process_update(self._update("cmd{}".format(i), message_id=42 + i))
+            final_text = self.mock_edit_message_text.call_args_list[-1][0][2]
+
+        self.assertLessEqual(len(final_text), term_max)
+        self.assertIn("cmd4", final_text)
+        self.assertNotIn("cmd0", final_text)
+        self.assertLess(len(handlers._shell_session.entries), 5)
+
+    def test_hard_trim_keeps_tail_and_reports_trimmed_chars(self) -> None:
+        self._enter()
+        session = handlers._shell_session
+        base_len = len(handlers._render_terminal(session))
+        term_max = base_len + 200
+
+        with mock.patch.object(handlers, "_TERM_MAX", term_max):
+            self.mock_execute_shell_in.return_value = ("y" * 5000, handlers.SHELLIE_WORKSPACE)
+            handlers.process_update(self._update("bigcmd", message_id=42))
+            final_text = self.mock_edit_message_text.call_args_list[-1][0][2]
+
+        self.assertLessEqual(len(final_text), term_max)
+        self.assertIn("chars trimmed", final_text)
+
+    def test_hard_trim_with_html_special_chars_still_fits(self) -> None:
+        self._enter()
+        session = handlers._shell_session
+        base_len = len(handlers._render_terminal(session))
+        term_max = base_len + 300
+
+        with mock.patch.object(handlers, "_TERM_MAX", term_max):
+            self.mock_execute_shell_in.return_value = ("<&>" * 2000, handlers.SHELLIE_WORKSPACE)
+            handlers.process_update(self._update("bigcmd2", message_id=43))
+            final_text = self.mock_edit_message_text.call_args_list[-1][0][2]
+
+        self.assertLessEqual(len(final_text), term_max)
+
+    def test_failed_edit_falls_back_to_send_message(self) -> None:
+        self._enter()
+        self.mock_edit_message_text.return_value = False
+        self.mock_send_message.return_value = {"ok": True, "result": {"message_id": 777}}
+        self.mock_execute_shell_in.return_value = ("ok", handlers.SHELLIE_WORKSPACE)
+
+        handlers.process_update(self._update("ls", message_id=42))
+
+        self.assertTrue(self.mock_edit_message_text.called)
+        self.assertGreaterEqual(self.mock_send_message.call_count, 2)
+        _, last_kwargs = self.mock_send_message.call_args
+        self.assertIn("reply_markup", last_kwargs)
+        self.assertEqual(handlers._shell_session.message_id, 777)
+
+    def test_upload_with_caption_while_active_ignores_caption(self) -> None:
+        self._enter()
+        tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp_dir, ignore_errors=True)
+        saved_path = os.path.join(tmp_dir, "report.csv")
+        with open(saved_path, "wb") as f:
+            f.write(b"hello")
+
+        with mock.patch.object(files, "extract_attachment", return_value={"kind": "document", "file_id": "f1"}), \
+                mock.patch.object(files, "save_incoming", return_value=(saved_path, None)), \
+                mock.patch.object(files, "upload_note", return_value="[system] note"):
+            handlers.process_update(self._file_update(caption="please summarize"))
+
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("Saved", reply)
+        self.assertIn("caption ignored", reply)
+        self.assertEqual(handlers._task_queue.qsize(), 0)
+        self.assertIsNotNone(handlers._shell_session)
+
+    def test_double_bang_prefix_outside_shell_mode_runs_bang_command(self) -> None:
+        self.mock_execute_shell.return_value = "ok"
+
+        handlers.process_update(self._update("!!ls"))
+
+        self.mock_execute_shell.assert_called_once_with("!ls")
+        self.mock_execute_shell_in.assert_not_called()
+        self.assertIsNone(handlers._shell_session)
+
+    def test_slash_shell_enters_shell_mode(self) -> None:
+        handlers.process_update(self._update("/shell"))
+
+        self.mock_send_message.assert_called_once()
+        args, kwargs = self.mock_send_message.call_args
+        self.assertEqual(args[0], 1)
+        self.assertIn("reply_markup", kwargs)
+        self.assertIn(handlers._SHELL_EXIT_DATA, str(kwargs["reply_markup"]))
+
+        self.assertIsNotNone(handlers._shell_session)
+        self.assertEqual(handlers._shell_session.message_id, 500)
+        self.assertEqual(handlers._shell_session.cwd, handlers.SHELLIE_WORKSPACE)
+        self.mock_call_gemini.assert_not_called()
+        self.mock_execute_shell.assert_not_called()
+        self.mock_execute_shell_in.assert_not_called()
+
+    def test_slash_shell_while_active_exits(self) -> None:
+        self._enter()
+        self.mock_send_message.reset_mock()
+        self.mock_edit_message_text.reset_mock()
+
+        handlers.process_update(self._update("/shell"))
+
+        self.mock_edit_message_text.assert_called_once()
+        edit_args, edit_kwargs = self.mock_edit_message_text.call_args
+        self.assertEqual(edit_kwargs.get("reply_markup"), {"inline_keyboard": []})
+        self.assertIn("[exited]", edit_args[2])
+
+        self.assertTrue(any("Shell mode off" in t for t in self._sent_texts()))
+        self.assertIsNone(handlers._shell_session)
+
+    def test_slash_shell_at_bot_enters_shell_mode(self) -> None:
+        handlers.process_update(self._update("/shell@MyBot"))
+
+        self.mock_send_message.assert_called_once()
+        self.assertIsNotNone(handlers._shell_session)
+        self.mock_call_gemini.assert_not_called()
+
+    def test_slash_shell_with_args_outside_mode_enters_shell_mode(self) -> None:
+        handlers.process_update(self._update("/shell ls"))
+
+        self.mock_send_message.assert_called_once()
+        self.assertIsNotNone(handlers._shell_session)
+        self.mock_execute_shell.assert_not_called()
+        self.mock_execute_shell_in.assert_not_called()
+        self.mock_call_gemini.assert_not_called()
+        self.assertEqual(handlers._task_queue.qsize(), 0)
+
+    def test_slash_shell_with_args_while_active_runs_as_command(self) -> None:
+        self._enter()
+        self.mock_execute_shell_in.return_value = ("ok", handlers.SHELLIE_WORKSPACE)
+
+        handlers.process_update(self._update("/shell ls"))
+
+        self.mock_execute_shell_in.assert_called_once_with("/shell ls", handlers.SHELLIE_WORKSPACE)
+        self.assertIsNotNone(handlers._shell_session)
 
 
 if __name__ == "__main__":

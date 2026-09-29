@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -223,6 +225,149 @@ class ExecuteShellTimeoutTests(unittest.TestCase):
 
         # The module clears _active_pgid in its finally block once done.
         self.assertIsNone(shell._active_pgid)
+
+
+class SupportsPwdTrapTests(unittest.TestCase):
+    """_supports_pwd_trap() gates the EXIT-trap prefix to POSIX-ish shells."""
+
+    def test_true_for_posix_shells(self) -> None:
+        self.assertTrue(shell._supports_pwd_trap("/bin/zsh"))
+        self.assertTrue(shell._supports_pwd_trap("/usr/bin/bash"))
+
+    def test_false_for_non_posix_shells(self) -> None:
+        self.assertFalse(shell._supports_pwd_trap("/usr/bin/fish"))
+        self.assertFalse(shell._supports_pwd_trap("/bin/tcsh"))
+
+
+class ExecuteShellRegressionTests(unittest.TestCase):
+    """execute_shell() (LLM/one-off path) must never get the pwd-trap treatment."""
+
+    def setUp(self) -> None:
+        self._settings_patcher = mock.patch.object(shell, "settings")
+        self.mock_settings = self._settings_patcher.start()
+        self.addCleanup(self._settings_patcher.stop)
+        self.mock_settings.get.side_effect = _settings_get_factory({})
+
+    def test_execute_shell_env_has_no_pwd_file_var(self) -> None:
+        result = shell.execute_shell("env")
+        self.assertNotIn(shell._PWD_FILE_ENV, result)
+
+
+class ExecuteShellInTests(unittest.TestCase):
+    """execute_shell_in(): cd persistence within a shell-mode session, via an
+    EXIT trap that writes the child's final $PWD to a private temp file."""
+
+    def setUp(self) -> None:
+        self._settings_patcher = mock.patch.object(shell, "settings")
+        self.mock_settings = self._settings_patcher.start()
+        self.addCleanup(self._settings_patcher.stop)
+        self.mock_settings.get.side_effect = _settings_get_factory({})
+
+        self._home_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._home_dir, ignore_errors=True)
+        self._ws_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._ws_dir, ignore_errors=True)
+        self._sub_dir = os.path.join(self._ws_dir, "sub")
+        os.makedirs(self._sub_dir, exist_ok=True)
+
+        self._home_patcher = mock.patch.object(shell, "SHELLIE_HOME", self._home_dir)
+        self._home_patcher.start()
+        self.addCleanup(self._home_patcher.stop)
+        self._ws_patcher = mock.patch.object(shell, "SHELLIE_WORKSPACE", self._ws_dir)
+        self._ws_patcher.start()
+        self.addCleanup(self._ws_patcher.stop)
+
+    def _assert_no_pwd_files_left(self) -> None:
+        leftovers = [f for f in os.listdir(self._home_dir) if f.startswith(".shellie-pwd-")]
+        self.assertEqual(leftovers, [])
+
+    def test_cd_updates_cwd(self) -> None:
+        out, new_cwd = shell.execute_shell_in("cd sub", self._ws_dir)
+        self.assertEqual(new_cwd, self._sub_dir)
+        self.assertIn("Executed successfully (no output).", out)
+        self._assert_no_pwd_files_left()
+
+    def test_pwd_reflects_given_cwd(self) -> None:
+        out, new_cwd = shell.execute_shell_in("pwd", self._sub_dir)
+        self.assertIn(self._sub_dir, out)
+        self.assertEqual(new_cwd, self._sub_dir)
+
+    def test_cd_and_exit_status_both_survive(self) -> None:
+        out, new_cwd = shell.execute_shell_in("cd sub; exit 3", self._ws_dir)
+        self.assertEqual(new_cwd, self._sub_dir)
+        self.assertIn("[exit 3]", out)
+
+    def test_set_e_then_cd_then_false_still_records_cwd(self) -> None:
+        out, new_cwd = shell.execute_shell_in("set -e; cd sub; false", self._ws_dir)
+        self.assertEqual(new_cwd, self._sub_dir)
+
+    def test_heredoc_command(self) -> None:
+        cmd = "cd sub\ncat <<EOF\nhi\nEOF"
+        out, new_cwd = shell.execute_shell_in(cmd, self._ws_dir)
+        self.assertIn("hi", out)
+        self.assertEqual(new_cwd, self._sub_dir)
+
+    def test_background_job_completes_and_leaves_cwd_unchanged(self) -> None:
+        start = time.time()
+        out, new_cwd = shell.execute_shell_in("sleep 0.2 &", self._ws_dir)
+        elapsed = time.time() - start
+        self.assertEqual(new_cwd, self._ws_dir)
+        self.assertLess(elapsed, 2.0)
+
+    def test_trailing_comment(self) -> None:
+        out, new_cwd = shell.execute_shell_in("echo x # comment", self._ws_dir)
+        self.assertIn("x", out)
+
+    def test_user_exit_trap_replaces_ours(self) -> None:
+        out, new_cwd = shell.execute_shell_in("trap 'echo bye' EXIT; cd sub", self._ws_dir)
+        # Our trap got clobbered by the user's, so the pwd file is never
+        # written and the old cwd is kept — accepted trade-off.
+        self.assertEqual(new_cwd, self._ws_dir)
+        self.assertIn("bye", out)
+
+    def test_missing_cwd_falls_back_to_workspace(self) -> None:
+        missing = os.path.join(self._ws_dir, "does-not-exist")
+        out, new_cwd = shell.execute_shell_in("pwd", missing)
+        self.assertEqual(new_cwd, self._ws_dir)
+        self.assertTrue(out.startswith("[note] Previous directory no longer exists"))
+
+    def test_timeout_keeps_old_cwd(self) -> None:
+        self.mock_settings.get.side_effect = _settings_get_factory({"SHELL_TIMEOUT_SEC": 1})
+        out, new_cwd = shell.execute_shell_in("cd sub; sleep 5", self._ws_dir)
+        self.assertIn("timed out", out)
+        self.assertEqual(new_cwd, self._ws_dir)
+        self._assert_no_pwd_files_left()
+
+    def test_no_pwd_file_leftover_after_normal_and_timeout_calls(self) -> None:
+        shell.execute_shell_in("cd sub", self._ws_dir)
+        self._assert_no_pwd_files_left()
+        self.mock_settings.get.side_effect = _settings_get_factory({"SHELL_TIMEOUT_SEC": 1})
+        shell.execute_shell_in("sleep 5", self._ws_dir)
+        self._assert_no_pwd_files_left()
+
+    def test_symlink_preserves_logical_path(self) -> None:
+        link_path = os.path.join(self._ws_dir, "link")
+        os.symlink(self._sub_dir, link_path)
+        out, new_cwd = shell.execute_shell_in("cd link", self._ws_dir)
+        self.assertTrue(new_cwd.endswith("link"))
+
+    def test_preflight_receives_original_command_without_trap_prefix(self) -> None:
+        calls = []
+
+        def _spy(shell_path, command):
+            calls.append(command)
+            return command, None
+
+        with mock.patch.object(shell, "_preflight_command", side_effect=_spy):
+            shell.execute_shell_in("cd sub", self._ws_dir)
+        self.assertEqual(calls, ["cd sub"])
+
+    @unittest.skipUnless(os.path.exists("/bin/zsh"), "zsh not available")
+    def test_zsh_cd_and_exit_status(self) -> None:
+        self.mock_settings.get.side_effect = _settings_get_factory({"SHELL_PATH": "/bin/zsh"})
+        out, new_cwd = shell.execute_shell_in("cd sub; exit 2", self._ws_dir)
+        self.assertEqual(new_cwd, self._sub_dir)
+        self.assertIn("[exit 2]", out)
 
 
 class KillActiveTests(unittest.TestCase):

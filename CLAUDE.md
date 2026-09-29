@@ -44,7 +44,7 @@ bypass, 24/7 via launchd/systemd.
   timeout → killpg SIGTERM → 2s → SIGKILL, `kill_active()` for SIGTERM handler,
   per-OS PATH augmentation, output = stdout + `[stderr]` + `[exit N]`, truncation,
   quote-repair preflight (`\'`/`\"` over-escape detection via `shell -n` parse
-  check, auto-repair candidates, quoting hint appended on syntax errors).
+  check, auto-repair candidates, quoting hint appended on syntax errors); `execute_shell_in` (EXIT-trap `$PWD` capture via `__SHELLIE_PWD_FILE` env var, mkstemp 0600 in SHELLIE_HOME, cwd kept on timeout or missing/replaced trap, workspace fallback when the stored dir is gone, POSIX shells only; preflight still runs on the original command).
 - `core/memory.py` — core `memory/MEMORY.md` (permanent, never auto-written) +
   dated files `memory/YYYY-MM-DD.md` (append_memory target, one-line entries).
   `read_memory()` injects **core + today only**; older memories are grep-searched
@@ -90,7 +90,12 @@ bypass, 24/7 via launchd/systemd.
   DEBUG), get_me/delete_message, `register_prechecks()`, `get_file`/`download_file`/
   `send_document` (multipart, call-time token, masked errors).
 - `telegram/handlers.py` — routing: auth (fail-closed; unauthorized = **silent**
-  + warn log) → settings commands (`/settings /get /set /unset`, excluded from
+  + warn log) → attachments → shell mode if active (every message → execute_shell,
+  `!cmd` tolerated, `exit`/`!!`/`/shell` (both toggle)/❌ `s:exit` callback/`/reset` leave; module-global
+  `_shell_session` main-thread only; terminal message edited in place, `_TERM_MAX=3800`
+  top-trim + single-entry tail hard-trim; session tracks `cwd` (shown in terminal header),
+  `cd` persists within session; user command messages deleted best-effort;
+  captions ignored while active) → settings commands (`/settings /get /set /unset`, excluded from
   history) → bypass (`!`, `/sh`, `/mem`, `/reset` = context + queue drain,
   `/restart` = process exit, `/queue` = queue status + live Gemini retry/cooldown (remaining seconds, attempt), `/kill` = drain queue
   without history reset, `/systemlog [N]` = tail agent.log last N lines (default
@@ -175,6 +180,7 @@ Phases 0–9 all implemented; issue #4 v1+v2 (auto-continuation + task persisten
   bypass command + `send_file` LLM tool, streaming 64KB, no new settings keys);
   `/browse` inline-keyboard UI (callback_query handling added to allowed_updates,
   `answer_callback_query` + `edit_message_text` support).
+- Issue #18 implemented: `!!` shell mode with in-place terminal message (s:exit inline button, /reset clears, not persisted).
 - Issue #13 open: OpenAI-compatible LLM backend support.
 
 Outstanding:
