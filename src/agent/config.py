@@ -47,10 +47,12 @@ SKILLS_DIR = os.path.join(SHELLIE_HOME, "skills")       # user skills (takes pri
 REPO_SKILLS_DIR = os.path.join(BASE_DIR, "skills")      # built-in repo skills
 OFFSET_FILE = os.path.join(SHELLIE_HOME, ".update_offset")
 SETTINGS_FILE = os.path.join(SHELLIE_HOME, "settings.json")
+TASKS_DIR = os.path.join(SHELLIE_HOME, "tasks")
 
 os.makedirs(MEMORY_DIR, exist_ok=True)
 os.makedirs(SKILLS_DIR, exist_ok=True)
 os.makedirs(SHELLIE_WORKSPACE, exist_ok=True)
+os.makedirs(TASKS_DIR, mode=0o700, exist_ok=True)
 
 # Seed MEMORY.md from the repo template on first run.
 _MEMORY_TEMPLATE = os.path.join(BASE_DIR, "memory", "MEMORY.md")

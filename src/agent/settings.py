@@ -300,6 +300,12 @@ CATALOG: Tuple[SettingSpec, ...] = (
         constraint="1~50",
     ),
     SettingSpec(
+        "FC_MAX_CONTINUATIONS", "int", _make_int_parser(0, 5),
+        default=2, apply_timing="immediate",
+        description="Max automatic continuations when a turn hits FC_MAX_LOOPS (0 = off; /continue still works)",
+        constraint="0~5",
+    ),
+    SettingSpec(
         "CONTEXT_TURNS", "int", _make_int_parser(0, 50),
         default=10, apply_timing="immediate",
         description="Recent conversation turns to retain (0=single-shot)",
