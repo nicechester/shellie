@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import os
+import shutil
+import tempfile
+import time
 import unittest
 from unittest import mock
 
+from src.agent.core import tasks
 from src.agent.settings import Result
 from src.agent.telegram import handlers
 
@@ -69,6 +73,8 @@ class HandlersTestCase(unittest.TestCase):
         handlers._reset_history()
         handlers._last_activity = 0.0
         handlers._queue_active_item = None
+        handlers._task_epoch = 0
+        handlers._active_continuation = 0
         # Drain any leftover items from a previous test.
         while not handlers._task_queue.empty():
             try:
@@ -76,6 +82,13 @@ class HandlersTestCase(unittest.TestCase):
                 handlers._task_queue.task_done()
             except Exception:
                 break
+
+        # Isolate task persistence from the real ~/.shellie/tasks directory.
+        self._tasks_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._tasks_dir, ignore_errors=True)
+        tasks_dir_patcher = mock.patch.object(tasks, "TASKS_DIR", self._tasks_dir)
+        tasks_dir_patcher.start()
+        self.addCleanup(tasks_dir_patcher.stop)
 
         patches = {
             "settings": mock.patch.object(handlers, "settings"),
@@ -107,6 +120,7 @@ class HandlersTestCase(unittest.TestCase):
             "CONTEXT_TURNS": 10,
             "IDLE_RESET_MINUTES": 30,
             "WEB_PORT": 8321,
+            "FC_MAX_CONTINUATIONS": 2,
         }
         self.mock_settings.get.side_effect = lambda key: self._settings_values[key]
 
@@ -114,6 +128,8 @@ class HandlersTestCase(unittest.TestCase):
         handlers._reset_history()
         handlers._last_activity = 0.0
         handlers._queue_active_item = None
+        handlers._task_epoch = 0
+        handlers._active_continuation = 0
 
     def _drain_queue(self) -> None:
         """Process all queued LLM items synchronously by calling _handle_llm directly."""
@@ -128,6 +144,25 @@ class HandlersTestCase(unittest.TestCase):
                 pass
             finally:
                 handlers._task_queue.task_done()
+
+    def _drain_queue_full(self) -> None:
+        """Process all queued items synchronously through the real worker
+        entry point (_process_llm_item), including task persistence and
+        auto-continuation."""
+        while not handlers._task_queue.empty():
+            try:
+                item = handlers._task_queue.get_nowait()
+            except Exception:
+                break
+            try:
+                handlers._process_llm_item(item)
+            except Exception:  # noqa: BLE001 - intentional in test drain helper
+                pass
+            finally:
+                handlers._task_queue.task_done()
+
+    def _sent_texts(self):
+        return [call_args[0][1] for call_args in self.mock_send_message.call_args_list]
 
     def _update(self, text, chat_id=1, user_id=111, message_id=42):
         return {
@@ -527,6 +562,7 @@ class QueueTests(HandlersTestCase):
         sleep_patcher = mock.patch.object(handlers.time, "sleep")
         handle_llm_patcher = mock.patch.object(handlers, "_handle_llm")
         with sleep_patcher as mock_sleep, handle_llm_patcher as mock_handle_llm:
+            mock_handle_llm.return_value = ("done", "")
             item = handlers._QueueItem(chat_id=1, text="test")
             handlers._process_llm_item(item)
 
@@ -660,6 +696,364 @@ class QueueTests(HandlersTestCase):
             handlers.process_update(self._update("/queue"))
         reply = self.mock_send_message.call_args[0][1]
         self.assertIn("대기 항목", reply)
+
+
+class ContinuationTests(HandlersTestCase):
+    """Auto-continuation chain (issue #4), driven through the real worker
+    entry point (_process_llm_item) so task persistence is exercised."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._settings_values["FC_MAX_LOOPS"] = 1
+
+    def test_limit_then_continuation_finishes(self) -> None:
+        fc_pending_1 = _fc_response([("execute_shell", {"command": "ls"})])
+        fc_pending_2 = _fc_response([("execute_shell", {"command": "pwd"})])
+        wrapup_resp = _text_response("W1")
+        done_resp = _text_response("all finished")
+        self.mock_call_gemini.side_effect = [
+            (fc_pending_1, "m1"), (fc_pending_2, "m1"), (wrapup_resp, "m1"), (done_resp, "m1"),
+        ]
+        self.mock_run_tool.return_value = "ls-output"
+
+        handlers.process_update(self._update("do the big task"))
+        self._drain_queue_full()
+
+        self.assertEqual(self.mock_call_gemini.call_count, 4)
+        continuation_contents = self.mock_call_gemini.call_args_list[3][0][0]
+        last_turn = continuation_contents[-1]
+        self.assertEqual(last_turn["role"], "user")
+        cont_text = last_turn["parts"][-1]["text"]
+        self.assertIn("Original request", cont_text)
+        self.assertIn("do the big task", cont_text)
+        self.assertIn("W1", cont_text)
+
+        self.assertTrue(
+            any("Continuing the remaining work automatically (1/2)" in t for t in self._sent_texts())
+        )
+        self.assertIsNone(tasks.load_task())
+
+    def test_three_limits_exhausts_continuations(self) -> None:
+        fc1 = _fc_response([("execute_shell", {"command": "ls"})])
+        fc2 = _fc_response([("execute_shell", {"command": "pwd"})])
+        wrap1 = _text_response("W1")
+        wrap2 = _text_response("W2")
+        wrap3 = _text_response("W3")
+        self.mock_call_gemini.side_effect = [
+            (fc1, "m1"), (fc2, "m1"), (wrap1, "m1"),
+            (fc1, "m1"), (fc2, "m1"), (wrap2, "m1"),
+            (fc1, "m1"), (fc2, "m1"), (wrap3, "m1"),
+        ]
+        self.mock_run_tool.return_value = "out"
+
+        handlers.process_update(self._update("long task"))
+        self._drain_queue_full()
+
+        self.assertEqual(self.mock_call_gemini.call_count, 9)
+        texts = self._sent_texts()
+        self.assertTrue(any("(1/2)" in t for t in texts))
+        self.assertTrue(any("(2/2)" in t for t in texts))
+        self.assertTrue(any("Auto-continuation limit" in t for t in texts))
+
+        record = tasks.load_task()
+        self.assertIsNotNone(record)
+        self.assertEqual(record["stop_reason"], "exhausted")
+        self.assertEqual(record["continuations"], 2)
+        self.assertEqual(record["last_wrapup"], "W3")
+
+    def test_fc_max_continuations_zero_no_continuation(self) -> None:
+        self._settings_values["FC_MAX_CONTINUATIONS"] = 0
+        fc1 = _fc_response([("execute_shell", {"command": "ls"})])
+        fc2 = _fc_response([("execute_shell", {"command": "pwd"})])
+        wrap1 = _text_response("W1")
+        self.mock_call_gemini.side_effect = [(fc1, "m1"), (fc2, "m1"), (wrap1, "m1")]
+        self.mock_run_tool.return_value = "out"
+
+        handlers.process_update(self._update("task"))
+        self._drain_queue_full()
+
+        self.assertEqual(self.mock_call_gemini.call_count, 3)
+        record = tasks.load_task()
+        self.assertIsNotNone(record)
+        self.assertEqual(record["stop_reason"], "limit")
+        self.assertEqual(record["continuations"], 0)
+        self.assertTrue(any("not finished yet" in t for t in self._sent_texts()))
+
+    def test_repeat_loop_outcome_no_continuation(self) -> None:
+        self._settings_values["FC_MAX_LOOPS"] = 15
+        fc_ls = _fc_response([("execute_shell", {"command": "ls"})])
+        wrap_resp = _text_response("wrap")
+        self.mock_call_gemini.side_effect = [
+            (fc_ls, "m1"), (fc_ls, "m1"), (fc_ls, "m1"), (wrap_resp, "m1"),
+        ]
+        self.mock_run_tool.return_value = "same"
+
+        handlers.process_update(self._update("loop identical"))
+        self._drain_queue_full()
+
+        record = tasks.load_task()
+        self.assertIsNotNone(record)
+        self.assertEqual(record["stop_reason"], "loop")
+        self.assertEqual(record["continuations"], 0)
+
+    def test_identical_wrapup_twice_stops_no_progress(self) -> None:
+        fc1 = _fc_response([("execute_shell", {"command": "ls"})])
+        fc2 = _fc_response([("execute_shell", {"command": "pwd"})])
+        wrap_w1 = _text_response("W1")
+        self.mock_call_gemini.side_effect = [
+            (fc1, "m1"), (fc2, "m1"), (wrap_w1, "m1"),
+            (fc1, "m1"), (fc2, "m1"), (wrap_w1, "m1"),
+        ]
+        self.mock_run_tool.return_value = "out"
+
+        handlers.process_update(self._update("stuck task"))
+        self._drain_queue_full()
+
+        record = tasks.load_task()
+        self.assertIsNotNone(record)
+        self.assertEqual(record["stop_reason"], "no_progress")
+        self.assertEqual(record["continuations"], 1)
+
+    def test_wrapup_no_text_no_continuation(self) -> None:
+        fc1 = _fc_response([("execute_shell", {"command": "ls"})])
+        fc2 = _fc_response([("execute_shell", {"command": "pwd"})])
+        self.mock_call_gemini.side_effect = [(fc1, "m1"), (fc2, "m1"), Exception("boom")]
+        self.mock_run_tool.return_value = "out"
+
+        handlers.process_update(self._update("silent task"))
+        self._drain_queue_full()
+
+        self.assertEqual(self.mock_call_gemini.call_count, 3)
+        record = tasks.load_task()
+        self.assertIsNotNone(record)
+        self.assertEqual(record["continuations"], 0)
+        self.assertEqual(record["stop_reason"], "limit")
+
+    def test_blocked_response_deletes_file_no_hint(self) -> None:
+        self.mock_call_gemini.return_value = (_blocked_response("SAFETY"), "m1")
+
+        handlers.process_update(self._update("blocked task"))
+        self._drain_queue_full()
+
+        self.assertIsNone(tasks.load_task())
+        self.assertEqual(self.mock_send_message.call_count, 1)
+
+    def test_handle_llm_error_path_keeps_file(self) -> None:
+        self.mock_call_gemini.side_effect = Exception("kaboom")
+
+        handlers.process_update(self._update("error task"))
+        self._drain_queue_full()
+
+        record = tasks.load_task()
+        self.assertIsNotNone(record)
+        self.assertEqual(record["stop_reason"], "error")
+
+    def test_abandon_mid_chain_stops_continuation(self) -> None:
+        fc1 = _fc_response([("execute_shell", {"command": "ls"})])
+        fc2 = _fc_response([("execute_shell", {"command": "pwd"})])
+        wrap1 = _text_response("W1")
+        call_state = {"count": 0}
+
+        def _side_effect(contents, **kwargs):
+            call_state["count"] += 1
+            if call_state["count"] == 1:
+                handlers._abandon_task("kill")
+                return fc1, "m1"
+            if call_state["count"] == 2:
+                return fc2, "m1"
+            return wrap1, "m1"
+
+        self.mock_call_gemini.side_effect = _side_effect
+        self.mock_run_tool.return_value = "out"
+
+        handlers.process_update(self._update("abandon me"))
+        self._drain_queue_full()
+
+        self.assertEqual(self.mock_call_gemini.call_count, 3)
+        self.assertIsNone(tasks.load_task())
+        texts = self._sent_texts()
+        self.assertFalse(any("Continuing the remaining work automatically" in t for t in texts))
+        self.assertFalse(any("not finished yet" in t for t in texts))
+
+
+class TaskCommandTests(HandlersTestCase):
+    """/continue, /discard, /reset, /kill task-file interactions and
+    notify_pending_task (issue #4)."""
+
+    def test_continue_no_file(self) -> None:
+        handlers.process_update(self._update("/continue"))
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertEqual(reply, "No unfinished task to continue.")
+        self.assertEqual(handlers._task_queue.qsize(), 0)
+
+    def test_continue_different_chat_id(self) -> None:
+        record = tasks.new_task(chat_id=999, user_id=111, prompt="other chat task")
+        tasks.save_task(record)
+
+        handlers.process_update(self._update("/continue", chat_id=1))
+
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertEqual(reply, "No unfinished task to continue.")
+        self.assertEqual(handlers._task_queue.qsize(), 0)
+
+    def test_continue_with_file_enqueues_and_processes(self) -> None:
+        record = tasks.new_task(chat_id=1, user_id=111, prompt="orig task")
+        record["continuations"] = 2
+        record["stop_reason"] = "exhausted"
+        tasks.save_task(record)
+
+        handlers.process_update(self._update("/continue", chat_id=1))
+
+        self.assertEqual(handlers._task_queue.qsize(), 1)
+        item = list(handlers._task_queue.queue)[0]
+        self.assertEqual(item.kind, "continue")
+        self.assertEqual(item.task_id, record["task_id"])
+
+        self.mock_call_gemini.return_value = (_text_response("all done"), "m1")
+        self._drain_queue_full()
+
+        contents = self.mock_call_gemini.call_args_list[0][0][0]
+        last_text = contents[-1]["parts"][-1]["text"]
+        self.assertIn("manual", last_text)
+        self.assertIsNone(tasks.load_task())
+
+    def test_continue_item_stale_task_id(self) -> None:
+        item = handlers._QueueItem(1, "/continue", user_id=None, kind="continue", task_id="nonexistent")
+        handlers._task_queue.put(item)
+
+        self._drain_queue_full()
+
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("already finished or discarded", reply)
+        self.mock_call_gemini.assert_not_called()
+
+    def test_continue_while_active_already_in_progress(self) -> None:
+        record = tasks.new_task(chat_id=1, user_id=111, prompt="active task")
+        tasks.save_task(record)
+        handlers._queue_active_item = handlers._QueueItem(1, "working", task_id=record["task_id"])
+
+        handlers.process_update(self._update("/continue", chat_id=1))
+
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertEqual(reply, "That task is already in progress.")
+        self.assertEqual(handlers._task_queue.qsize(), 0)
+
+    def test_discard_deletes_file_and_bumps_epoch(self) -> None:
+        record = tasks.new_task(chat_id=1, user_id=111, prompt="discard me")
+        tasks.save_task(record)
+        epoch_before = handlers._task_epoch
+
+        handlers.process_update(self._update("/discard", chat_id=1))
+
+        self.assertIsNone(tasks.load_task())
+        self.assertEqual(handlers._task_epoch, epoch_before + 1)
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("Unfinished task discarded", reply)
+        self.assertIn("ago", reply)
+
+    def test_discard_wrong_chat_is_noop(self) -> None:
+        record = tasks.new_task(chat_id=999, user_id=111, prompt="other")
+        tasks.save_task(record)
+        epoch_before = handlers._task_epoch
+
+        handlers.process_update(self._update("/discard", chat_id=1))
+
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertEqual(reply, "No unfinished task to discard.")
+        self.assertEqual(handlers._task_epoch, epoch_before)
+        self.assertIsNotNone(tasks.load_task())
+
+    def test_discard_no_file_is_noop(self) -> None:
+        epoch_before = handlers._task_epoch
+
+        handlers.process_update(self._update("/discard", chat_id=1))
+
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertEqual(reply, "No unfinished task to discard.")
+        self.assertEqual(handlers._task_epoch, epoch_before)
+
+    def test_reset_discards_existing_task(self) -> None:
+        record = tasks.new_task(chat_id=1, user_id=111, prompt="reset target")
+        tasks.save_task(record)
+
+        handlers.process_update(self._update("/reset", chat_id=1))
+
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("Unfinished task discarded.", reply)
+        self.assertIsNone(tasks.load_task())
+
+    def test_kill_discards_existing_task(self) -> None:
+        record = tasks.new_task(chat_id=1, user_id=111, prompt="kill target")
+        tasks.save_task(record)
+
+        handlers.process_update(self._update("/kill", chat_id=1))
+
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("Unfinished task discarded.", reply)
+        self.assertIsNone(tasks.load_task())
+
+    def test_help_includes_continue_and_discard(self) -> None:
+        handlers.process_update(self._update("/help"))
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("/continue", reply)
+        self.assertIn("/discard", reply)
+
+    def test_notify_pending_task_valid_file(self) -> None:
+        record = tasks.new_task(chat_id=1, user_id=111, prompt="pending work")
+        record["stop_reason"] = "limit"
+        tasks.save_task(record)
+
+        handlers.notify_pending_task()
+
+        self.assertEqual(self.mock_send_message.call_count, 1)
+        call_args = self.mock_send_message.call_args
+        self.assertEqual(call_args[0][0], 1)
+        reply = call_args[0][1]
+        self.assertIn("An unfinished task exists", reply)
+        self.assertIn("/continue", reply)
+        self.assertEqual(handlers._task_queue.qsize(), 0)
+
+    def test_notify_pending_task_stale_file(self) -> None:
+        record = tasks.new_task(chat_id=1, user_id=111, prompt="stale work")
+        stale_time = time.time() - tasks.TASK_MAX_AGE_SEC - 10
+        with mock.patch.object(tasks.time, "time", return_value=stale_time):
+            tasks.save_task(record)
+
+        handlers.notify_pending_task()
+
+        self.mock_send_message.assert_not_called()
+        self.assertIsNone(tasks.load_task())
+
+    def test_notify_pending_task_user_mismatch(self) -> None:
+        record = tasks.new_task(chat_id=1, user_id=222, prompt="not yours")
+        tasks.save_task(record)
+
+        handlers.notify_pending_task()
+
+        self.mock_send_message.assert_not_called()
+        self.assertIsNone(tasks.load_task())
+
+    def test_notify_pending_task_corrupt_file(self) -> None:
+        path = os.path.join(self._tasks_dir, "current.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{not valid json")
+
+        handlers.notify_pending_task()
+
+        self.mock_send_message.assert_not_called()
+        corrupt_names = [
+            name for name in os.listdir(self._tasks_dir) if name.startswith("current.json.corrupt-")
+        ]
+        self.assertEqual(len(corrupt_names), 1)
+
+    def test_notify_pending_task_stop_reason_none_includes_interrupted_line(self) -> None:
+        record = tasks.new_task(chat_id=1, user_id=111, prompt="interrupted work")
+        tasks.save_task(record)
+
+        handlers.notify_pending_task()
+
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("interrupted", reply.lower())
 
 
 if __name__ == "__main__":

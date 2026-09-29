@@ -351,13 +351,15 @@ def _is_rpd_limit(res: Dict[str, Any], delay: Optional[float]) -> bool:
     """Return True if a 429 looks like an RPD (per-day) exhaustion.
 
     Primary signal: a QuotaFailure violation whose quotaId contains "PerDay".
-    Fallback: error message contains "per day", "daily", or "rpd" keywords.
-    The retry delay is NOT a reliable signal — RPD retryDelay is the same
-    order of magnitude as RPM (seconds, not hours).
+    This is authoritative when present. Fallback: error message contains
+    "per day", "daily", or "rpd" keywords — used only when no quotaId detail
+    is present. The retry delay is NOT a reliable signal — RPD retryDelay is
+    the same order of magnitude as RPM (seconds, not hours).
     """
     try:
         error = res.get("error") if isinstance(res, dict) else None
         if isinstance(error, dict):
+            saw_quota_id = False
             for detail in (error.get("details") or []):
                 if not isinstance(detail, dict):
                     continue
@@ -365,8 +367,14 @@ def _is_rpd_limit(res: Dict[str, Any], delay: Optional[float]) -> bool:
                     continue
                 for v in (detail.get("violations") or []):
                     quota_id = v.get("quotaId", "") if isinstance(v, dict) else ""
+                    if quota_id:
+                        saw_quota_id = True
                     if _RPD_QUOTA_ID_RE.search(quota_id):
                         return True
+            # quotaId is authoritative when present; don't consult message heuristic
+            if saw_quota_id:
+                return False
+            # No quotaId detail; fall back to message keywords
             message = error.get("message", "")
             if isinstance(message, str) and _RPD_MESSAGE_RE.search(message):
                 return True

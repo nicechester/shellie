@@ -88,6 +88,11 @@ class TestLayerPrecedence(_SettingsTestCase):
         self.assertEqual(store.get("GEMINI_RETRY_BASE_DELAY_SEC"), 60)
         self.assertEqual(store.get("GEMINI_MAX_RETRIES"), 2)
 
+    def test_fc_max_continuations_default(self):
+        store, missing = self._new_store()
+        self.assertEqual(missing, [])
+        self.assertEqual(store.get("FC_MAX_CONTINUATIONS"), 2)
+
 
 class TestInvalidValues(_SettingsTestCase):
     def test_invalid_env_value_is_warned_and_falls_back_to_default(self):
@@ -130,6 +135,16 @@ class TestBoundaryValidation(_SettingsTestCase):
 
     def test_gemini_max_retries_boundaries(self):
         parser = _CATALOG_BY_KEY["GEMINI_MAX_RETRIES"].parser
+        for raw, expect_ok in (("-1", False), ("0", True), ("5", True), ("6", False)):
+            with self.subTest(raw=raw):
+                if expect_ok:
+                    self.assertEqual(parser(raw), int(raw))
+                else:
+                    with self.assertRaises(ValueError):
+                        parser(raw)
+
+    def test_fc_max_continuations_boundaries(self):
+        parser = _CATALOG_BY_KEY["FC_MAX_CONTINUATIONS"].parser
         for raw, expect_ok in (("-1", False), ("0", True), ("5", True), ("6", False)):
             with self.subTest(raw=raw):
                 if expect_ok:

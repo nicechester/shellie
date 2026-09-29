@@ -13,6 +13,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from src.agent.config import settings
+from src.agent.core import tasks
 from src.agent.core.gemini import call_gemini, get_retry_status, parse_response, run_tool
 from src.agent.core.memory import read_memory
 from src.agent.core.shell import execute_shell
@@ -25,8 +26,18 @@ _LOGGER = logging.getLogger("shellie.telegram.handlers")
 _history: List[Dict[str, Any]] = []
 _last_activity: float = 0.0
 
+# Task persistence (issue #4): guards every tasks.* file-mutating call and
+# the epoch counter used to detect/abandon an in-flight continuation chain
+# after /reset, /kill or /discard.
+_task_lock = threading.Lock()
+_task_epoch: int = 0
+_active_continuation: int = 0  # worker writes; /queue reads (best-effort, no lock)
+
 _SETTINGS_TOKENS = ("/settings", "/get", "/set", "/unset")
-_BYPASS_TOKENS = ("/mem", "/restart", "/reset", "/sh", "/help", "/queue", "/kill", "/systemlog")
+_BYPASS_TOKENS = (
+    "/mem", "/restart", "/reset", "/sh", "/help", "/queue", "/kill", "/systemlog",
+    "/continue", "/discard",
+)
 
 _HELP_TEXT = (
     "<b>Bypass commands</b> (no LLM)\n"
@@ -36,6 +47,8 @@ _HELP_TEXT = (
     "<code>/restart</code> — restart the process\n"
     "<code>/queue</code> — show task queue status\n"
     "<code>/kill</code> — drain queue and discard pending tasks\n"
+    "<code>/continue</code> — resume the unfinished task\n"
+    "<code>/discard</code> — drop the unfinished task\n"
     "<code>/systemlog [N]</code> — show last N lines of agent.log (default 50)\n"
     "<code>/help</code> — show this message\n"
     "\n"
@@ -97,7 +110,7 @@ def process_update(update: Dict[str, Any]) -> None:
         return
     if _handle_bypass_command(chat_id, text):
         return
-    _task_queue.put(_QueueItem(chat_id, text))
+    _task_queue.put(_QueueItem(chat_id, text, user_id=user_id))
 
 
 def _first_token_command(text: str) -> str:
@@ -330,6 +343,12 @@ def _queue_status_text() -> str:
     if active is not None:
         preview = html.escape(active.text[:80])
         lines.append("🔄 처리 중: <code>{}</code>".format(preview))
+        if _active_continuation > 0:
+            lines.append(
+                "Auto-continuation: {}/{}".format(
+                    _active_continuation, settings.get("FC_MAX_CONTINUATIONS")
+                )
+            )
     else:
         lines.append("💤 대기 중 (idle)")
     lines.extend(_retry_status_lines(get_retry_status()))
@@ -386,6 +405,8 @@ def _handle_bypass_command(chat_id: int, text: str) -> bool:
         msg = "🔄 Conversation context cleared."
         if drained:
             msg += " (대기 항목 {}개 삭제됨)".format(drained)
+        if _abandon_task("reset") is not None:
+            msg += " Unfinished task discarded."
         send_message(chat_id, msg)
         return True
 
@@ -393,7 +414,42 @@ def _handle_bypass_command(chat_id: int, text: str) -> bool:
         drained = _drain_queue()
         active = _queue_active_item
         active_note = " 현재 처리 중인 항목은 완료 후 중단됩니다." if active else ""
-        send_message(chat_id, "🗑️ 대기 항목 {}개 삭제됨.{}".format(drained, active_note))
+        msg = "🗑️ 대기 항목 {}개 삭제됨.{}".format(drained, active_note)
+        if _abandon_task("kill") is not None:
+            msg += " Unfinished task discarded."
+        send_message(chat_id, msg)
+        return True
+
+    if cmd == "/continue":
+        with _task_lock:
+            record = tasks.load_task()
+        if record is None or record.get("chat_id") != chat_id:
+            send_message(chat_id, "No unfinished task to continue.")
+            return True
+        active = _queue_active_item
+        if active is not None and active.task_id == record["task_id"]:
+            send_message(chat_id, "That task is already in progress.")
+            return True
+        _task_queue.put(
+            _QueueItem(chat_id, "/continue", user_id=None, kind="continue", task_id=record["task_id"])
+        )
+        age = tasks.format_age(time.time() - record["created_at"])
+        send_message(chat_id, "Resuming the unfinished task (started {} ago).".format(age))
+        return True
+
+    if cmd == "/discard":
+        with _task_lock:
+            record = tasks.load_task()
+        if record is None or record.get("chat_id") != chat_id:
+            send_message(chat_id, "No unfinished task to discard.")
+            return True
+        active = _queue_active_item
+        _abandon_task("discard")
+        age = tasks.format_age(time.time() - record["created_at"])
+        msg = "Unfinished task discarded (started {} ago).".format(age)
+        if active is not None and active.task_id == record["task_id"]:
+            msg += " The current step will finish, but it will not continue."
+        send_message(chat_id, msg)
         return True
 
     if cmd == "/systemlog":
@@ -458,11 +514,21 @@ def _markdown_to_html(text: str) -> str:
 
 
 class _QueueItem:
-    __slots__ = ("chat_id", "text")
+    __slots__ = ("chat_id", "text", "user_id", "kind", "task_id")
 
-    def __init__(self, chat_id: int, text: str) -> None:
+    def __init__(
+        self,
+        chat_id: int,
+        text: str,
+        user_id: Optional[int] = None,
+        kind: str = "message",
+        task_id: Optional[str] = None,
+    ) -> None:
         self.chat_id = chat_id
         self.text = text
+        self.user_id = user_id
+        self.kind = kind
+        self.task_id = task_id
 
 
 _task_queue: queue.Queue = queue.Queue()  # unbounded
@@ -492,12 +558,189 @@ def _queue_worker() -> None:
             _task_queue.task_done()
 
 
+_CONT_PROMPT_EMBED_CHARS = 4000
+_CONT_WRAPUP_EMBED_CHARS = 6000
+
+_CONT_STOP_HINTS = {
+    "exhausted": (
+        "Auto-continuation limit ({max}) reached; the task is not finished yet. "
+        "Send /continue to keep going or /discard to drop it."
+    ),
+    "limit": (
+        "The task is not finished yet. Send /continue to keep going or /discard to drop it."
+    ),
+    "loop": (
+        "No progress is being made, so auto-continuation was stopped. "
+        "Send /continue to try again or /discard to drop it."
+    ),
+    "no_progress": (
+        "No progress is being made, so auto-continuation was stopped. "
+        "Send /continue to try again or /discard to drop it."
+    ),
+    "error": (
+        "The task stopped because of an error. Send /continue to retry or /discard to drop it."
+    ),
+}
+
+
+def _build_continuation_prompt(record: Dict[str, Any], label: str) -> str:
+    """Build a self-contained continuation prompt (works after idle reset,
+    restart, or CONTEXT_TURNS=0 since it embeds the original request and the
+    last wrap-up rather than relying on _history)."""
+    prompt = record["prompt"][:_CONT_PROMPT_EMBED_CHARS]
+    last_wrapup = record.get("last_wrapup", "")
+
+    if last_wrapup:
+        wrapup = last_wrapup[:_CONT_WRAPUP_EMBED_CHARS]
+        return (
+            "[system] Continuation ({label}) of an unfinished task. The previous turn stopped because the tool-call budget ran out.\n\n"
+            "Original request:\n<<<\n{prompt}\n>>>\n\n"
+            "Your last progress summary:\n<<<\n{wrapup}\n>>>\n\n"
+            "Now EXECUTE the remaining unfinished work using your tools. Do not repeat steps that are already done. Do NOT reply with a plan, a summary, or instructions for the user — perform the remaining actions yourself with tool calls. Only after the remaining actions have actually been executed, give the final answer with concrete results (files created, URLs, ids)."
+        ).format(label=label, prompt=prompt, wrapup=wrapup)
+
+    return (
+        "[system] Continuation ({label}) of a task that was interrupted before it finished (for example by a process restart). Some steps may already have run.\n\n"
+        "Original request:\n<<<\n{prompt}\n>>>\n\n"
+        "First check the current state (files, outputs) with your tools before acting, and do not repeat work that is already done. Then EXECUTE the remaining work — do NOT reply with a plan, a summary, or instructions for the user. Only after the remaining actions have actually been executed, give the final answer with concrete results (files created, URLs, ids)."
+    ).format(label=label, prompt=prompt)
+
+
+def _abandon_task(by: str) -> Optional[Dict[str, Any]]:
+    """Discard the current task file (if any) and bump the epoch so any
+    in-flight continuation chain notices and abandons itself."""
+    global _task_epoch
+    with _task_lock:
+        record = tasks.load_task()
+        _task_epoch += 1
+        tasks.delete_task()
+    if record is not None:
+        _LOGGER.info("task_abandoned task_id=%s by=%s", record["task_id"], by)
+    return record
+
+
+def _run_task_chain(
+    item: _QueueItem, record: Dict[str, Any], epoch: int, outcome: str, wrapup: str
+) -> None:
+    """Drive the auto-continuation loop for one task until it finishes,
+    gets stopped, or is abandoned by a concurrent /reset, /kill or /discard.
+    """
+    global _active_continuation
+    while True:
+        with _task_lock:
+            if _task_epoch != epoch:
+                _LOGGER.info("task_abandoned task_id=%s", record["task_id"])
+                return
+
+        if outcome in ("done", "blocked"):
+            with _task_lock:
+                if _task_epoch == epoch:
+                    tasks.delete_task(record["task_id"])
+            _LOGGER.info(
+                "task_done task_id=%s continuations=%d outcome=%s",
+                record["task_id"], record["continuations"], outcome,
+            )
+            return
+
+        max_cont = settings.get("FC_MAX_CONTINUATIONS")
+
+        if outcome == "limit" and record["last_wrapup"] and wrapup.strip() == record["last_wrapup"].strip():
+            outcome = "no_progress"
+
+        if outcome == "limit" and wrapup and record["continuations"] < max_cont:
+            record["continuations"] += 1
+            record["last_wrapup"] = wrapup
+            record["stop_reason"] = None
+            with _task_lock:
+                if _task_epoch != epoch:
+                    return
+                tasks.save_task(record)
+            n = record["continuations"]
+            _active_continuation = n
+            _LOGGER.info(
+                "task_continuation task_id=%s n=%d max=%d", record["task_id"], n, max_cont
+            )
+            send_message(
+                item.chat_id,
+                "Continuing the remaining work automatically ({}/{})...".format(n, max_cont),
+            )
+            outcome, wrapup = _handle_llm(
+                item.chat_id, _build_continuation_prompt(record, "{}/{}".format(n, max_cont))
+            )
+            continue
+
+        if outcome == "limit" and max_cont > 0 and record["continuations"] >= max_cont:
+            stop_reason = "exhausted"
+        else:
+            stop_reason = outcome
+
+        if wrapup:
+            record["last_wrapup"] = wrapup
+        record["stop_reason"] = stop_reason
+        with _task_lock:
+            if _task_epoch != epoch:
+                return
+            tasks.save_task(record)
+        _LOGGER.info(
+            "task_stopped task_id=%s reason=%s continuations=%d",
+            record["task_id"], stop_reason, record["continuations"],
+        )
+        hint = _CONT_STOP_HINTS.get(stop_reason, _CONT_STOP_HINTS["limit"])
+        if stop_reason == "exhausted":
+            hint = hint.format(max=max_cont)
+        send_message(item.chat_id, hint)
+        return
+
+
+def _process_continue_item(item: _QueueItem) -> None:
+    with _task_lock:
+        epoch = _task_epoch
+        record = tasks.load_task()
+        if record is None or record["task_id"] != item.task_id:
+            record = None
+        else:
+            record["continuations"] = 0
+            record["stop_reason"] = None
+            tasks.save_task(record)
+
+    if record is None:
+        send_message(
+            item.chat_id, "That task was already finished or discarded; nothing to continue."
+        )
+        return
+
+    item.task_id = record["task_id"]
+    outcome, wrapup = _handle_llm(item.chat_id, _build_continuation_prompt(record, "manual"))
+    _run_task_chain(item, record, epoch, outcome, wrapup)
+
+
 def _process_llm_item(item: _QueueItem) -> None:
     """Process one LLM queue item. call_gemini already handles all retries
     internally (RPM sleep + exponential backoff across the whole chain).
     If it still raises, propagate so the worker can notify the user.
     """
-    _handle_llm(item.chat_id, item.text)
+    global _active_continuation
+    try:
+        if item.kind == "continue":
+            _process_continue_item(item)
+            return
+
+        with _task_lock:
+            epoch = _task_epoch
+            existing = tasks.load_task()
+            if existing is not None:
+                _LOGGER.info("task_replaced old_task_id=%s", existing["task_id"])
+            record = tasks.new_task(item.chat_id, item.user_id, item.text)
+            if not tasks.save_task(record):
+                _LOGGER.warning("task_save_failed task_id=%s", record["task_id"])
+            item.task_id = record["task_id"]
+
+        _LOGGER.info("task_created task_id=%s chat_id=%s", record["task_id"], item.chat_id)
+
+        outcome, wrapup = _handle_llm(item.chat_id, item.text)
+        _run_task_chain(item, record, epoch, outcome, wrapup)
+    finally:
+        _active_continuation = 0
 
 
 def _trimmed_history(context_turns: int) -> List[Dict[str, Any]]:
@@ -592,10 +835,11 @@ def _fc_wrapup(
     n: int,
     last_text: str,
     on_cooldown: Callable[[int, int, float], None],
-) -> None:
+) -> str:
     """Send one tools-disabled final-answer request using the tool results
     gathered so far, then reply and (if any text is produced) save history.
-    Never runs tools; never raises.
+    Never runs tools; never raises. Returns the final wrap-up text produced
+    (may be "" if no text was produced).
     """
     if reason == "loop":
         note = _FC_WRAPUP_LOOP_NOTE.format(n)
@@ -637,13 +881,15 @@ def _fc_wrapup(
         _history.append({"role": "model", "parts": [{"text": final_text}]})
         _trim_history_pairs(context_turns)
 
+    return final_text
+
 
 def _run_llm_turn(
     chat_id: int,
     contents: List[Dict[str, Any]],
     user_turn: Dict[str, Any],
     context_turns: int,
-) -> None:
+) -> Tuple[str, str]:
     fc_max_loops = settings.get("FC_MAX_LOOPS")
     loop_count = 0
     last_text = ""
@@ -660,7 +906,7 @@ def _run_llm_turn(
         if parsed.blocked:
             reason = parsed.block_reason or "unknown"
             send_message(chat_id, "⚠️ Response was blocked: {}".format(html.escape(str(reason))))
-            return
+            return "blocked", ""
 
         if parsed.text:
             last_text = parsed.text
@@ -671,11 +917,11 @@ def _run_llm_turn(
                     "fc_limit_reached loops=%d max=%d pending=%s trace=%s",
                     loop_count, fc_max_loops, [name for name, _ in parsed.function_calls], trace,
                 )
-                _fc_wrapup(
+                wrapup_text = _fc_wrapup(
                     chat_id, contents, user_turn, context_turns,
                     reason="limit", n=fc_max_loops, last_text=last_text, on_cooldown=on_cooldown,
                 )
-                return
+                return "limit", wrapup_text
 
             contents.append(parsed.raw_content)
             response_parts = []
@@ -705,11 +951,11 @@ def _run_llm_turn(
                     "fc_loop_detected loops=%d repeats=%d calls=%s trace=%s",
                     loop_count, repeat_count, calls_desc, trace,
                 )
-                _fc_wrapup(
+                wrapup_text = _fc_wrapup(
                     chat_id, contents, user_turn, context_turns,
                     reason="loop", n=repeat_count, last_text=last_text, on_cooldown=on_cooldown,
                 )
-                return
+                return "loop", wrapup_text
             continue
 
         if loop_count > 0:
@@ -723,10 +969,10 @@ def _run_llm_turn(
         _history.append(user_turn)
         _history.append(parsed.raw_content)
         _trim_history_pairs(context_turns)
-        return
+        return "done", ""
 
 
-def _handle_llm(chat_id: int, text: str) -> None:
+def _handle_llm(chat_id: int, text: str) -> Tuple[str, str]:
     global _last_activity
 
     now = time.time()
@@ -747,9 +993,43 @@ def _handle_llm(chat_id: int, text: str) -> None:
     )
     typing_thread.start()
     try:
-        _run_llm_turn(chat_id, contents, user_turn, context_turns)
+        return _run_llm_turn(chat_id, contents, user_turn, context_turns)
     except Exception as exc:
         _LOGGER.exception("Error in LLM track")
         send_message(chat_id, "⚠️ An error occurred: {}".format(html.escape(str(exc))))
+        return "error", ""
     finally:
         stop_typing.set()
+
+
+def notify_pending_task() -> None:
+    """Called once at startup (from __main__) to notify the owner about an
+    unfinished task left over from a previous run. Never raises, never
+    auto-resumes anything."""
+    with _task_lock:
+        record = tasks.load_task()
+    if record is None:
+        return
+
+    user_id = record.get("user_id")
+    if user_id is not None and user_id != settings.get("ALLOWED_USER_ID"):
+        with _task_lock:
+            tasks.delete_task(record["task_id"])
+        _LOGGER.warning("Task file owner mismatch; discarding task_id=%s", record["task_id"])
+        return
+
+    preview = html.escape(record["prompt"][:80])
+    age = tasks.format_age(time.time() - record["created_at"])
+    lines = [
+        "An unfinished task exists (started {} ago):".format(age),
+        "<code>{}</code>".format(preview),
+    ]
+    if record.get("stop_reason") is None:
+        lines.append("It was interrupted before finishing.")
+    lines.append("/continue to resume, /discard to drop it. Sending a new request will replace it.")
+    message = "\n".join(lines)
+
+    try:
+        send_message(record["chat_id"], message)
+    except Exception:
+        _LOGGER.debug("Failed to send pending task notice", exc_info=True)

@@ -16,14 +16,14 @@ to interact with it:
   (`gemini-2.5-flash` → `gemini-2.5-pro` → `gemini-2.5-flash-lite` by default,
   falling back to the next model on 429/`RESOURCE_EXHAUSTED`/5xx/transport
   errors) with function calling. The model can call `execute_shell` and
-  `append_memory`, looping up to `FC_MAX_LOOPS` times per message; on reaching the limit or on detecting a repeated tool-call loop, the agent makes a final tools-disabled call to summarize results, and the turn is kept in context.
+  `append_memory`, looping up to `FC_MAX_LOOPS` times per message; on reaching the limit or on detecting a repeated tool-call loop, the agent makes a final tools-disabled call to summarize results. If `FC_MAX_CONTINUATIONS` > 0, the agent can automatically resume the unfinished task up to that limit; otherwise `/continue` can be used to manually resume.
 - **Long-term memory** — split into a core file, `memory/MEMORY.md`
   (user-curated, permanent), and per-day files `memory/YYYY-MM-DD.md` that
   the LLM appends to with `append_memory`. `/mem` and every LLM call inject
   the core file plus today's dated file into the system instruction; older
   dated files are not injected but can be found with `grep -ri "<keyword>"
   memory/`.
-- **Runtime-editable settings** — all 20 settings can be changed without a
+- **Runtime-editable settings** — all 22 settings can be changed without a
   restart, either from a local web UI (`http://127.0.0.1:<WEB_PORT>/`) or via
   Telegram `/set`/`/unset` commands. See [§7](#7-settings).
 - **MCP tools (optional)** — configure `MCP_SERVERS` to let the Gemini LLM
@@ -199,6 +199,8 @@ service for you (macOS → launchd, Linux → systemd user unit), and `chmod
 | `/get KEY` | Bypass (settings) | Detail view for one key: value, source, default, constraint, apply timing |
 | `/set KEY VALUE` | Bypass (settings) | Applies an override immediately (rejected for web-only keys) |
 | `/unset KEY` | Bypass (settings) | Removes an override, falling back to the env/default layer |
+| `/continue` | Bypass (task) | Resume the unfinished task (stopped, errored, or left over from a restart) |
+| `/discard` | Bypass (task) | Drop the unfinished task without resuming |
 | anything else | LLM (Gemini) | Sent with tools `execute_shell` and `append_memory`; function-calling loop up to `FC_MAX_LOOPS` iterations (or on repeat-loop detection), with final wrap-up call if limit reached, with up to `CONTEXT_TURNS` recent turns of history |
 
 ## 7. Settings
@@ -218,7 +220,7 @@ does nothing until you restart — and even after a restart, if an override
 for that key already exists in `settings.json`, your new `.env` value stays
 shadowed until you `/unset` that key (or delete `settings.json`).
 
-### 20-key reference
+### 22-key reference
 
 | Key | Default | Range / format | Telegram-editable | Apply timing |
 |---|---|---|---|---|
@@ -232,6 +234,7 @@ shadowed until you `/unset` that key (or delete `settings.json`).
 | `GEMINI_MAX_RETRIES` | `2` | 0–5 | Yes | immediate |
 | `SYSTEM_PROMPT` | platform-neutral Korean default | 1–4000 chars, multi-line allowed | Yes | immediate |
 | `FC_MAX_LOOPS` | `15` | 1–50 | Yes | immediate |
+| `FC_MAX_CONTINUATIONS` | `2` | 0–5 | Yes | immediate |
 | `CONTEXT_TURNS` | `10` | 0–50 (0 = single-shot, no history kept) | Yes | immediate |
 | `IDLE_RESET_MINUTES` | `30` | 0–1440 (0 = disabled) | Yes | immediate |
 | `SHELL_TIMEOUT_SEC` | `45` | 1–600 | Yes | immediate |
@@ -319,6 +322,10 @@ service, delete the offending key from `settings.json` (or delete the whole
 file to fall back to `.env`/defaults), then restart the service. Because
 `TELEGRAM_BOT_TOKEN`/`GEMINI_API_KEY`/`ALLOWED_USER_ID` can only be changed
 from the web UI, Telegram commands alone can never lock you out of the bot.
+
+### Task persistence
+
+In-flight task state is persisted to `~/.shellie/tasks/current.json` (mode 0600): the file is created when an LLM task starts, updated on each wrap-up/continuation, and deleted when the task completes (or on `/reset`, `/kill`, `/discard`). On restart, the process does **not** auto-resume; instead it notifies you about the unfinished task and waits for `/continue` (resume) or `/discard` (drop). Task files expire after 3 days of inactivity and are deleted automatically.
 
 ## 8. Skills
 
