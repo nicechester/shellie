@@ -42,7 +42,9 @@ bypass, 24/7 via launchd/systemd.
   validated), `Popen([shell, "-c", cmd], start_new_session=True)` with cwd =
   SHELLIE_WORKSPACE (user workspace, not repo root; separate from config dir),
   timeout → killpg SIGTERM → 2s → SIGKILL, `kill_active()` for SIGTERM handler,
-  per-OS PATH augmentation, output = stdout + `[stderr]` + `[exit N]`, truncation.
+  per-OS PATH augmentation, output = stdout + `[stderr]` + `[exit N]`, truncation,
+  quote-repair preflight (`\'`/`\"` over-escape detection via `shell -n` parse
+  check, auto-repair candidates, quoting hint appended on syntax errors).
 - `core/memory.py` — core `memory/MEMORY.md` (permanent, never auto-written) +
   dated files `memory/YYYY-MM-DD.md` (append_memory target, one-line entries).
   `read_memory()` injects **core + today only**; older memories are grep-searched
@@ -128,6 +130,20 @@ Phases 0–9 all implemented. Recent changes:
 - Workspace directory split: SHELLIE_HOME (~/.shellie/) for config/context;
   SHELLIE_WORKSPACE (~/workspace) for job outputs/generated code; cwd set to
   SHELLIE_WORKSPACE; both configurable via env vars; issue #3.
+- `execute_shell` now preflights commands for over-escaped quotes (e.g. `\'`
+  inside single quotes): parse-checks via `shell -n`, auto-repairs when a
+  candidate rewrite parses cleanly, and otherwise appends a quoting hint to
+  the tool result on shell syntax errors, so the model can self-correct
+  instead of exhausting the FC loop budget on broken escaping.
+- `skills/gws.md` gained a quoting-rules section (no backslash-escaped quotes;
+  `'` for single quotes inside JSON; payload files for large JSON) and its
+  bad `--json-values '[[\"a\"...]]'` example was fixed (it was teaching the
+  model the exact over-escape pattern). New `skills/sheet_from_csv.py`:
+  CSV → new/existing spreadsheet via argv-based gws calls (no shell quoting).
+- Issue #4 updated with the incremental batch plan: v1 auto-continuation on
+  FC-limit (history-based), v2 task persistence in `~/.shellie/tasks/`
+  (create at start / update on wrap-up / delete on done or `/reset` `/kill`;
+  on restart ask `/continue` `/discard`, never auto-resume).
 - Issue #13 open: OpenAI-compatible LLM backend support.
 
 Outstanding:
