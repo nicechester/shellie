@@ -76,7 +76,8 @@ class HandlersTestCase(unittest.TestCase):
         handlers._queue_active_item = None
         handlers._task_epoch = 0
         handlers._active_continuation = 0
-        handlers._pending_upload_notes.clear()
+        handlers._pending_uploads.clear()
+        handlers._last_media_group_id = None
         handlers._ls_index.clear()
         handlers._ls_next_id = 1
         handlers._shell_session = None
@@ -107,6 +108,8 @@ class HandlersTestCase(unittest.TestCase):
             "read_memory": mock.patch.object(handlers, "read_memory"),
             "call_gemini": mock.patch.object(handlers, "call_gemini"),
             "run_tool": mock.patch.object(handlers, "run_tool"),
+            "classify_upload": mock.patch.object(files, "classify_upload"),
+            "build_attachment_part": mock.patch.object(files, "build_attachment_part"),
         }
         self.mocks = {}
         for name, patcher in patches.items():
@@ -125,6 +128,13 @@ class HandlersTestCase(unittest.TestCase):
         self.mock_read_memory = self.mocks["read_memory"]
         self.mock_call_gemini = self.mocks["call_gemini"]
         self.mock_run_tool = self.mocks["run_tool"]
+        self.mock_classify_upload = self.mocks["classify_upload"]
+        self.mock_build_attachment_part = self.mocks["build_attachment_part"]
+        self.mock_classify_upload.return_value = ("text", "text/csv", "")
+        self.mock_build_attachment_part.return_value = (
+            {"text": "[content of report.csv]\n<<<\nhello\n>>>"},
+            "[attachment removed from history: report.csv (text/csv) — saved at /tmp/report.csv]",
+        )
 
         self._settings_values = {
             "ALLOWED_USER_ID": 111,
@@ -143,7 +153,8 @@ class HandlersTestCase(unittest.TestCase):
         handlers._queue_active_item = None
         handlers._task_epoch = 0
         handlers._active_continuation = 0
-        handlers._pending_upload_notes.clear()
+        handlers._pending_uploads.clear()
+        handlers._last_media_group_id = None
         handlers._ls_index.clear()
         handlers._ls_next_id = 1
         handlers._shell_session = None
@@ -363,6 +374,63 @@ class SettingsCommandTests(HandlersTestCase):
         self.assertIn("••••", reply)
         self.mock_call_gemini.assert_not_called()
         self.assertEqual(handlers._history, [])
+
+    def test_env_no_arg_matches_settings_listing(self) -> None:
+        handlers.process_update(self._update("/settings"))
+        settings_reply = self.mock_send_message.call_args[0][1]
+
+        handlers.process_update(self._update("/env"))
+        env_reply = self.mock_send_message.call_args[0][1]
+
+        self.assertEqual(settings_reply, env_reply)
+        self.mock_call_gemini.assert_not_called()
+        self.assertEqual(handlers._history, [])
+
+    def test_env_with_key_matches_get(self) -> None:
+        self.mock_settings.rows.return_value = self._base_rows() + [
+            _row("GEMINI_MODEL_CHAIN", value="flash,pro,lite")
+        ]
+
+        handlers.process_update(self._update("/get GEMINI_MODEL_CHAIN"))
+        get_reply = self.mock_send_message.call_args[0][1]
+
+        handlers.process_update(self._update("/env GEMINI_MODEL_CHAIN"))
+        env_reply = self.mock_send_message.call_args[0][1]
+
+        self.assertEqual(get_reply, env_reply)
+        self.assertIn("GEMINI_MODEL_CHAIN", env_reply)
+        self.mock_call_gemini.assert_not_called()
+
+    def test_env_with_extra_args_matches_get(self) -> None:
+        handlers.process_update(self._update("/get SHELL_TIMEOUT_SEC extra"))
+        get_reply = self.mock_send_message.call_args[0][1]
+
+        handlers.process_update(self._update("/env SHELL_TIMEOUT_SEC extra"))
+        env_reply = self.mock_send_message.call_args[0][1]
+
+        self.assertEqual(get_reply, env_reply)
+
+    def test_env_excluded_from_llm_queue(self) -> None:
+        handlers.process_update(self._update("/env"))
+        self.mock_call_gemini.assert_not_called()
+        self.assertEqual(handlers._task_queue.qsize(), 0)
+        self.assertEqual(handlers._history, [])
+
+    def test_env_at_bot_suffix_works(self) -> None:
+        handlers.process_update(self._update("/env@MyBot"))
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertTrue(reply.startswith("<pre>"))
+        self.assertEqual(handlers._task_queue.qsize(), 0)
+
+    def test_env_never_calls_update_or_unset(self) -> None:
+        handlers.process_update(self._update("/env SHELL_TIMEOUT_SEC"))
+        self.mock_settings.update.assert_not_called()
+        self.mock_settings.unset.assert_not_called()
+
+    def test_help_mentions_env_alias(self) -> None:
+        handlers.process_update(self._update("/help"))
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("/env", reply)
 
 
 class FunctionCallLoopTests(HandlersTestCase):
@@ -1139,7 +1207,9 @@ class FileUploadTests(HandlersTestCase):
         reply = self.mock_send_message.call_args[0][1]
         self.assertIn("Saved", reply)
         self.assertIn(saved_path, reply)
+        self.assertIn("What would you like me to do", reply)
         self.assertEqual(handlers._task_queue.qsize(), 0)
+        self.assertEqual(len(handlers._pending_uploads), 1)
 
         with mock.patch.object(files, "extract_attachment", return_value=None):
             handlers.process_update(self._update("next message"))
@@ -1148,6 +1218,21 @@ class FileUploadTests(HandlersTestCase):
         item = list(handlers._task_queue.queue)[0]
         self.assertTrue(item.text.startswith("[system] note-A"))
         self.assertIn("next message", item.text)
+        self.assertEqual(len(item.attachments), 1)
+        self.assertEqual(item.attachments[0]["path"], saved_path)
+        self.assertEqual(handlers._pending_uploads, [])
+
+    def test_no_caption_upload_note_says_attached(self) -> None:
+        saved_path = self._real_saved_path()
+        with mock.patch.object(files, "extract_attachment", return_value=self._att()), \
+                mock.patch.object(files, "save_incoming", return_value=(saved_path, None)):
+            handlers.process_update(self._file_update())
+
+        with mock.patch.object(files, "extract_attachment", return_value=None):
+            handlers.process_update(self._update("next message"))
+
+        item = list(handlers._task_queue.queue)[0]
+        self.assertIn("attached", item.text)
 
     def test_document_with_caption_queues_note_plus_caption(self) -> None:
         saved_path = self._real_saved_path()
@@ -1160,6 +1245,9 @@ class FileUploadTests(HandlersTestCase):
         item = list(handlers._task_queue.queue)[0]
         self.assertIn("[system] note-B", item.text)
         self.assertIn("please summarize this", item.text)
+        self.assertEqual(len(item.attachments), 1)
+        self.assertEqual(item.attachments[0]["path"], saved_path)
+        self.assertEqual(handlers._pending_uploads, [])
 
     def test_upload_failure_sends_warning_and_no_note(self) -> None:
         with mock.patch.object(files, "extract_attachment", return_value=self._att()), \
@@ -1169,13 +1257,176 @@ class FileUploadTests(HandlersTestCase):
         reply = self.mock_send_message.call_args[0][1]
         self.assertIn("Upload failed", reply)
         self.assertIn("boom", reply)
-        self.assertEqual(handlers._pending_upload_notes, [])
+        self.assertEqual(handlers._pending_uploads, [])
         self.assertEqual(handlers._task_queue.qsize(), 0)
 
-    def test_reset_clears_pending_upload_notes(self) -> None:
-        handlers._pending_upload_notes.append("[system] leftover")
+    def test_reset_clears_pending_uploads(self) -> None:
+        handlers._pending_uploads.append(
+            {"path": "/tmp/x", "att": self._att(), "size": 5, "mode": "text", "mime": "text/csv", "reason": ""}
+        )
         handlers.process_update(self._update("/reset"))
-        self.assertEqual(handlers._pending_upload_notes, [])
+        self.assertEqual(handlers._pending_uploads, [])
+
+    def test_album_second_upload_same_group_suppresses_question(self) -> None:
+        saved_path1 = self._real_saved_path(b"one")
+        with mock.patch.object(files, "extract_attachment", return_value=self._att()), \
+                mock.patch.object(files, "save_incoming", return_value=(saved_path1, None)):
+            update1 = self._file_update()
+            update1["message"]["media_group_id"] = "grp1"
+            handlers.process_update(update1)
+        reply1 = self.mock_send_message.call_args[0][1]
+        self.assertIn("What would you like me to do", reply1)
+
+        self.mock_send_message.reset_mock()
+        saved_path2 = os.path.join(self._upload_dir, "report2.csv")
+        with open(saved_path2, "wb") as f:
+            f.write(b"two")
+        with mock.patch.object(files, "extract_attachment", return_value=self._att()), \
+                mock.patch.object(files, "save_incoming", return_value=(saved_path2, None)):
+            update2 = self._file_update()
+            update2["message"]["media_group_id"] = "grp1"
+            handlers.process_update(update2)
+        reply2 = self.mock_send_message.call_args[0][1]
+        self.assertNotIn("What would you like me to do", reply2)
+        self.assertEqual(len(handlers._pending_uploads), 2)
+
+    def test_selection_keeps_newest_within_cap_marks_older_as_limited(self) -> None:
+        self.mock_classify_upload.return_value = ("media", "image/jpeg", "")
+        content = b"x" * (3 * 1024 * 1024)
+        path_a = os.path.join(self._upload_dir, "a.jpg")
+        path_b = os.path.join(self._upload_dir, "b.jpg")
+        with open(path_a, "wb") as f:
+            f.write(content)
+        with open(path_b, "wb") as f:
+            f.write(content)
+
+        with mock.patch.object(files, "extract_attachment", return_value=self._att()), \
+                mock.patch.object(files, "save_incoming", return_value=(path_a, None)):
+            handlers.process_update(self._file_update())
+        with mock.patch.object(files, "extract_attachment", return_value=self._att()), \
+                mock.patch.object(files, "save_incoming", return_value=(path_b, None)):
+            handlers.process_update(self._file_update())
+
+        with mock.patch.object(files, "extract_attachment", return_value=None):
+            handlers.process_update(self._update("go"))
+
+        item = list(handlers._task_queue.queue)[0]
+        self.assertEqual(len(item.attachments), 1)
+        self.assertEqual(item.attachments[0]["path"], path_b)
+        self.assertIn("limit", item.text)
+
+    def test_none_mode_note_cannot_be_attached_no_ref(self) -> None:
+        self.mock_classify_upload.return_value = ("none", "application/zip", "type")
+        saved_path = self._real_saved_path()
+        with mock.patch.object(files, "extract_attachment", return_value=self._att()), \
+                mock.patch.object(files, "save_incoming", return_value=(saved_path, None)):
+            handlers.process_update(self._file_update())
+
+        with mock.patch.object(files, "extract_attachment", return_value=None):
+            handlers.process_update(self._update("go"))
+
+        item = list(handlers._task_queue.queue)[0]
+        self.assertEqual(item.attachments, [])
+        self.assertIn("cannot be attached", item.text)
+
+    def test_too_large_note_mentions_path_only(self) -> None:
+        self.mock_classify_upload.return_value = ("none", "application/pdf", "size")
+        saved_path = self._real_saved_path()
+        with mock.patch.object(files, "extract_attachment", return_value=self._att()), \
+                mock.patch.object(files, "save_incoming", return_value=(saved_path, None)):
+            handlers.process_update(self._file_update())
+
+        with mock.patch.object(files, "extract_attachment", return_value=None):
+            handlers.process_update(self._update("go"))
+
+        item = list(handlers._task_queue.queue)[0]
+        self.assertEqual(item.attachments, [])
+        self.assertIn("too large", item.text)
+
+
+class HandleLlmAttachmentTests(HandlersTestCase):
+    """_handle_llm attachment wiring (issue #6): media-first parts, in-place
+    history stripping to a placeholder, and no-save-on-error."""
+
+    def _ref(self):
+        return {"path": "/ws/photo.jpg", "name": "photo.jpg", "mime": "image/jpeg", "mode": "media", "size": 123}
+
+    def test_attachment_part_sent_first_then_stripped_from_history(self) -> None:
+        ref = self._ref()
+        part = {"inlineData": {"mimeType": "image/jpeg", "data": "QUJD"}}
+        placeholder = "[attachment removed from history: photo.jpg (image/jpeg) — saved at /ws/photo.jpg]"
+        self.mock_build_attachment_part.return_value = (part, placeholder)
+        self.mock_call_gemini.return_value = (_text_response("ok"), "m1")
+
+        outcome, _ = handlers._handle_llm(1, "hi", attachments=[ref])
+
+        self.assertEqual(outcome, "done")
+        first_call_contents = self.mock_call_gemini.call_args_list[0][0][0]
+        user_turn = first_call_contents[-1]
+        self.assertEqual(user_turn["parts"], [part, {"text": "hi"}])
+
+        self.assertEqual(len(handlers._history), 2)
+        saved_user_turn = handlers._history[0]
+        self.assertFalse(any("inlineData" in p for p in saved_user_turn["parts"]))
+        parts_texts = [p.get("text") for p in saved_user_turn["parts"]]
+        self.assertIn(placeholder, parts_texts)
+        self.assertIn("hi", parts_texts)
+
+    def test_no_attachments_behaves_as_before(self) -> None:
+        self.mock_call_gemini.return_value = (_text_response("ok"), "m1")
+
+        outcome, _ = handlers._handle_llm(1, "hi")
+
+        self.assertEqual(outcome, "done")
+        self.mock_build_attachment_part.assert_not_called()
+        first_call_contents = self.mock_call_gemini.call_args_list[0][0][0]
+        self.assertEqual(first_call_contents[-1]["parts"], [{"text": "hi"}])
+
+    def test_call_gemini_failure_saves_nothing_to_history(self) -> None:
+        ref = self._ref()
+        part = {"inlineData": {"mimeType": "image/jpeg", "data": "QUJD"}}
+        placeholder = "[attachment removed from history: photo.jpg (image/jpeg) — saved at /ws/photo.jpg]"
+        self.mock_build_attachment_part.return_value = (part, placeholder)
+        self.mock_call_gemini.side_effect = Exception("boom")
+
+        outcome, _ = handlers._handle_llm(1, "hi", attachments=[ref])
+
+        self.assertEqual(outcome, "error")
+        self.assertEqual(handlers._history, [])
+
+
+class TaskAttachmentPersistenceTests(HandlersTestCase):
+    """Task-file prompts must never carry attachment content (issue #6)."""
+
+    def test_task_prompt_never_contains_attachment_content(self) -> None:
+        fake_b64 = "QkFTRTY0ZmFrZWRhdGE="
+        ref = {"path": "/ws/photo.jpg", "name": "photo.jpg", "mime": "image/jpeg", "mode": "media", "size": 123}
+        self.mock_build_attachment_part.return_value = (
+            {"inlineData": {"mimeType": "image/jpeg", "data": fake_b64}},
+            "[attachment removed from history: photo.jpg (image/jpeg) — saved at /ws/photo.jpg]",
+        )
+        self._settings_values["FC_MAX_LOOPS"] = 1
+        fc_pending = _fc_response([("execute_shell", {"command": "ls"})])
+        self.mock_call_gemini.side_effect = [
+            (fc_pending, "m1"), (fc_pending, "m1"), (_text_response(""), "m1"),
+        ]
+        self.mock_run_tool.return_value = "out"
+
+        saved_records = []
+        original_save = tasks.save_task
+
+        def _capture(record):
+            saved_records.append(dict(record))
+            return original_save(record)
+
+        with mock.patch.object(tasks, "save_task", side_effect=_capture):
+            item = handlers._QueueItem(1, "describe the photo", user_id=111, attachments=[ref])
+            handlers._task_queue.put(item)
+            self._drain_queue_full()
+
+        self.assertTrue(saved_records)
+        for record in saved_records:
+            self.assertNotIn(fake_b64, record.get("prompt", ""))
 
 
 class FileSendCommandTests(HandlersTestCase):
@@ -1785,7 +2036,8 @@ class ShellModeTests(HandlersTestCase):
         with open(saved_path, "wb") as f:
             f.write(b"hello")
 
-        with mock.patch.object(files, "extract_attachment", return_value={"kind": "document", "file_id": "f1"}), \
+        with mock.patch.object(files, "extract_attachment",
+                               return_value={"kind": "document", "file_id": "f1", "file_name": "report.csv"}), \
                 mock.patch.object(files, "save_incoming", return_value=(saved_path, None)), \
                 mock.patch.object(files, "upload_note", return_value="[system] note"):
             handlers.process_update(self._file_update(caption="please summarize"))
@@ -1795,6 +2047,18 @@ class ShellModeTests(HandlersTestCase):
         self.assertIn("caption ignored", reply)
         self.assertEqual(handlers._task_queue.qsize(), 0)
         self.assertIsNotNone(handlers._shell_session)
+        self.assertEqual(len(handlers._pending_uploads), 1)
+
+        handlers._exit_shell_mode(notify=False)
+        with mock.patch.object(files, "extract_attachment", return_value=None):
+            handlers.process_update(self._update("now do it"))
+
+        self.assertEqual(handlers._task_queue.qsize(), 1)
+        item = list(handlers._task_queue.queue)[0]
+        self.assertIn("[system] note", item.text)
+        self.assertIn("now do it", item.text)
+        self.assertEqual(len(item.attachments), 1)
+        self.assertEqual(item.attachments[0]["path"], saved_path)
 
     def test_double_bang_prefix_outside_shell_mode_runs_bang_command(self) -> None:
         self.mock_execute_shell.return_value = "ok"

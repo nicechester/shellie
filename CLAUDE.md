@@ -81,6 +81,9 @@ bypass, 24/7 via launchd/systemd.
   claiming, `save_incoming` to SHELLIE_WORKSPACE root with 0600 + collision
   suffixes, `resolve_send_path` with .env/settings.json blocked, `send_file`,
   `resolve_dir` / `list_dir` (hidden files skipped, dirs-first casefold sort, `LS_MAX_ENTRIES=100`);
+  `resolve_mime` / `classify_upload` (media|text|none + reason, NUL sniff first 8KB) /
+  `build_attachment_part` (worker-side base64 → camelCase inlineData, unavailable fallback, history placeholder);
+  caps `INLINE_MEDIA_MAX_BYTES=5MB` total, `MAX_INLINE_ATTACHMENTS=5`, `INLINE_TEXT_MAX_BYTES=100KB`;
   Telegram limits 20 MB download / 50 MB upload.
 - `telegram/client.py` — call-time token URLs, long-poll get_updates (allowed_updates
   now `["message", "callback_query"]`, failures return `{"_status", "_error"}` for backoff),
@@ -95,8 +98,8 @@ bypass, 24/7 via launchd/systemd.
   `_shell_session` main-thread only; terminal message edited in place, `_TERM_MAX=3800`
   top-trim + single-entry tail hard-trim; session tracks `cwd` (shown in terminal header),
   `cd` persists within session; user command messages deleted best-effort;
-  captions ignored while active) → settings commands (`/settings /get /set /unset`, excluded from
-  history) → bypass (`!`, `/sh`, `/mem`, `/reset` = context + queue drain,
+  captions ignored while active) → settings commands (`/settings /get /set /unset` + read-only alias `/env` [= `/settings`,
+  `/env KEY` = `/get KEY`], excluded from history) → bypass (`!`, `/sh`, `/mem`, `/reset` = context + queue drain,
   `/restart` = process exit, `/queue` = queue status + live Gemini retry/cooldown (remaining seconds, attempt), `/kill` = drain queue
   without history reset, `/systemlog [N]` = tail agent.log last N lines (default
   50, max 500); service-manager detection warns if none; `/file <path>` = send
@@ -105,8 +108,10 @@ bypass, 24/7 via launchd/systemd.
   `f:<id>` answer callback then send via send_file; callback auth on from.id fail-closed
   SILENT; index map ≤1000 ids referenced from callback_data, ids only increment, cleared
   by `/reset`), `/continue` / `/discard` = resume/drop unfinished task from task
-  file; uploads saved to SHELLIE_WORKSPACE + upload-note queue (max 5) prefixes
-  next LLM message) → LLM track (FC loop:
+  file; `_pending_uploads` (lazy base64 on worker, refs only, max 5, /reset clears,
+  media_group_id dedupes no-caption), _QueueItem carries refs, user turn = media parts +
+  text, history stripped in place in _handle_llm's finally, task files never contain base64,
+  saved to SHELLIE_WORKSPACE) → LLM track (FC loop:
   all functionCalls answered in one user-role turn, FC_MAX_LOOPS cap (1–50, default 15) + repeat-loop detection (3 identical call+result iterations) → tools-disabled wrap-up call (toolConfig NONE), turn preserved in history;
   on reaching FC_MAX_LOOPS, auto-continuation up to FC_MAX_CONTINUATIONS times,
   epoch-guarded, task state persisted; CONTEXT_TURNS pairs + IDLE_RESET_MINUTES idle reset). Task queue: LLM messages
@@ -181,6 +186,7 @@ Phases 0–9 all implemented; issue #4 v1+v2 (auto-continuation + task persisten
   `/browse` inline-keyboard UI (callback_query handling added to allowed_updates,
   `answer_callback_query` + `edit_message_text` support).
 - Issue #18 implemented: `!!` shell mode with in-place terminal message (s:exit inline button, /reset clears, not persisted).
+- Issue #6 implemented — multimodal uploads to Gemini (inlineData media + inline text files, 5MB/5-attachment/100KB caps, no-caption follow-up question, history stripping).
 - Issue #13 open: OpenAI-compatible LLM backend support.
 
 Outstanding:

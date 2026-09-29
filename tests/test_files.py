@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 import os
 import re
@@ -422,6 +423,135 @@ class SendFileTests(FilesTestBase):
 
         self.assertFalse(ok)
         self.assertNotIn(fake_token, msg)
+
+
+class ResolveMimeTests(unittest.TestCase):
+    def test_photo_without_mime_defaults_to_jpeg(self) -> None:
+        att = {"kind": "photo", "file_name": "x.jpg"}
+        self.assertEqual(files.resolve_mime(att), "image/jpeg")
+
+    def test_voice_without_mime_defaults_to_ogg(self) -> None:
+        att = {"kind": "voice", "file_name": "x.ogg"}
+        self.assertEqual(files.resolve_mime(att), "audio/ogg")
+
+    def test_mime_with_charset_param_is_stripped(self) -> None:
+        att = {"mime_type": "text/plain; charset=utf-8"}
+        self.assertEqual(files.resolve_mime(att), "text/plain")
+
+    def test_document_no_mime_with_heic_extension(self) -> None:
+        att = {"kind": "document", "file_name": "photo.HEIC"}
+        self.assertEqual(files.resolve_mime(att), "image/heic")
+
+    def test_x_wav_alias_normalized(self) -> None:
+        att = {"mime_type": "audio/x-wav"}
+        self.assertEqual(files.resolve_mime(att), "audio/wav")
+
+    def test_octet_stream_with_pdf_extension_falls_back_to_guess(self) -> None:
+        att = {"kind": "document", "mime_type": "application/octet-stream", "file_name": "report.pdf"}
+        self.assertEqual(files.resolve_mime(att), "application/pdf")
+
+
+class ClassifyUploadTests(FilesTestBase):
+    def test_1mb_pdf_is_media(self) -> None:
+        path = self._write("doc.pdf", b"x" * (1024 * 1024))
+        att = {"mime_type": "application/pdf", "file_name": "doc.pdf"}
+        mode, mime, reason = files.classify_upload(att, path, os.path.getsize(path))
+        self.assertEqual(mode, "media")
+        self.assertEqual(mime, "application/pdf")
+        self.assertEqual(reason, "")
+
+    def test_6mb_pdf_is_none_size(self) -> None:
+        path = self._write("big.pdf", b"x" * (6 * 1024 * 1024))
+        att = {"mime_type": "application/pdf", "file_name": "big.pdf"}
+        mode, mime, reason = files.classify_upload(att, path, os.path.getsize(path))
+        self.assertEqual(mode, "none")
+        self.assertEqual(reason, "size")
+
+    def test_small_py_file_is_text(self) -> None:
+        path = self._write("script.py", b"print('hi')\n")
+        att = {"mime_type": "text/x-python", "file_name": "script.py"}
+        mode, mime, reason = files.classify_upload(att, path, os.path.getsize(path))
+        self.assertEqual(mode, "text")
+        self.assertEqual(reason, "")
+
+    def test_200kb_py_file_is_none_size(self) -> None:
+        path = self._write("script.py", b"x" * (200 * 1024))
+        att = {"mime_type": "text/x-python", "file_name": "script.py"}
+        mode, mime, reason = files.classify_upload(att, path, os.path.getsize(path))
+        self.assertEqual(mode, "none")
+        self.assertEqual(reason, "size")
+
+    def test_txt_with_nul_byte_is_none(self) -> None:
+        path = self._write("data.txt", b"abc\x00def")
+        att = {"mime_type": "text/plain", "file_name": "data.txt"}
+        mode, mime, reason = files.classify_upload(att, path, os.path.getsize(path))
+        self.assertEqual(mode, "none")
+
+    def test_zip_is_none_type(self) -> None:
+        path = self._write("archive.zip", b"PK\x03\x04")
+        att = {"mime_type": "application/zip", "file_name": "archive.zip"}
+        mode, mime, reason = files.classify_upload(att, path, os.path.getsize(path))
+        self.assertEqual(mode, "none")
+        self.assertEqual(reason, "type")
+
+    def test_zero_byte_file_is_none(self) -> None:
+        path = self._write("empty.pdf", b"")
+        att = {"mime_type": "application/pdf", "file_name": "empty.pdf"}
+        mode, mime, reason = files.classify_upload(att, path, 0)
+        self.assertEqual(mode, "none")
+
+    def test_never_raises_on_missing_file(self) -> None:
+        att = {"mime_type": "application/pdf", "file_name": "gone.pdf"}
+        mode, mime, reason = files.classify_upload(att, "/no/such/path", 10)
+        self.assertEqual(mode, "media")  # classify only checks size, not existence
+
+
+class BuildAttachmentPartTests(FilesTestBase):
+    def test_media_part_keys_and_base64_roundtrip(self) -> None:
+        raw = b"\xff\xd8\xff\xe0fake-jpeg-bytes"
+        path = self._write("photo.jpg", raw)
+        ref = {"path": path, "name": "photo.jpg", "mime": "image/jpeg", "mode": "media", "size": len(raw)}
+
+        part, placeholder = files.build_attachment_part(ref)
+
+        self.assertEqual(set(part.keys()), {"inlineData"})
+        self.assertEqual(set(part["inlineData"].keys()), {"mimeType", "data"})
+        self.assertEqual(part["inlineData"]["mimeType"], "image/jpeg")
+        decoded = base64.b64decode(part["inlineData"]["data"])
+        self.assertEqual(decoded, raw)
+        self.assertIn("photo.jpg", placeholder)
+        self.assertIn(path, placeholder)
+
+    def test_text_part_wraps_content_and_replaces_invalid_utf8(self) -> None:
+        raw = b"hello \xff world"
+        path = self._write("note.txt", raw)
+        ref = {"path": path, "name": "note.txt", "mime": "text/plain", "mode": "text", "size": len(raw)}
+
+        part, placeholder = files.build_attachment_part(ref)
+
+        self.assertIn("text", part)
+        self.assertIn("[content of note.txt]", part["text"])
+        self.assertIn("hello � world", part["text"])
+        self.assertIn("note.txt", placeholder)
+
+    def test_missing_file_returns_unavailable_text_no_raise(self) -> None:
+        ref = {"path": os.path.join(self.workspace_dir, "gone.jpg"), "name": "gone.jpg",
+               "mime": "image/jpeg", "mode": "media", "size": 10}
+
+        part, placeholder = files.build_attachment_part(ref)
+
+        self.assertIn("text", part)
+        self.assertIn("unavailable", part["text"])
+        self.assertIn("gone.jpg", placeholder)
+
+    def test_file_grown_past_cap_returns_unavailable_text_no_raise(self) -> None:
+        path = self._write("photo.jpg", b"x" * (files.INLINE_MEDIA_MAX_BYTES + 1))
+        ref = {"path": path, "name": "photo.jpg", "mime": "image/jpeg", "mode": "media", "size": 10}
+
+        part, placeholder = files.build_attachment_part(ref)
+
+        self.assertIn("text", part)
+        self.assertIn("unavailable", part["text"])
 
 
 class HttpDownloadTests(unittest.TestCase):

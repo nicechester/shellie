@@ -197,13 +197,32 @@ service for you (macOS → launchd, Linux → systemd user unit), and `chmod
 | `/mem` | Bypass | Prints long-term memory: core `MEMORY.md` plus today's dated file (`memory/YYYY-MM-DD.md`) |
 | `/reset` | Bypass | Clears the in-process conversation history (context only, not `MEMORY.md`) |
 | `/restart` | Bypass | Exits the process; the service manager (launchd/systemd) restarts it. Warns if no service manager is detected. Now mainly useful for picking up **code** changes — setting changes already hot-apply |
-| `/settings`, `/get` | Bypass (settings) | Lists all 20 keys with current value (masked if secret), source, and apply timing |
-| `/get KEY` | Bypass (settings) | Detail view for one key: value, source, default, constraint, apply timing |
+| `/settings`, `/get`, `/env` | Bypass (settings) | Lists all 20 keys with current value (masked if secret), source, and apply timing |
+| `/get KEY`, `/env KEY` | Bypass (settings) | Detail view for one key: value, source, default, constraint, apply timing |
 | `/set KEY VALUE` | Bypass (settings) | Applies an override immediately (rejected for web-only keys) |
 | `/unset KEY` | Bypass (settings) | Removes an override, falling back to the env/default layer |
 | `/continue` | Bypass (task) | Resume the unfinished task (stopped, errored, or left over from a restart) |
 | `/discard` | Bypass (task) | Drop the unfinished task without resuming |
+| `/file <path>` | Bypass | Send a file from SHELLIE_WORKSPACE to the user |
+| `/browse [path]` | Bypass | List files in a directory with an inline-keyboard menu |
 | anything else | LLM (Gemini) | Sent with tools `execute_shell` and `append_memory`; function-calling loop up to `FC_MAX_LOOPS` iterations (or on repeat-loop detection), with final wrap-up call if limit reached, with up to `CONTEXT_TURNS` recent turns of history |
+
+### Attachments (multimodal uploads)
+
+When you send files via Telegram, Shellie includes them in your next Gemini message:
+
+**Supported types:**
+- **Images, PDFs, audio, and video** → sent to Gemini as base64 `inlineData` parts (Gemini processes them directly).
+- **Text and code files** → content is inlined as plain text in your message.
+
+**Limits:**
+- **5 MB total per message** (all attachments combined).
+- **Up to 5 attachments** per message.
+- **100 KB per text file** (larger text files are saved with a path note only, not inlined).
+
+**No caption?** If you send a file without a message, Shellie replies with "What would you like me to do with it? I'll include it with your next message." — no LLM call. This reply is skipped for subsequent items in an album (media_group_id deduplication).
+
+**History cleanup:** After each turn, attachment content is removed from conversation history and replaced with "[attachment removed from history: …]" placeholders to keep request sizes bounded. Re-send the file to ask about it again later.
 
 ## 7. Settings
 
