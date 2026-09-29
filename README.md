@@ -192,6 +192,8 @@ service for you (macOS → launchd, Linux → systemd user unit), and `chmod
 |---|---|---|
 | `!<cmd>` | Bypass (shell) | Runs `<cmd>` in the resolved shell (see `SHELL_PATH` in [§7](#7-settings)), no LLM call |
 | `/sh <cmd>` | Bypass (shell) | Same as `!<cmd>`, explicit form |
+| `!!` / `/shell` | Bypass (shell mode) | Toggles shell mode: every following message runs as a shell command in one terminal message edited in place, with no LLM calls. `cd` persists within the session (shown in the terminal header); variables/exports do not. Requires a POSIX shell (sh/bash/zsh/dash/ksh); with other shells commands run in the last directory without tracking `cd`. Your command messages are deleted to keep the terminal visible. `/reset` also leaves shell mode. Not persisted across restarts. |
+| `exit` *(in shell mode)* | Bypass (shell mode) | Leaves shell mode. Only special while shell mode is active; otherwise it goes to the LLM like any text. |
 | `/mem` | Bypass | Prints long-term memory: core `MEMORY.md` plus today's dated file (`memory/YYYY-MM-DD.md`) |
 | `/reset` | Bypass | Clears the in-process conversation history (context only, not `MEMORY.md`) |
 | `/restart` | Bypass | Exits the process; the service manager (launchd/systemd) restarts it. Warns if no service manager is detected. Now mainly useful for picking up **code** changes — setting changes already hot-apply |

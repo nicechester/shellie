@@ -12,11 +12,11 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from src.agent.config import settings
+from src.agent.config import settings, SHELLIE_WORKSPACE
 from src.agent.core import tasks
 from src.agent.core.gemini import call_gemini, get_retry_status, parse_response, run_tool
 from src.agent.core.memory import read_memory
-from src.agent.core.shell import execute_shell
+from src.agent.core.shell import execute_shell, execute_shell_in
 from src.agent.telegram import files as tg_files
 from src.agent.telegram.client import (
     answer_callback_query,
@@ -61,15 +61,44 @@ _BROWSE_MAX_ENTRIES = 98
 _BROWSE_LABEL_MAX = 40
 _CALLBACK_RE = re.compile(r"^([df]):(\d{1,9})$")
 
+
+# Shell mode (issue #18): a single in-place "terminal" message where every
+# subsequent chat message runs as a shell command. Same single-instance,
+# unlocked global model as _ls_index above — only ever touched by the main
+# (polling) thread (process_update and its helpers, including callback_query
+# updates), never by the queue worker thread. Tied to exactly one chat_id;
+# messages from other chats flow through the normal (non-shell) path.
+class _ShellSession:
+    __slots__ = ("chat_id", "message_id", "entries", "cwd")
+
+    def __init__(self, chat_id: int) -> None:
+        self.chat_id = chat_id
+        self.message_id: Optional[int] = None
+        self.entries: List[Tuple[str, str, str]] = []  # (prompt_cwd, cmd, output) - raw/unescaped
+        self.cwd = SHELLIE_WORKSPACE
+
+
+_shell_session: Optional[_ShellSession] = None
+
+_SHELL_EXIT_DATA = "s:exit"
+_SHELL_MARKUP: Dict[str, Any] = {
+    "inline_keyboard": [[{"text": "❌ Exit shell mode", "callback_data": _SHELL_EXIT_DATA}]]
+}
+_TERM_MAX = 3800
+_TERM_CMD_MAX = 300
+_SHELL_DELETE_INPUT = True
+
 _SETTINGS_TOKENS = ("/settings", "/get", "/set", "/unset")
 _BYPASS_TOKENS = (
     "/mem", "/restart", "/reset", "/sh", "/help", "/queue", "/kill", "/systemlog",
-    "/continue", "/discard", "/file", "/browse",
+    "/continue", "/discard", "/file", "/browse", "/shell",
 )
 
 _HELP_TEXT = (
     "<b>Bypass commands</b> (no LLM)\n"
     "<code>!&lt;cmd&gt;</code> / <code>/sh &lt;cmd&gt;</code> — run shell command\n"
+    "<code>!!</code> / <code>/shell</code> — toggle shell mode (every message runs as a shell command; "
+    "<code>!!</code> / <code>exit</code> / ❌ to leave)\n"
     "<code>/mem</code> — show long-term memory\n"
     "<code>/reset</code> — clear conversation history\n"
     "<code>/restart</code> — restart the process\n"
@@ -152,6 +181,14 @@ def process_update(update: Dict[str, Any]) -> None:
     if not isinstance(text, str) or not text:
         return
 
+    if _shell_session is not None and _shell_session.chat_id == chat_id:
+        _handle_shell_text(chat_id, message_id, text)
+        return
+    stripped = text.strip()
+    if stripped == "!!" or (_first_token_command(text) == "/shell" and len(stripped.split()) == 1):
+        _enter_shell_mode(chat_id)
+        return
+
     if _handle_settings_command(chat_id, message_id, text):
         return
     if _handle_bypass_command(chat_id, text):
@@ -183,16 +220,184 @@ def _handle_incoming_file(
     except OSError:
         size_str = "?"
 
-    send_message(chat_id, "📥 Saved: <code>{}</code> ({})".format(_esc(path), size_str))
+    caption = message.get("caption")
+    has_caption = isinstance(caption, str) and bool(caption.strip())
+    shell_active = _shell_session is not None and _shell_session.chat_id == chat_id
+
+    reply = "📥 Saved: <code>{}</code> ({})".format(_esc(path), size_str)
+    if shell_active and has_caption:
+        reply += " (caption ignored in shell mode)"
+    send_message(chat_id, reply)
 
     _pending_upload_notes.append(tg_files.upload_note(path, att))
     while len(_pending_upload_notes) > _MAX_PENDING_UPLOAD_NOTES:
         _pending_upload_notes.pop(0)
 
-    caption = message.get("caption")
-    if isinstance(caption, str) and caption.strip():
+    if has_caption and not shell_active:
         text = _consume_upload_notes(caption)
         _task_queue.put(_QueueItem(chat_id, text, user_id=user_id))
+
+
+# ---------------------------------------------------------------------------
+# Shell mode (issue #18): "!!" toggles a persistent in-place terminal message
+# where every subsequent chat message runs as a shell command.
+# ---------------------------------------------------------------------------
+
+
+def _handle_shell_text(chat_id: int, message_id: Optional[int], text: str) -> None:
+    session = _shell_session
+    if session is None:
+        return
+
+    stripped = text.strip()
+    if stripped == "!!" or stripped == "exit" or (_first_token_command(text) == "/shell" and len(stripped.split()) == 1):
+        _exit_shell_mode()
+        return
+
+    if _first_token_command(text) == "/reset":
+        _handle_bypass_command(chat_id, text)
+        return
+
+    cmd = stripped
+    if cmd.startswith("!"):
+        cmd = cmd[1:]
+    if not cmd.strip():
+        return
+
+    send_chat_action(chat_id)
+    prompt_cwd = session.cwd
+    session.entries.append((prompt_cwd, cmd, "(running…)"))
+    _shell_show(session, _SHELL_MARKUP)
+
+    out, session.cwd = execute_shell_in(cmd, session.cwd)
+    session.entries[-1] = (prompt_cwd, cmd, out)
+    _shell_show(session, _SHELL_MARKUP)
+
+    if _SHELL_DELETE_INPUT and message_id is not None:
+        delete_message(chat_id, message_id)
+
+
+def _prompt_path(cwd: str) -> str:
+    home = os.path.expanduser("~")
+    if cwd == home:
+        return "~"
+    prefix = home + os.sep
+    if cwd.startswith(prefix):
+        return "~" + cwd[len(home):]
+    return cwd
+
+
+def _render_terminal(session: "_ShellSession", exited: bool = False) -> str:
+    if exited:
+        header = "🐚 <b>Shell mode</b> — exited"
+    else:
+        header = (
+            "🐚 <b>Shell mode</b> — <code>{}</code>\n"
+            "Each message runs as a shell command; <code>cd</code> persists in this session "
+            "(variables/exports do not). Send <code>!!</code> or <code>exit</code>, or tap ❌, to leave."
+        ).format(_esc(session.cwd))
+
+    def _pre_for(entries: List[Tuple[str, str, str]]) -> str:
+        if not entries:
+            raw = "{}$ ".format(_prompt_path(session.cwd))
+        else:
+            lines = []
+            for prompt_cwd, cmd, out in entries:
+                disp_cmd = cmd if len(cmd) <= _TERM_CMD_MAX else cmd[:_TERM_CMD_MAX] + "…"
+                lines.append("{}$ {}\n{}".format(_prompt_path(prompt_cwd), disp_cmd, out))
+            raw = "\n".join(lines)
+        if exited:
+            raw += "\n[exited]"
+        return "<pre>{}</pre>".format(html.escape(raw))
+
+    # Drop oldest entries permanently until the rendered HTML fits, keeping
+    # at least one entry around for the hard-trim fallback below.
+    while len(session.entries) > 1:
+        text = header + "\n" + _pre_for(session.entries)
+        if len(text) <= _TERM_MAX:
+            return text
+        session.entries.pop(0)
+
+    text = header + "\n" + _pre_for(session.entries)
+    if len(text) <= _TERM_MAX or not session.entries:
+        return text
+
+    # A single entry is still too big: hard-trim its output, keeping the
+    # tail, instead of dropping it entirely.
+    prompt_cwd, cmd, out = session.entries[0]
+    disp_cmd = cmd if len(cmd) <= _TERM_CMD_MAX else cmd[:_TERM_CMD_MAX] + "…"
+    fixed_raw = "{}$ {}\n".format(_prompt_path(prompt_cwd), disp_cmd)
+    exited_raw = "\n[exited]" if exited else ""
+    fixed_len = (
+        len(header) + 1 + len("<pre>") + len("</pre>")
+        + len(html.escape(fixed_raw)) + len(html.escape(exited_raw))
+    )
+    budget = max(0, _TERM_MAX - fixed_len)
+
+    tail_len = min(len(out), budget)
+    while True:
+        trimmed_n = len(out) - tail_len
+        if trimmed_n <= 0:
+            candidate = out
+        else:
+            tail = out[-tail_len:] if tail_len > 0 else ""
+            note = "… ({} chars trimmed — redirect to a file and use /file)\n".format(trimmed_n)
+            candidate = note + tail
+        # Escaping can inflate the text (&/</>) even when the raw tail fits,
+        # so the budget check must always run on the escaped candidate.
+        if len(html.escape(candidate)) <= budget or tail_len <= 0:
+            tail_text = candidate
+            break
+        tail_len = int(tail_len * 0.9)
+
+    return header + "\n" + _pre_for([(prompt_cwd, cmd, tail_text)])
+
+
+def _sent_message_id(resp: Any) -> Optional[int]:
+    if isinstance(resp, dict):
+        result = resp.get("result")
+        if isinstance(result, dict):
+            mid = result.get("message_id")
+            if isinstance(mid, int):
+                return mid
+    return None
+
+
+def _shell_show(session: "_ShellSession", markup: Dict[str, Any]) -> None:
+    text = _render_terminal(session)
+    if session.message_id is not None and edit_message_text(
+        session.chat_id, session.message_id, text, reply_markup=markup
+    ):
+        return
+    resp = send_message(session.chat_id, text, reply_markup=markup)
+    session.message_id = _sent_message_id(resp)
+
+
+def _enter_shell_mode(chat_id: int) -> None:
+    global _shell_session
+    session = _ShellSession(chat_id)
+    _shell_session = session
+    _shell_show(session, _SHELL_MARKUP)
+    _LOGGER.info("shell_mode on chat_id=%s", chat_id)
+
+
+def _exit_shell_mode(notify: bool = True) -> bool:
+    global _shell_session
+    session = _shell_session
+    _shell_session = None
+    if session is None:
+        return False
+
+    text = _render_terminal(session, exited=True)
+    if session.message_id is not None:
+        edit_message_text(
+            session.chat_id, session.message_id, text, reply_markup={"inline_keyboard": []}
+        )
+
+    if notify:
+        send_message(session.chat_id, "🐚 Shell mode off — messages go to the LLM again.")
+    _LOGGER.info("shell_mode off")
+    return True
 
 
 def _first_token_command(text: str) -> str:
@@ -455,7 +660,16 @@ def _handle_callback(cq: Dict[str, Any]) -> None:
         return
     chat_id = chat["id"]
 
-    m = _CALLBACK_RE.match(str(cq.get("data") or ""))
+    data = str(cq.get("data") or "")
+    if data == _SHELL_EXIT_DATA:
+        if _shell_session is not None and _shell_session.chat_id == chat_id:
+            _exit_shell_mode()
+            answer_callback_query(cq_id, "Shell mode off")
+        else:
+            answer_callback_query(cq_id, "Shell mode is not active.")
+        return
+
+    m = _CALLBACK_RE.match(data)
     if not m:
         answer_callback_query(cq_id, "Unknown action")
         return
@@ -607,6 +821,8 @@ def _handle_bypass_command(chat_id: int, text: str) -> bool:
             msg += " (대기 항목 {}개 삭제됨)".format(drained)
         if _abandon_task("reset") is not None:
             msg += " Unfinished task discarded."
+        if _exit_shell_mode(notify=False):
+            msg += " Shell mode off."
         send_message(chat_id, msg)
         return True
 
@@ -684,6 +900,10 @@ def _handle_bypass_command(chat_id: int, text: str) -> bool:
         ok, msg = tg_files.send_file(chat_id, parts[1])
         if not ok:
             send_message(chat_id, "⚠️ " + _esc(msg))
+        return True
+
+    if cmd == "/shell":
+        _enter_shell_mode(chat_id)
         return True
 
     if cmd == "/browse":
