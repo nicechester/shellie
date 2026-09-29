@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import mimetypes
 import os
 import tempfile
 from datetime import datetime
@@ -16,6 +18,65 @@ TG_UPLOAD_MAX_BYTES = 50 * 1024 * 1024
 CAPTION_MAX = 1024
 _MAX_NAME_BYTES = 200
 LS_MAX_ENTRIES = 100
+
+# Multimodal inline attachments (issue #6): uploaded media/documents become
+# part of the next Gemini turn instead of just a saved-path note.
+# INLINE_MEDIA_MAX_BYTES is both the per-file media cap AND the total
+# media+text budget for one turn's attachments.
+INLINE_MEDIA_MAX_BYTES = 5 * 1024 * 1024
+MAX_INLINE_ATTACHMENTS = 5
+INLINE_TEXT_MAX_BYTES = 100 * 1024
+
+SUPPORTED_MEDIA_MIMES = {
+    "image/jpeg", "image/png", "image/webp", "image/heic", "image/heif",
+    "application/pdf",
+    "audio/ogg", "audio/mpeg", "audio/mp3", "audio/wav", "audio/aac", "audio/flac", "audio/aiff",
+    "video/mp4", "video/mpeg", "video/quicktime", "video/webm", "video/3gpp", "video/x-flv",
+    "video/mpg", "video/wmv",
+}
+
+# Normalize a few common mime spellings Telegram/clients send that do not
+# exactly match the canonical names above.
+_MIME_ALIASES = {
+    "audio/x-wav": "audio/wav",
+    "audio/wave": "audio/wav",
+    "audio/opus": "audio/ogg",
+    "image/jpg": "image/jpeg",
+}
+
+# Extensions the stdlib mimetypes module often misses or gets wrong.
+_EXT_MIME = {
+    ".heic": "image/heic",
+    ".heif": "image/heif",
+    ".webp": "image/webp",
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".flac": "audio/flac",
+    ".webm": "video/webm",
+}
+
+# Telegram message field -> default mime when the client sends none.
+_KIND_MIME = {
+    "photo": "image/jpeg",
+    "voice": "audio/ogg",
+    "video": "video/mp4",
+    "audio": "audio/mpeg",
+}
+
+# Mime types (besides "text/*") treated as inlineable text.
+_TEXT_MIME_EXACT = {
+    "application/json", "application/xml", "application/x-yaml", "application/yaml",
+    "application/javascript", "application/x-sh", "application/toml", "application/sql",
+}
+
+# Extensions treated as inlineable text regardless of the reported mime type.
+_TEXT_EXTENSIONS = {
+    ".txt", ".md", ".csv", ".tsv", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg",
+    ".conf", ".log", ".py", ".js", ".ts", ".tsx", ".jsx", ".sh", ".zsh", ".bash",
+    ".java", ".kt", ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".cs", ".rb", ".php",
+    ".sql", ".html", ".css", ".xml", ".swift", ".gradle", ".properties",
+}
 
 
 def _default_name(kind: str) -> str:
@@ -303,14 +364,140 @@ def send_file(chat_id: int, raw_path: str, caption: Optional[str] = None) -> Tup
     return True, "Sent {} ({})".format(filename, format_size(size))
 
 
-def upload_note(path: str, att: Dict[str, Any]) -> str:
+def upload_note(path: str, att: Dict[str, Any], status: str = "") -> str:
     try:
         size = os.path.getsize(path)
     except OSError:
         size = att.get("file_size")
     size_str = format_size(size) if isinstance(size, int) else "unknown size"
     mime_or_kind = att.get("mime_type") or att.get("kind")
-    return (
+    note = (
         "[system] The user uploaded a file via Telegram. It was saved at: {} "
         "(original name: {}, type: {}, size: {})."
     ).format(path, att.get("file_name"), mime_or_kind, size_str)
+    if status:
+        note += " " + status
+    return note
+
+
+# ---------------------------------------------------------------------------
+# Multimodal inline attachments (issue #6).
+# ---------------------------------------------------------------------------
+
+
+def _looks_like_text_mime(mime: str) -> bool:
+    return mime.startswith("text/") or mime in _TEXT_MIME_EXACT
+
+
+def _has_text_extension(file_name: str) -> bool:
+    return os.path.splitext(file_name)[1].lower() in _TEXT_EXTENSIONS
+
+
+def _no_nul_bytes(path: str, max_bytes: int = 8192) -> bool:
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(max_bytes)
+    except OSError:
+        return False
+    return b"\x00" not in chunk
+
+
+def resolve_mime(att: Dict[str, Any]) -> Optional[str]:
+    """Best-effort mime type for an attachment: Telegram's reported
+    mime_type first, then kind/extension-based fallbacks when missing or
+    generic, then alias normalization. Never raises."""
+    raw = att.get("mime_type")
+    mime: Optional[str] = None
+    if isinstance(raw, str) and raw.strip():
+        mime = raw.split(";", 1)[0].strip().lower()
+
+    if not mime or mime == "application/octet-stream":
+        candidate: Optional[str] = None
+        kind = att.get("kind")
+        if isinstance(kind, str):
+            candidate = _KIND_MIME.get(kind)
+        file_name = att.get("file_name")
+        if not candidate and isinstance(file_name, str) and file_name:
+            ext = os.path.splitext(file_name)[1].lower()
+            candidate = _EXT_MIME.get(ext)
+        if not candidate and isinstance(file_name, str) and file_name:
+            candidate = mimetypes.guess_type(file_name)[0]
+        if candidate:
+            mime = candidate
+
+    if not mime:
+        return None
+    return _MIME_ALIASES.get(mime, mime)
+
+
+def classify_upload(att: Dict[str, Any], path: str, size: int) -> Tuple[str, Optional[str], str]:
+    """Classify an already-saved upload for inline attachment to the next
+    Gemini turn.
+
+    Returns (mode, mime, reason): mode is "media", "text" or "none"; reason
+    is "" when attachable, "type" for an unsupported/undetected type, or
+    "size" for exceeding the per-mode cap. Never raises.
+    """
+    try:
+        mime = resolve_mime(att)
+
+        if mime in SUPPORTED_MEDIA_MIMES:
+            if 0 < size <= INLINE_MEDIA_MAX_BYTES:
+                return "media", mime, ""
+            return "none", mime, "size"
+
+        is_text = bool(mime) and _looks_like_text_mime(mime)
+        if not is_text:
+            file_name = att.get("file_name")
+            is_text = isinstance(file_name, str) and _has_text_extension(file_name)
+
+        if is_text:
+            if size <= 0 or size > INLINE_TEXT_MAX_BYTES:
+                return "none", mime, "size"
+            if not _no_nul_bytes(path):
+                return "none", mime, "type"
+            return "text", mime, ""
+
+        return "none", mime, "type"
+    except Exception:
+        return "none", None, "type"
+
+
+def build_attachment_part(ref: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    """Build one Gemini `contents` part for an already-classified attachment.
+
+    Runs on the queue worker thread. ref = {"path", "name", "mime", "mode",
+    "size"}. Never raises; never logs file contents. Returns (part,
+    history_placeholder) — the placeholder replaces this part once the turn
+    is saved to history, so raw media/text never lingers in memory/history.
+    """
+    path = ref.get("path")
+    name = ref.get("name") or os.path.basename(str(path))
+    mime = ref.get("mime")
+    mode = ref.get("mode")
+    placeholder = "[attachment removed from history: {} ({}) — saved at {}]".format(name, mime, path)
+    unavailable = {"text": "[attachment unavailable: {} could not be read or is now too large]".format(name)}
+
+    cap = INLINE_MEDIA_MAX_BYTES if mode == "media" else INLINE_TEXT_MAX_BYTES
+    try:
+        current_size = os.path.getsize(path)
+    except OSError:
+        return unavailable, placeholder
+
+    if current_size <= 0 or current_size > cap:
+        return unavailable, placeholder
+
+    try:
+        if mode == "media":
+            with open(path, "rb") as f:
+                raw = f.read()
+            b64 = base64.b64encode(raw).decode("ascii")
+            del raw
+            return {"inlineData": {"mimeType": mime, "data": b64}}, placeholder
+
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+        text = "[content of {}]\n<<<\n{}\n>>>".format(name, content)
+        return {"text": text}, placeholder
+    except OSError:
+        return unavailable, placeholder

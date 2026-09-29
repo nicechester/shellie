@@ -40,11 +40,18 @@ _task_lock = threading.Lock()
 _task_epoch: int = 0
 _active_continuation: int = 0  # worker writes; /queue reads (best-effort, no lock)
 
-# Pending "[system] uploaded file" notes to prepend to the next LLM message.
-# Only touched by the main (polling) thread — process_update and its helpers
-# run there, never from the queue worker thread.
-_pending_upload_notes: List[str] = []
-_MAX_PENDING_UPLOAD_NOTES = 5
+# Pending uploads to fold into the next LLM message (issue #6): each entry is
+# {"path", "att", "size", "mode", "mime", "reason"} where mode/mime/reason
+# come from tg_files.classify_upload. Only touched by the main (polling)
+# thread — process_update and its helpers run there, never from the queue
+# worker thread.
+_pending_uploads: List[Dict[str, Any]] = []
+_MAX_PENDING_UPLOADS = 5
+
+# media_group_id of the most recently saved upload, used to ask the
+# "what should I do with it?" question at most once per album. Same
+# main-thread-only model as _pending_uploads.
+_last_media_group_id: Optional[str] = None
 
 # /browse listing index: ids referenced from inline-keyboard callback_data
 # (d:<id> / f:<id>) -> (abs_path, is_dir). Only touched by the main (polling)
@@ -88,7 +95,7 @@ _TERM_MAX = 3800
 _TERM_CMD_MAX = 300
 _SHELL_DELETE_INPUT = True
 
-_SETTINGS_TOKENS = ("/settings", "/get", "/set", "/unset")
+_SETTINGS_TOKENS = ("/settings", "/get", "/env", "/set", "/unset")
 _BYPASS_TOKENS = (
     "/mem", "/restart", "/reset", "/sh", "/help", "/queue", "/kill", "/systemlog",
     "/continue", "/discard", "/file", "/browse", "/shell",
@@ -112,8 +119,8 @@ _HELP_TEXT = (
     "<code>/help</code> — show this message\n"
     "\n"
     "<b>Settings commands</b>\n"
-    "<code>/settings</code> / <code>/get</code> — list all settings\n"
-    "<code>/get KEY</code> — detail for one key\n"
+    "<code>/settings</code> / <code>/env</code> — list settings\n"
+    "<code>/get KEY</code> / <code>/env KEY</code> — read one setting\n"
     "<code>/set KEY VALUE</code> — apply an override\n"
     "<code>/unset KEY</code> — remove an override\n"
     "\n"
@@ -193,21 +200,67 @@ def process_update(update: Dict[str, Any]) -> None:
         return
     if _handle_bypass_command(chat_id, text):
         return
-    text = _consume_upload_notes(text)
-    _task_queue.put(_QueueItem(chat_id, text, user_id=user_id))
+    text, refs = _consume_uploads(text)
+    _task_queue.put(_QueueItem(chat_id, text, user_id=user_id, attachments=refs))
 
 
-def _consume_upload_notes(text: str) -> str:
-    if not _pending_upload_notes:
-        return text
-    combined = "\n".join(_pending_upload_notes) + "\n\n" + text
-    _pending_upload_notes.clear()
-    return combined
+def _consume_uploads(text: str) -> Tuple[str, List[Dict[str, Any]]]:
+    """Fold pending uploads into `text`: newest-first selection of up to
+    MAX_INLINE_ATTACHMENTS attachments within the shared INLINE_MEDIA_MAX_BYTES
+    budget, a "[system]" note per pending upload (in upload order), and the
+    selected refs (in upload order) to attach to the next LLM turn."""
+    if not _pending_uploads:
+        return text, []
+
+    selected: List[Dict[str, Any]] = []
+    notes_by_index: Dict[int, str] = {}
+    running_total = 0
+    count = 0
+
+    for idx in range(len(_pending_uploads) - 1, -1, -1):
+        entry = _pending_uploads[idx]
+        mode = entry.get("mode")
+        size = entry.get("size") or 0
+        included = (
+            mode != "none"
+            and count < tg_files.MAX_INLINE_ATTACHMENTS
+            and running_total + size <= tg_files.INLINE_MEDIA_MAX_BYTES
+        )
+        if included:
+            selected.append(entry)
+            count += 1
+            running_total += size
+            status = "Its content is attached to this message."
+        elif mode == "none" and entry.get("reason") == "type":
+            status = "It cannot be attached directly; use your tools on the saved path."
+        elif mode == "none" and entry.get("reason") == "size":
+            status = "It is too large to attach, so only the path is available."
+        else:
+            status = "It was not attached (per-message attachment limit); use your tools on the saved path."
+        notes_by_index[idx] = tg_files.upload_note(entry["path"], entry["att"], status)
+
+    selected.reverse()  # newest-first -> upload order
+    notes = [notes_by_index[i] for i in range(len(_pending_uploads))]
+    refs = [
+        {
+            "path": entry["path"],
+            "name": entry["att"].get("file_name") or os.path.basename(entry["path"]),
+            "mime": entry.get("mime"),
+            "mode": entry.get("mode"),
+            "size": entry.get("size"),
+        }
+        for entry in selected
+    ]
+
+    combined = "\n".join(notes) + "\n\n" + text
+    _pending_uploads.clear()
+    return combined, refs
 
 
 def _handle_incoming_file(
     chat_id: int, user_id: int, message: Dict[str, Any], att: Dict[str, Any]
 ) -> None:
+    global _last_media_group_id
     send_chat_action(chat_id)
     path, err = tg_files.save_incoming(att)
     if err:
@@ -218,24 +271,37 @@ def _handle_incoming_file(
         size = os.path.getsize(path)
         size_str = tg_files.format_size(size)
     except OSError:
+        size = 0
         size_str = "?"
+
+    mode, mime, reason = tg_files.classify_upload(att, path, size)
+    _pending_uploads.append(
+        {"path": path, "att": att, "size": size, "mode": mode, "mime": mime, "reason": reason}
+    )
+    while len(_pending_uploads) > _MAX_PENDING_UPLOADS:
+        _pending_uploads.pop(0)
 
     caption = message.get("caption")
     has_caption = isinstance(caption, str) and bool(caption.strip())
     shell_active = _shell_session is not None and _shell_session.chat_id == chat_id
+    media_group_id = message.get("media_group_id")
 
     reply = "📥 Saved: <code>{}</code> ({})".format(_esc(path), size_str)
     if shell_active and has_caption:
         reply += " (caption ignored in shell mode)"
+    elif (
+        not shell_active
+        and not has_caption
+        and (media_group_id is None or media_group_id != _last_media_group_id)
+    ):
+        reply += "\nWhat would you like me to do with it? I'll include it with your next message."
     send_message(chat_id, reply)
 
-    _pending_upload_notes.append(tg_files.upload_note(path, att))
-    while len(_pending_upload_notes) > _MAX_PENDING_UPLOAD_NOTES:
-        _pending_upload_notes.pop(0)
+    _last_media_group_id = media_group_id
 
     if has_caption and not shell_active:
-        text = _consume_upload_notes(caption)
-        _task_queue.put(_QueueItem(chat_id, text, user_id=user_id))
+        text, refs = _consume_uploads(caption)
+        _task_queue.put(_QueueItem(chat_id, text, user_id=user_id, attachments=refs))
 
 
 # ---------------------------------------------------------------------------
@@ -543,7 +609,7 @@ def _handle_settings_command(chat_id: int, message_id: Optional[int], text: str)
         send_message(chat_id, _settings_listing_text())
         return True
 
-    if cmd == "/get":
+    if cmd == "/get" or cmd == "/env":
         rest = text.split(None, 1)
         key = rest[1].split()[0] if len(rest) > 1 and rest[1].strip() else ""
         if not key:
@@ -786,6 +852,7 @@ def _handle_restart(chat_id: int) -> None:
 
 
 def _handle_bypass_command(chat_id: int, text: str) -> bool:
+    global _last_media_group_id
     if text.startswith("!"):
         _run_shell_bypass(chat_id, text[1:])
         return True
@@ -813,7 +880,8 @@ def _handle_bypass_command(chat_id: int, text: str) -> bool:
 
     if cmd == "/reset":
         _reset_history()
-        _pending_upload_notes.clear()
+        _pending_uploads.clear()
+        _last_media_group_id = None
         _ls_index.clear()
         drained = _drain_queue()
         msg = "🔄 Conversation context cleared."
@@ -949,7 +1017,7 @@ def _markdown_to_html(text: str) -> str:
 
 
 class _QueueItem:
-    __slots__ = ("chat_id", "text", "user_id", "kind", "task_id")
+    __slots__ = ("chat_id", "text", "user_id", "kind", "task_id", "attachments")
 
     def __init__(
         self,
@@ -958,12 +1026,14 @@ class _QueueItem:
         user_id: Optional[int] = None,
         kind: str = "message",
         task_id: Optional[str] = None,
+        attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         self.chat_id = chat_id
         self.text = text
         self.user_id = user_id
         self.kind = kind
         self.task_id = task_id
+        self.attachments = list(attachments or [])
 
 
 _task_queue: queue.Queue = queue.Queue()  # unbounded
@@ -1172,7 +1242,8 @@ def _process_llm_item(item: _QueueItem) -> None:
 
         _LOGGER.info("task_created task_id=%s chat_id=%s", record["task_id"], item.chat_id)
 
-        outcome, wrapup = _handle_llm(item.chat_id, item.text)
+        outcome, wrapup = _handle_llm(item.chat_id, item.text, attachments=item.attachments)
+        item.attachments = []
         _run_task_chain(item, record, epoch, outcome, wrapup)
     finally:
         _active_continuation = 0
@@ -1419,7 +1490,9 @@ def _run_llm_turn(
         return "done", ""
 
 
-def _handle_llm(chat_id: int, text: str) -> Tuple[str, str]:
+def _handle_llm(
+    chat_id: int, text: str, attachments: Optional[List[Dict[str, Any]]] = None
+) -> Tuple[str, str]:
     global _last_activity
 
     now = time.time()
@@ -1429,7 +1502,22 @@ def _handle_llm(chat_id: int, text: str) -> Tuple[str, str]:
     _last_activity = now
 
     context_turns = settings.get("CONTEXT_TURNS")
-    user_turn = {"role": "user", "parts": [{"text": text}]}
+
+    refs = attachments or []
+    parts: List[Dict[str, Any]] = []
+    placeholders: List[str] = []
+    if refs:
+        mimes = []
+        total_bytes = 0
+        for ref in refs:
+            part, placeholder = tg_files.build_attachment_part(ref)
+            parts.append(part)
+            placeholders.append(placeholder)
+            mimes.append(str(ref.get("mime")))
+            total_bytes += ref.get("size") or 0
+        _LOGGER.info("attachments n=%d mimes=%s bytes=%d", len(refs), ",".join(mimes), total_bytes)
+
+    user_turn = {"role": "user", "parts": parts + [{"text": text}]}
     contents = _trimmed_history(context_turns) + [user_turn]
 
     send_chat_action(chat_id)
@@ -1447,6 +1535,12 @@ def _handle_llm(chat_id: int, text: str) -> Tuple[str, str]:
         return "error", ""
     finally:
         stop_typing.set()
+        if placeholders:
+            # _history holds this same dict object (appended by _run_llm_turn
+            # or _fc_wrapup on success) — mutating "parts" here strips
+            # inlineData/text-content from retained history with no other
+            # bookkeeping. Harmless if the turn was never saved (error path).
+            user_turn["parts"] = [{"text": p} for p in placeholders] + [{"text": text}]
 
 
 def notify_pending_task() -> None:
