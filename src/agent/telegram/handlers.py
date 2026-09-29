@@ -17,7 +17,14 @@ from src.agent.core import tasks
 from src.agent.core.gemini import call_gemini, get_retry_status, parse_response, run_tool
 from src.agent.core.memory import read_memory
 from src.agent.core.shell import execute_shell
-from src.agent.telegram.client import delete_message, send_chat_action, send_message
+from src.agent.telegram import files as tg_files
+from src.agent.telegram.client import (
+    answer_callback_query,
+    delete_message,
+    edit_message_text,
+    send_chat_action,
+    send_message,
+)
 
 _LOGGER = logging.getLogger("shellie.telegram.handlers")
 
@@ -33,10 +40,31 @@ _task_lock = threading.Lock()
 _task_epoch: int = 0
 _active_continuation: int = 0  # worker writes; /queue reads (best-effort, no lock)
 
+# Pending "[system] uploaded file" notes to prepend to the next LLM message.
+# Only touched by the main (polling) thread — process_update and its helpers
+# run there, never from the queue worker thread.
+_pending_upload_notes: List[str] = []
+_MAX_PENDING_UPLOAD_NOTES = 5
+
+# /browse listing index: ids referenced from inline-keyboard callback_data
+# (d:<id> / f:<id>) -> (abs_path, is_dir). Only touched by the main (polling)
+# thread — process_update and its helpers (including callback_query updates,
+# which are also processed on the main polling thread) run there, never from
+# the queue worker thread. _ls_next_id only ever increments for the life of
+# the process (never reset, not even on /reset) so an old listing's tap
+# always either resolves to its original path or reports "expired", never a
+# different file.
+_ls_index: Dict[int, Tuple[str, bool]] = {}
+_ls_next_id: int = 1
+_LS_INDEX_MAX = 1000
+_BROWSE_MAX_ENTRIES = 98
+_BROWSE_LABEL_MAX = 40
+_CALLBACK_RE = re.compile(r"^([df]):(\d{1,9})$")
+
 _SETTINGS_TOKENS = ("/settings", "/get", "/set", "/unset")
 _BYPASS_TOKENS = (
     "/mem", "/restart", "/reset", "/sh", "/help", "/queue", "/kill", "/systemlog",
-    "/continue", "/discard",
+    "/continue", "/discard", "/file", "/browse",
 )
 
 _HELP_TEXT = (
@@ -50,6 +78,8 @@ _HELP_TEXT = (
     "<code>/continue</code> — resume the unfinished task\n"
     "<code>/discard</code> — drop the unfinished task\n"
     "<code>/systemlog [N]</code> — show last N lines of agent.log (default 50)\n"
+    "<code>/file &lt;path&gt;</code> — send a file from the host\n"
+    "<code>/browse [path]</code> — browse files; tap a file to download it, a folder to open it\n"
     "<code>/help</code> — show this message\n"
     "\n"
     "<b>Settings commands</b>\n"
@@ -57,6 +87,9 @@ _HELP_TEXT = (
     "<code>/get KEY</code> — detail for one key\n"
     "<code>/set KEY VALUE</code> — apply an override\n"
     "<code>/unset KEY</code> — remove an override\n"
+    "\n"
+    "<b>Files</b>\n"
+    "Files sent to the bot (documents, photos, videos, audio, voice notes) are saved to the workspace.\n"
     "\n"
     "<b>Anything else</b> — sent to Gemini LLM"
 )
@@ -84,11 +117,13 @@ def _drain_queue() -> int:
 
 
 def process_update(update: Dict[str, Any]) -> None:
+    cq = update.get("callback_query")
+    if isinstance(cq, dict):
+        _handle_callback(cq)
+        return
+
     message = update.get("message")
     if not isinstance(message, dict):
-        return
-    text = message.get("text")
-    if not isinstance(text, str) or not text:
         return
     chat = message.get("chat")
     if not isinstance(chat, dict) or "id" not in chat:
@@ -101,16 +136,63 @@ def process_update(update: Dict[str, Any]) -> None:
     user_id = from_user["id"]
     message_id = message.get("message_id")
 
+    # Auth check comes before anything else (fail-closed, silent) so that
+    # files from other users are never downloaded.
     allowed = settings.get("ALLOWED_USER_ID")
     if allowed is None or user_id != allowed:
         _LOGGER.warning("Unauthorized access: user_id=%s", user_id)
+        return
+
+    att = tg_files.extract_attachment(message)
+    if att is not None:
+        _handle_incoming_file(chat_id, user_id, message, att)
+        return
+
+    text = message.get("text")
+    if not isinstance(text, str) or not text:
         return
 
     if _handle_settings_command(chat_id, message_id, text):
         return
     if _handle_bypass_command(chat_id, text):
         return
+    text = _consume_upload_notes(text)
     _task_queue.put(_QueueItem(chat_id, text, user_id=user_id))
+
+
+def _consume_upload_notes(text: str) -> str:
+    if not _pending_upload_notes:
+        return text
+    combined = "\n".join(_pending_upload_notes) + "\n\n" + text
+    _pending_upload_notes.clear()
+    return combined
+
+
+def _handle_incoming_file(
+    chat_id: int, user_id: int, message: Dict[str, Any], att: Dict[str, Any]
+) -> None:
+    send_chat_action(chat_id)
+    path, err = tg_files.save_incoming(att)
+    if err:
+        send_message(chat_id, "⚠️ Upload failed: {}".format(_esc(err)))
+        return
+
+    try:
+        size = os.path.getsize(path)
+        size_str = tg_files.format_size(size)
+    except OSError:
+        size_str = "?"
+
+    send_message(chat_id, "📥 Saved: <code>{}</code> ({})".format(_esc(path), size_str))
+
+    _pending_upload_notes.append(tg_files.upload_note(path, att))
+    while len(_pending_upload_notes) > _MAX_PENDING_UPLOAD_NOTES:
+        _pending_upload_notes.pop(0)
+
+    caption = message.get("caption")
+    if isinstance(caption, str) and caption.strip():
+        text = _consume_upload_notes(caption)
+        _task_queue.put(_QueueItem(chat_id, text, user_id=user_id))
 
 
 def _first_token_command(text: str) -> str:
@@ -288,6 +370,121 @@ def _handle_settings_command(chat_id: int, message_id: Optional[int], text: str)
 
 
 # ---------------------------------------------------------------------------
+# /browse listing (issue #16): inline-keyboard buttons (tap a file to
+# download it, a folder to open it) generated from a directory listing.
+# ---------------------------------------------------------------------------
+
+
+def _ls_register(path: str, is_dir: bool) -> int:
+    global _ls_next_id
+    entry_id = _ls_next_id
+    _ls_next_id += 1
+    _ls_index[entry_id] = (path, is_dir)
+    while len(_ls_index) > _LS_INDEX_MAX:
+        del _ls_index[min(_ls_index)]
+    return entry_id
+
+
+def _build_listing(
+    dir_path: str, entries: List[Dict[str, Any]], total: int
+) -> Tuple[str, Dict[str, Any]]:
+    lines = ["📂 <code>{}</code> ({} entries)".format(_esc(dir_path), total)]
+    if not entries:
+        lines.append("(empty)")
+    if total > len(entries):
+        lines.append("… {} more not shown (use !ls or a narrower path)".format(total - len(entries)))
+    text = "\n".join(lines)
+
+    rows: List[List[Dict[str, Any]]] = []
+
+    if dir_path != "/":
+        parent_id = _ls_register(os.path.dirname(dir_path), True)
+        rows.append([{"text": "⬆️ ..", "callback_data": "d:{}".format(parent_id)}])
+
+    for entry in entries:
+        name = entry["name"]
+        label = name if len(name) <= _BROWSE_LABEL_MAX else name[:_BROWSE_LABEL_MAX] + "…"
+        if entry["is_dir"]:
+            entry_id = _ls_register(entry["path"], True)
+            rows.append([{"text": "📁 {}/".format(label), "callback_data": "d:{}".format(entry_id)}])
+        else:
+            entry_id = _ls_register(entry["path"], False)
+            size = entry.get("size")
+            size_str = tg_files.format_size(size) if isinstance(size, int) else "?"
+            rows.append([{"text": "📄 {} · {}".format(label, size_str), "callback_data": "f:{}".format(entry_id)}])
+
+    return text, {"inline_keyboard": rows}
+
+
+def _listing_for(raw: Optional[str]) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[str]]:
+    dir_path, err = tg_files.resolve_dir(raw)
+    if err:
+        return None, None, err
+    entries, total, err = tg_files.list_dir(dir_path, limit=_BROWSE_MAX_ENTRIES)
+    if err:
+        return None, None, err
+    text, markup = _build_listing(dir_path, entries, total)
+    return text, markup, None
+
+
+def _send_listing(chat_id: int, raw: Optional[str]) -> None:
+    text, markup, err = _listing_for(raw)
+    if err:
+        send_message(chat_id, "⚠️ " + _esc(err))
+        return
+    send_message(chat_id, text, reply_markup=markup)
+
+
+def _handle_callback(cq: Dict[str, Any]) -> None:
+    cq_id = cq.get("id")
+    from_user = cq.get("from")
+    if not isinstance(from_user, dict) or "id" not in from_user:
+        return
+    uid = from_user["id"]
+
+    allowed = settings.get("ALLOWED_USER_ID")
+    if allowed is None or uid != allowed:
+        _LOGGER.warning("Unauthorized callback: user_id=%s", uid)
+        return
+
+    msg = cq.get("message")
+    chat = msg.get("chat") if isinstance(msg, dict) else None
+    message_id = msg.get("message_id") if isinstance(msg, dict) else None
+    if not isinstance(chat, dict) or "id" not in chat or message_id is None:
+        answer_callback_query(cq_id)
+        return
+    chat_id = chat["id"]
+
+    m = _CALLBACK_RE.match(str(cq.get("data") or ""))
+    if not m:
+        answer_callback_query(cq_id, "Unknown action")
+        return
+
+    n = int(m.group(2))
+    if n not in _ls_index:
+        answer_callback_query(
+            cq_id, "This listing has expired — send /browse again.", show_alert=True
+        )
+        return
+    path, is_dir = _ls_index[n]
+
+    if is_dir:
+        text, markup, err = _listing_for(path)
+        if err:
+            answer_callback_query(cq_id, err, show_alert=True)
+            return
+        if not edit_message_text(chat_id, message_id, text, reply_markup=markup):
+            send_message(chat_id, text, reply_markup=markup)
+        answer_callback_query(cq_id)
+        return
+
+    answer_callback_query(cq_id, "Sending {}…".format(os.path.basename(path)))
+    ok, msg2 = tg_files.send_file(chat_id, path)
+    if not ok:
+        send_message(chat_id, "⚠️ " + _esc(msg2))
+
+
+# ---------------------------------------------------------------------------
 # Bypass commands (LLM 0%), excluded from LLM history.
 # ---------------------------------------------------------------------------
 
@@ -380,6 +577,7 @@ def _handle_bypass_command(chat_id: int, text: str) -> bool:
         return True
 
     cmd = _first_token_command(text)
+
     if cmd not in _BYPASS_TOKENS:
         return False
 
@@ -401,6 +599,8 @@ def _handle_bypass_command(chat_id: int, text: str) -> bool:
 
     if cmd == "/reset":
         _reset_history()
+        _pending_upload_notes.clear()
+        _ls_index.clear()
         drained = _drain_queue()
         msg = "🔄 Conversation context cleared."
         if drained:
@@ -474,6 +674,21 @@ def _handle_bypass_command(chat_id: int, text: str) -> bool:
 
     if cmd == "/queue":
         send_message(chat_id, _queue_status_text())
+        return True
+
+    if cmd == "/file":
+        parts = text.split(None, 1)
+        if len(parts) < 2 or not parts[1].strip():
+            send_message(chat_id, _esc("Usage: /file <path> (relative to workspace or absolute)"))
+            return True
+        ok, msg = tg_files.send_file(chat_id, parts[1])
+        if not ok:
+            send_message(chat_id, "⚠️ " + _esc(msg))
+        return True
+
+    if cmd == "/browse":
+        parts = text.split(None, 1)
+        _send_listing(chat_id, parts[1] if len(parts) > 1 else None)
         return True
 
     return False
@@ -884,6 +1099,18 @@ def _fc_wrapup(
     return final_text
 
 
+def _run_tool_for_chat(chat_id: int, name: str, args: Dict[str, Any]) -> str:
+    """Dispatch a single function call. send_file needs the chat_id (not
+    exposed to the model), so it is intercepted here rather than routed
+    through the generic run_tool registry."""
+    if name == "send_file":
+        try:
+            return tg_files.send_file(chat_id, str(args.get("path", "")), args.get("caption") or None)[1]
+        except Exception as exc:
+            return "Error: {}".format(exc)
+    return run_tool(name, args)
+
+
 def _run_llm_turn(
     chat_id: int,
     contents: List[Dict[str, Any]],
@@ -928,7 +1155,7 @@ def _run_llm_turn(
             triples: List[Tuple[str, Dict[str, Any], Any]] = []
             for name, args in parsed.function_calls:
                 _LOGGER.info("tool_call name=%s args=%r", name, args)
-                result = run_tool(name, args)
+                result = _run_tool_for_chat(chat_id, name, args)
                 _LOGGER.info("tool_result name=%s result=%r", name, result[:200] if isinstance(result, str) else result)
                 response_parts.append(
                     {"functionResponse": {"name": name, "response": {"output": result}}}

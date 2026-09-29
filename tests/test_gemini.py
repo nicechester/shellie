@@ -798,6 +798,29 @@ class ToolsRegistryTests(unittest.TestCase):
         self.assertEqual(result, "Unknown function: unknown")
 
 
+class SendFileToolFallbackTests(unittest.TestCase):
+    """send_file (issue #16) is declared for the model, but outside a
+    Telegram chat (e.g. direct call_gemini use) it has no chat_id to send
+    to, so run_tool falls back to an explanatory message instead of routing
+    through Telegram."""
+
+    def test_send_file_declared_in_tools_schema(self) -> None:
+        with mock.patch.object(
+            gemini.shell,
+            "execution_environment",
+            return_value={"os": "Linux", "arch": "x86_64", "shell": "/bin/bash", "cwd": "/base"},
+        ):
+            schema = gemini.build_tools_schema()
+
+        declarations = schema[0]["functionDeclarations"]
+        names = [d["name"] for d in declarations]
+        self.assertIn("send_file", names)
+
+    def test_run_tool_send_file_outside_telegram_returns_fallback_message(self) -> None:
+        result = gemini.run_tool("send_file", {})
+        self.assertEqual(result, "send_file is only available inside a Telegram chat.")
+
+
 class ListSkillsTests(unittest.TestCase):
     def test_docstringed_private_and_syntax_error_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
