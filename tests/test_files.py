@@ -275,6 +275,124 @@ class ResolveSendPathTests(FilesTestBase):
         self.assertIsNotNone(err)
 
 
+class NormalizePathTests(FilesTestBase):
+    def test_quotes_stripped(self) -> None:
+        path, err = files._normalize_path('"data.txt"')
+        self.assertIsNone(err)
+        self.assertEqual(path, os.path.realpath(os.path.join(self.workspace_dir, "data.txt")))
+
+    def test_empty_raises_error(self) -> None:
+        path, err = files._normalize_path("   ")
+        self.assertIsNone(path)
+        self.assertIsNotNone(err)
+
+
+class ListDirTests(FilesTestBase):
+    def test_dirs_first_case_insensitive_sort(self) -> None:
+        os.makedirs(os.path.join(self.workspace_dir, "Zdir"))
+        os.makedirs(os.path.join(self.workspace_dir, "adir"))
+        self._write("Bfile.txt")
+        self._write("afile.txt")
+
+        entries, total, err = files.list_dir(self.workspace_dir)
+
+        self.assertIsNone(err)
+        self.assertEqual(total, 4)
+        names = [(e["name"], e["is_dir"]) for e in entries]
+        self.assertEqual(
+            names, [("adir", True), ("Zdir", True), ("afile.txt", False), ("Bfile.txt", False)]
+        )
+
+    def test_hidden_names_excluded(self) -> None:
+        self._write("visible.txt")
+        self._write(".hidden.txt")
+        self._write(".shellie-upload-abc.part")
+
+        entries, total, err = files.list_dir(self.workspace_dir)
+
+        self.assertIsNone(err)
+        self.assertEqual([e["name"] for e in entries], ["visible.txt"])
+        self.assertEqual(total, 1)
+
+    def test_limit_caps_entries_but_total_is_full_count(self) -> None:
+        for i in range(10):
+            self._write("f{:02d}.txt".format(i))
+
+        entries, total, err = files.list_dir(self.workspace_dir, limit=3)
+
+        self.assertIsNone(err)
+        self.assertEqual(len(entries), 3)
+        self.assertEqual(total, 10)
+
+    def test_broken_symlink_reports_none_size_and_not_dir(self) -> None:
+        target = os.path.join(self.workspace_dir, "gone.txt")
+        with open(target, "wb") as f:
+            f.write(b"x")
+        link = os.path.join(self.workspace_dir, "broken_link")
+        os.symlink(target, link)
+        os.unlink(target)
+
+        entries, total, err = files.list_dir(self.workspace_dir)
+
+        self.assertIsNone(err)
+        entry = next(e for e in entries if e["name"] == "broken_link")
+        self.assertIsNone(entry["size"])
+        self.assertFalse(entry["is_dir"])
+
+    def test_missing_directory_returns_error(self) -> None:
+        entries, total, err = files.list_dir(os.path.join(self.workspace_dir, "nope"))
+
+        self.assertEqual(entries, [])
+        self.assertEqual(total, 0)
+        self.assertIsNotNone(err)
+
+    def test_scandir_error_returns_error(self) -> None:
+        with mock.patch.object(files.os, "scandir", side_effect=PermissionError("denied")):
+            entries, total, err = files.list_dir(self.workspace_dir)
+
+        self.assertEqual(entries, [])
+        self.assertEqual(total, 0)
+        self.assertIn("denied", err)
+
+
+class ResolveDirTests(FilesTestBase):
+    def test_none_defaults_to_workspace(self) -> None:
+        path, err = files.resolve_dir(None)
+        self.assertIsNone(err)
+        self.assertEqual(path, os.path.realpath(self.workspace_dir))
+
+    def test_empty_string_defaults_to_workspace(self) -> None:
+        path, err = files.resolve_dir("")
+        self.assertIsNone(err)
+        self.assertEqual(path, os.path.realpath(self.workspace_dir))
+
+    def test_relative_path_resolves_inside_workspace(self) -> None:
+        os.makedirs(os.path.join(self.workspace_dir, "sub"))
+        path, err = files.resolve_dir("sub")
+        self.assertIsNone(err)
+        self.assertEqual(path, os.path.realpath(os.path.join(self.workspace_dir, "sub")))
+
+    def test_tilde_expands_to_home(self) -> None:
+        home_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home_dir, ignore_errors=True)
+        with mock.patch.dict(os.environ, {"HOME": home_dir}):
+            path, err = files.resolve_dir("~")
+        self.assertIsNone(err)
+        self.assertEqual(path, os.path.realpath(home_dir))
+
+    def test_missing_path_reports_not_found(self) -> None:
+        path, err = files.resolve_dir("nope")
+        self.assertIsNone(path)
+        self.assertIn("Not found", err)
+
+    def test_file_path_reports_not_a_directory(self) -> None:
+        self._write("afile.txt")
+        path, err = files.resolve_dir("afile.txt")
+        self.assertIsNone(path)
+        self.assertIn("Not a directory", err)
+        self.assertIn("/file", err)
+
+
 class SendFileTests(FilesTestBase):
     def test_caption_cut_to_max(self) -> None:
         path = self._write("report.csv", b"1,2,3")

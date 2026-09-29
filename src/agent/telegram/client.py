@@ -34,7 +34,7 @@ def get_updates(offset: Optional[int] = None) -> Dict:
 
     payload = {
         "timeout": poll_timeout,
-        "allowed_updates": ["message"]
+        "allowed_updates": ["message", "callback_query"]
     }
     if offset is not None:
         payload["offset"] = offset
@@ -95,7 +95,7 @@ def split_message(text: str, limit: int = 4096) -> List[str]:
     return chunks
 
 
-def send_message(chat_id: int, text: str, parse_mode: Optional[str] = "HTML") -> Dict:
+def send_message(chat_id: int, text: str, parse_mode: Optional[str] = "HTML", reply_markup: Optional[Dict] = None) -> Dict:
     token = settings.get("TELEGRAM_BOT_TOKEN")
     if not token:
         _LOGGER.warning("send_message: token not set")
@@ -104,13 +104,16 @@ def send_message(chat_id: int, text: str, parse_mode: Optional[str] = "HTML") ->
     chunks = split_message(text)
     last_response: Dict = {"ok": False}
 
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks):
+        is_last = (i == len(chunks) - 1)
         payload: Dict = {
             "chat_id": chat_id,
             "text": chunk
         }
         if parse_mode is not None:
             payload["parse_mode"] = parse_mode
+        if is_last and reply_markup is not None:
+            payload["reply_markup"] = reply_markup
 
         url = _api_url("sendMessage", token)
         response, status = http_post(url, payload)
@@ -121,6 +124,8 @@ def send_message(chat_id: int, text: str, parse_mode: Optional[str] = "HTML") ->
                     "chat_id": chat_id,
                     "text": chunk
                 }
+                if is_last and reply_markup is not None:
+                    payload_plain["reply_markup"] = reply_markup
                 response, status = http_post(url, payload_plain)
 
             if status != 200 or not response.get("ok"):
@@ -168,6 +173,60 @@ def delete_message(chat_id: int, message_id: int) -> bool:
         response, status = http_post(url, payload)
         return status == 200 and response.get("ok", False)
     except Exception:
+        return False
+
+
+def edit_message_text(chat_id: int, message_id: int, text: str, reply_markup: Optional[Dict] = None, parse_mode: Optional[str] = "HTML") -> bool:
+    token = settings.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        return False
+
+    payload: Dict = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text
+    }
+    if parse_mode is not None:
+        payload["parse_mode"] = parse_mode
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+
+    url = _api_url("editMessageText", token)
+    try:
+        response, status = http_post(url, payload)
+        if status == 200 and response.get("ok"):
+            return True
+        if status == 400:
+            description = response.get("description", "")
+            if "message is not modified" in description:
+                return True
+        error_str = str(response.get("description") or response.get("error", ""))
+        masked_error = mask_token(error_str)
+        _LOGGER.warning("edit_message_text failed: status=%d error=%s", status, masked_error)
+        return False
+    except Exception:
+        return False
+
+
+def answer_callback_query(callback_query_id: str, text: Optional[str] = None, show_alert: bool = False) -> bool:
+    token = settings.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        return False
+
+    payload: Dict = {
+        "callback_query_id": callback_query_id
+    }
+    if text is not None:
+        payload["text"] = text[:200]
+    if show_alert:
+        payload["show_alert"] = True
+
+    url = _api_url("answerCallbackQuery", token)
+    try:
+        response, status = http_post(url, payload)
+        return status == 200 and response.get("ok", False)
+    except Exception:
+        _LOGGER.debug("answer_callback_query failed", exc_info=True)
         return False
 
 

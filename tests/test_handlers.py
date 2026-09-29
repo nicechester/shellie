@@ -77,6 +77,8 @@ class HandlersTestCase(unittest.TestCase):
         handlers._task_epoch = 0
         handlers._active_continuation = 0
         handlers._pending_upload_notes.clear()
+        handlers._ls_index.clear()
+        handlers._ls_next_id = 1
         # Drain any leftover items from a previous test.
         while not handlers._task_queue.empty():
             try:
@@ -97,6 +99,8 @@ class HandlersTestCase(unittest.TestCase):
             "send_message": mock.patch.object(handlers, "send_message"),
             "send_chat_action": mock.patch.object(handlers, "send_chat_action"),
             "delete_message": mock.patch.object(handlers, "delete_message"),
+            "edit_message_text": mock.patch.object(handlers, "edit_message_text"),
+            "answer_callback_query": mock.patch.object(handlers, "answer_callback_query"),
             "execute_shell": mock.patch.object(handlers, "execute_shell"),
             "read_memory": mock.patch.object(handlers, "read_memory"),
             "call_gemini": mock.patch.object(handlers, "call_gemini"),
@@ -111,6 +115,8 @@ class HandlersTestCase(unittest.TestCase):
         self.mock_send_message = self.mocks["send_message"]
         self.mock_send_chat_action = self.mocks["send_chat_action"]
         self.mock_delete_message = self.mocks["delete_message"]
+        self.mock_edit_message_text = self.mocks["edit_message_text"]
+        self.mock_answer_callback_query = self.mocks["answer_callback_query"]
         self.mock_execute_shell = self.mocks["execute_shell"]
         self.mock_read_memory = self.mocks["read_memory"]
         self.mock_call_gemini = self.mocks["call_gemini"]
@@ -133,6 +139,8 @@ class HandlersTestCase(unittest.TestCase):
         handlers._task_epoch = 0
         handlers._active_continuation = 0
         handlers._pending_upload_notes.clear()
+        handlers._ls_index.clear()
+        handlers._ls_next_id = 1
 
     def _drain_queue(self) -> None:
         """Process all queued LLM items synchronously by calling _handle_llm directly."""
@@ -187,6 +195,17 @@ class HandlersTestCase(unittest.TestCase):
         if caption is not None:
             message["caption"] = caption
         return {"message": message}
+
+    def _callback_update(self, data, user_id=111, chat_id=1, message_id=77, cq_id="cq1"):
+        return {
+            "update_id": 1,
+            "callback_query": {
+                "id": cq_id,
+                "from": {"id": user_id},
+                "message": {"chat": {"id": chat_id}, "message_id": message_id},
+                "data": data,
+            },
+        }
 
     def _base_rows(self):
         return [
@@ -1191,6 +1210,287 @@ class SendFileToolRoutingTests(HandlersTestCase):
 
         mock_send_file.assert_called_once_with(1, "out.csv", "here")
         self.mock_run_tool.assert_not_called()
+
+
+class BrowseCommandTests(HandlersTestCase):
+    """/browse and tappable inline-keyboard callbacks (issue #16 delta)."""
+
+    def test_browse_sends_inline_keyboard(self) -> None:
+        entries = [
+            {"name": "a<b>.txt", "path": "/ws/a<b>.txt", "is_dir": False, "size": 10},
+            {"name": "sub", "path": "/ws/sub", "is_dir": True, "size": None},
+        ]
+        with mock.patch.object(files, "resolve_dir", return_value=("/", None)), \
+                mock.patch.object(files, "list_dir", return_value=(entries, 2, None)):
+            handlers.process_update(self._update("/browse"))
+
+        call_args, call_kwargs = self.mock_send_message.call_args
+        self.assertEqual(call_args[0], 1)
+        self.assertIn("reply_markup", call_kwargs)
+        markup = call_kwargs["reply_markup"]
+
+        buttons = [row[0] for row in markup["inline_keyboard"]]
+        file_btn = next(b for b in buttons if b["callback_data"] == "f:1")
+        dir_btn = next(b for b in buttons if b["callback_data"] == "d:2")
+        self.assertIn("a<b>.txt", file_btn["text"])
+        self.assertIn("sub/", dir_btn["text"])
+
+        self.assertEqual(handlers._ls_index[1], ("/ws/a<b>.txt", False))
+        self.assertEqual(handlers._ls_index[2], ("/ws/sub", True))
+
+    def test_browse_header_escapes_dir_path(self) -> None:
+        with mock.patch.object(files, "resolve_dir", return_value=("/ws/<x>", None)), \
+                mock.patch.object(files, "list_dir", return_value=([], 0, None)):
+            handlers.process_update(self._update("/browse"))
+
+        reply_text = self.mock_send_message.call_args[0][1]
+        self.assertIn("&lt;x&gt;", reply_text)
+        self.assertNotIn("<x>", reply_text)
+
+    def test_browse_no_arg_passes_none_to_resolve_dir(self) -> None:
+        with mock.patch.object(files, "resolve_dir", return_value=("/", None)) as mock_resolve, \
+                mock.patch.object(files, "list_dir", return_value=([], 0, None)):
+            handlers.process_update(self._update("/browse"))
+        mock_resolve.assert_called_once_with(None)
+
+    def test_browse_with_path_arg_passes_it_through(self) -> None:
+        with mock.patch.object(files, "resolve_dir", return_value=("/ws/sub", None)) as mock_resolve, \
+                mock.patch.object(files, "list_dir", return_value=([], 0, None)):
+            handlers.process_update(self._update("/browse sub"))
+        mock_resolve.assert_called_once_with("sub")
+
+    def test_browse_resolve_dir_error_sends_warning(self) -> None:
+        with mock.patch.object(files, "resolve_dir", return_value=(None, "Not found: x")):
+            handlers.process_update(self._update("/browse x"))
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("⚠️", reply)
+        self.assertIn("Not found", reply)
+
+    def test_browse_list_dir_error_sends_warning(self) -> None:
+        with mock.patch.object(files, "resolve_dir", return_value=("/ws", None)), \
+                mock.patch.object(files, "list_dir", return_value=([], 0, "denied")):
+            handlers.process_update(self._update("/browse"))
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("⚠️", reply)
+        self.assertIn("denied", reply)
+
+    def test_browse_calls_list_dir_with_limit_and_bounded_buttons(self) -> None:
+        entries = [
+            {"name": "f{}.txt".format(i), "path": "/ws/sub/f{}.txt".format(i), "is_dir": False, "size": 1}
+            for i in range(98)
+        ]
+        with mock.patch.object(files, "resolve_dir", return_value=("/ws/sub", None)), \
+                mock.patch.object(files, "list_dir", return_value=(entries, 98, None)) as mock_list:
+            handlers.process_update(self._update("/browse sub"))
+
+        mock_list.assert_called_once_with("/ws/sub", limit=handlers._BROWSE_MAX_ENTRIES)
+        reply_markup = self.mock_send_message.call_args[1]["reply_markup"]
+        self.assertLessEqual(len(reply_markup["inline_keyboard"]), 100)
+
+    def test_second_browse_continues_numbering_old_ids_still_resolve(self) -> None:
+        entries1 = [{"name": "one.txt", "path": "/ws/one.txt", "is_dir": False, "size": 1}]
+        entries2 = [{"name": "two.txt", "path": "/ws/two.txt", "is_dir": False, "size": 2}]
+        with mock.patch.object(files, "resolve_dir", return_value=("/", None)), \
+                mock.patch.object(files, "list_dir", return_value=(entries1, 1, None)):
+            handlers.process_update(self._update("/browse"))
+        with mock.patch.object(files, "resolve_dir", return_value=("/", None)), \
+                mock.patch.object(files, "list_dir", return_value=(entries2, 1, None)):
+            handlers.process_update(self._update("/browse"))
+
+        self.assertEqual(handlers._ls_index[1], ("/ws/one.txt", False))
+        self.assertEqual(handlers._ls_index[2], ("/ws/two.txt", False))
+
+        with mock.patch.object(files, "send_file", return_value=(True, "Sent")) as mock_send:
+            handlers.process_update(self._callback_update("f:1"))
+        mock_send.assert_called_once_with(1, "/ws/one.txt")
+
+    def test_callback_dir_tap_edits_message_no_send_message(self) -> None:
+        handlers._ls_index[1] = ("/ws/sub", True)
+        handlers._ls_next_id = 2
+        with mock.patch.object(files, "resolve_dir", return_value=("/ws/sub", None)) as mock_resolve, \
+                mock.patch.object(files, "list_dir", return_value=([], 0, None)):
+            handlers.process_update(self._callback_update("d:1"))
+
+        mock_resolve.assert_called_once_with("/ws/sub")
+        self.mock_edit_message_text.assert_called_once()
+        edit_args = self.mock_edit_message_text.call_args[0]
+        self.assertEqual(edit_args[0], 1)
+        self.assertEqual(edit_args[1], 77)
+        self.mock_send_message.assert_not_called()
+        self.mock_answer_callback_query.assert_called_once_with("cq1")
+
+    def test_callback_file_prefix_on_stored_folder_also_edits(self) -> None:
+        handlers._ls_index[1] = ("/ws/sub", True)
+        handlers._ls_next_id = 2
+        with mock.patch.object(files, "resolve_dir", return_value=("/ws/sub", None)), \
+                mock.patch.object(files, "list_dir", return_value=([], 0, None)), \
+                mock.patch.object(files, "send_file") as mock_send:
+            handlers.process_update(self._callback_update("f:1"))
+
+        self.mock_edit_message_text.assert_called_once()
+        mock_send.assert_not_called()
+
+    def test_callback_folder_tap_resolve_error_answers_alert_no_edit(self) -> None:
+        handlers._ls_index[1] = ("/ws/gone", True)
+        handlers._ls_next_id = 2
+        with mock.patch.object(files, "resolve_dir", return_value=(None, "Not found: gone")):
+            handlers.process_update(self._callback_update("d:1"))
+
+        self.mock_edit_message_text.assert_not_called()
+        self.mock_answer_callback_query.assert_called_once_with("cq1", "Not found: gone", show_alert=True)
+        self.mock_send_message.assert_not_called()
+
+    def test_callback_folder_tap_list_dir_error_answers_alert_no_edit(self) -> None:
+        handlers._ls_index[1] = ("/ws/denied", True)
+        handlers._ls_next_id = 2
+        with mock.patch.object(files, "resolve_dir", return_value=("/ws/denied", None)), \
+                mock.patch.object(files, "list_dir", return_value=([], 0, "denied")):
+            handlers.process_update(self._callback_update("d:1"))
+
+        self.mock_edit_message_text.assert_not_called()
+        self.mock_answer_callback_query.assert_called_once_with("cq1", "denied", show_alert=True)
+        self.mock_send_message.assert_not_called()
+
+    def test_callback_edit_failure_falls_back_to_send_message_with_markup(self) -> None:
+        handlers._ls_index[1] = ("/ws/sub", True)
+        handlers._ls_next_id = 2
+        self.mock_edit_message_text.return_value = False
+        with mock.patch.object(files, "resolve_dir", return_value=("/ws/sub", None)), \
+                mock.patch.object(files, "list_dir", return_value=([], 0, None)):
+            handlers.process_update(self._callback_update("d:1"))
+
+        self.mock_send_message.assert_called_once()
+        _, send_kwargs = self.mock_send_message.call_args
+        self.assertIn("reply_markup", send_kwargs)
+        self.mock_answer_callback_query.assert_called_once_with("cq1")
+
+    def test_callback_file_tap_sends_file_with_exact_path_no_llm(self) -> None:
+        handlers._ls_index[1] = ("/ws/report.csv", False)
+        handlers._ls_next_id = 2
+        with mock.patch.object(files, "send_file", return_value=(True, "Sent")) as mock_send:
+            handlers.process_update(self._callback_update("f:1"))
+        mock_send.assert_called_once_with(1, "/ws/report.csv")
+        self.mock_call_gemini.assert_not_called()
+
+    def test_callback_file_tap_answers_before_send_file(self) -> None:
+        handlers._ls_index[1] = ("/ws/report.csv", False)
+        handlers._ls_next_id = 2
+        order = []
+        self.mock_answer_callback_query.side_effect = lambda *a, **k: order.append("answer")
+
+        def _fake_send_file(*a, **k):
+            order.append("send_file")
+            return True, "Sent"
+
+        with mock.patch.object(files, "send_file", side_effect=_fake_send_file):
+            handlers.process_update(self._callback_update("f:1"))
+
+        self.assertEqual(order, ["answer", "send_file"])
+
+    def test_callback_file_tap_failure_message_escaped(self) -> None:
+        handlers._ls_index[1] = ("/ws/report.csv", False)
+        handlers._ls_next_id = 2
+        with mock.patch.object(files, "send_file", return_value=(False, "<bad>")):
+            handlers.process_update(self._callback_update("f:1"))
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("&lt;bad&gt;", reply)
+        self.assertNotIn("<bad>", reply)
+
+    def test_callback_empty_map_answers_expired_alert(self) -> None:
+        handlers.process_update(self._callback_update("f:99"))
+        self.mock_answer_callback_query.assert_called_once_with(
+            "cq1", "This listing has expired — send /browse again.", show_alert=True
+        )
+        self.mock_send_message.assert_not_called()
+
+    def test_callback_missing_id_answers_expired_alert(self) -> None:
+        handlers._ls_index[1] = ("/ws/report.csv", False)
+        handlers._ls_next_id = 2
+        handlers.process_update(self._callback_update("f:99"))
+        self.mock_answer_callback_query.assert_called_once_with(
+            "cq1", "This listing has expired — send /browse again.", show_alert=True
+        )
+        self.mock_send_message.assert_not_called()
+
+    def test_unauthorized_callback_is_silent(self) -> None:
+        handlers._ls_index[1] = ("/ws/report.csv", False)
+        handlers._ls_next_id = 2
+        with mock.patch.object(files, "send_file") as mock_send:
+            handlers.process_update(self._callback_update("f:1", user_id=222))
+        self.mock_answer_callback_query.assert_not_called()
+        self.mock_send_message.assert_not_called()
+        self.mock_edit_message_text.assert_not_called()
+        mock_send.assert_not_called()
+
+    def test_callback_with_no_message_is_answered_and_nothing_else(self) -> None:
+        update = self._callback_update("f:1")
+        del update["callback_query"]["message"]
+        handlers.process_update(update)
+        self.mock_answer_callback_query.assert_called_once_with("cq1")
+        self.mock_send_message.assert_not_called()
+        self.mock_edit_message_text.assert_not_called()
+
+    def test_callback_bad_data_prefix_answers_unknown_action(self) -> None:
+        handlers.process_update(self._callback_update("x:1"))
+        self.mock_answer_callback_query.assert_called_once_with("cq1", "Unknown action")
+
+    def test_callback_bad_data_non_numeric_id_answers_unknown_action(self) -> None:
+        handlers.process_update(self._callback_update("f:abc"))
+        self.mock_answer_callback_query.assert_called_once_with("cq1", "Unknown action")
+
+    def test_reset_clears_map_and_next_browse_does_not_reuse_ids(self) -> None:
+        entries = [{"name": "one.txt", "path": "/ws/one.txt", "is_dir": False, "size": 1}]
+        with mock.patch.object(files, "resolve_dir", return_value=("/", None)), \
+                mock.patch.object(files, "list_dir", return_value=(entries, 1, None)):
+            handlers.process_update(self._update("/browse"))
+        self.assertEqual(list(handlers._ls_index.keys()), [1])
+
+        handlers.process_update(self._update("/reset"))
+        self.assertEqual(handlers._ls_index, {})
+
+        with mock.patch.object(files, "resolve_dir", return_value=("/", None)), \
+                mock.patch.object(files, "list_dir", return_value=(entries, 1, None)):
+            handlers.process_update(self._update("/browse"))
+        # The counter is never reset, even by /reset, so ids keep climbing.
+        self.assertEqual(list(handlers._ls_index.keys()), [2])
+
+    def test_plain_file_command_still_takes_original_branch(self) -> None:
+        with mock.patch.object(files, "send_file", return_value=(True, "Sent")) as mock_send:
+            handlers.process_update(self._update("/file x"))
+        mock_send.assert_called_once_with(1, "x")
+
+    def test_filex_and_file_underscore_go_to_llm_queue(self) -> None:
+        handlers.process_update(self._update("/filex hello"))
+        self.assertEqual(handlers._task_queue.qsize(), 1)
+        handlers._task_queue.get_nowait()
+        handlers._task_queue.task_done()
+
+        handlers.process_update(self._update("/file_ hello"))
+        self.assertEqual(handlers._task_queue.qsize(), 1)
+        handlers._task_queue.get_nowait()
+        handlers._task_queue.task_done()
+
+        # /file_N as plain text now falls through to the LLM too (only the
+        # inline-keyboard callback_data "f:<id>" / "d:<id>" is special-cased).
+        handlers.process_update(self._update("/file_1"))
+        self.assertEqual(handlers._task_queue.qsize(), 1)
+
+    def test_eviction_oldest_ids_expire(self) -> None:
+        with mock.patch.object(handlers, "_LS_INDEX_MAX", 3):
+            for i in range(5):
+                handlers._ls_register("/ws/f{}.txt".format(i), False)
+            self.assertEqual(sorted(handlers._ls_index.keys()), [3, 4, 5])
+
+            handlers.process_update(self._callback_update("f:1"))
+            self.mock_answer_callback_query.assert_called_once_with(
+                "cq1", "This listing has expired — send /browse again.", show_alert=True
+            )
+
+    def test_unauthorized_file_n_text_is_silent(self) -> None:
+        handlers._ls_index[1] = ("/ws/report.csv", False)
+        handlers._ls_next_id = 2
+        handlers.process_update(self._update("/file_1", user_id=222))
+        self.mock_send_message.assert_not_called()
 
 
 if __name__ == "__main__":

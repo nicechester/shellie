@@ -79,20 +79,27 @@ bypass, 24/7 via launchd/systemd.
   MCP_SERVERS key (JSON array, secret/web-only).
 - `telegram/files.py` — attachment detection, filename sanitization, unique-path
   claiming, `save_incoming` to SHELLIE_WORKSPACE root with 0600 + collision
-  suffixes, `resolve_send_path` with .env/settings.json blocked, `send_file`;
+  suffixes, `resolve_send_path` with .env/settings.json blocked, `send_file`,
+  `resolve_dir` / `list_dir` (hidden files skipped, dirs-first casefold sort, `LS_MAX_ENTRIES=100`);
   Telegram limits 20 MB download / 50 MB upload.
-- `telegram/client.py` — call-time token URLs, long-poll get_updates (failures
-  return `{"_status", "_error"}` for backoff), `split_message` (4096, `<pre>`
-  continuity, HTML→plain retry), get_me/delete_message, `register_prechecks()`,
-  `get_file`/`download_file`/`send_document` (multipart, call-time token, masked
-  errors).
+- `telegram/client.py` — call-time token URLs, long-poll get_updates (allowed_updates
+  now `["message", "callback_query"]`, failures return `{"_status", "_error"}` for backoff),
+  `split_message` (4096, `<pre>` continuity, HTML→plain retry), `send_message` with
+  optional reply_markup (attached on last chunk only), `edit_message_text` (returns True
+  on ok or "message is not modified" 400), `answer_callback_query` (try/except, log at
+  DEBUG), get_me/delete_message, `register_prechecks()`, `get_file`/`download_file`/
+  `send_document` (multipart, call-time token, masked errors).
 - `telegram/handlers.py` — routing: auth (fail-closed; unauthorized = **silent**
   + warn log) → settings commands (`/settings /get /set /unset`, excluded from
   history) → bypass (`!`, `/sh`, `/mem`, `/reset` = context + queue drain,
   `/restart` = process exit, `/queue` = queue status + live Gemini retry/cooldown (remaining seconds, attempt), `/kill` = drain queue
   without history reset, `/systemlog [N]` = tail agent.log last N lines (default
   50, max 500); service-manager detection warns if none; `/file <path>` = send
-  file to user, `/continue` / `/discard` = resume/drop unfinished task from task
+  file to user, `/browse [path]` = inline-keyboard directory listing (one button per row,
+  ≤98 entries + parent `⬆️ ..` row; folders `d:<id>` edit listing in place, files
+  `f:<id>` answer callback then send via send_file; callback auth on from.id fail-closed
+  SILENT; index map ≤1000 ids referenced from callback_data, ids only increment, cleared
+  by `/reset`), `/continue` / `/discard` = resume/drop unfinished task from task
   file; uploads saved to SHELLIE_WORKSPACE + upload-note queue (max 5) prefixes
   next LLM message) → LLM track (FC loop:
   all functionCalls answered in one user-role turn, FC_MAX_LOOPS cap (1–50, default 15) + repeat-loop detection (3 identical call+result iterations) → tools-disabled wrap-up call (toolConfig NONE), turn preserved in history;
@@ -165,7 +172,9 @@ Phases 0–9 all implemented; issue #4 v1+v2 (auto-continuation + task persisten
   wrap-up). Tests: tests/test_tasks.py (new), ContinuationTests +
   TaskCommandTests in test_handlers.py, settings boundary tests.
 - Issue #16 implemented: Telegram file transfer (upload to SHELLIE_WORKSPACE, `/file`
-  bypass command + `send_file` LLM tool, streaming 64KB, no new settings keys).
+  bypass command + `send_file` LLM tool, streaming 64KB, no new settings keys);
+  `/browse` inline-keyboard UI (callback_query handling added to allowed_updates,
+  `answer_callback_query` + `edit_message_text` support).
 - Issue #13 open: OpenAI-compatible LLM backend support.
 
 Outstanding:

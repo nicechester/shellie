@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.agent.config import BASE_DIR, SETTINGS_FILE, SHELLIE_WORKSPACE
 from src.agent.telegram.client import download_file, get_file, send_chat_action, send_document
@@ -15,6 +15,7 @@ TG_DOWNLOAD_MAX_BYTES = 20 * 1024 * 1024
 TG_UPLOAD_MAX_BYTES = 50 * 1024 * 1024
 CAPTION_MAX = 1024
 _MAX_NAME_BYTES = 200
+LS_MAX_ENTRIES = 100
 
 
 def _default_name(kind: str) -> str:
@@ -181,7 +182,7 @@ def format_size(n: int) -> str:
     return "{:.1f} MB".format(mb)
 
 
-def resolve_send_path(raw: str) -> Tuple[Optional[str], Optional[str]]:
+def _normalize_path(raw: str) -> Tuple[Optional[str], Optional[str]]:
     if not isinstance(raw, str):
         return None, "Empty path"
     s = raw.strip()
@@ -193,6 +194,18 @@ def resolve_send_path(raw: str) -> Tuple[Optional[str], Optional[str]]:
     expanded = os.path.expanduser(s)
     joined = os.path.join(SHELLIE_WORKSPACE, expanded)
     path = os.path.realpath(joined)
+    return path, None
+
+
+def resolve_send_path(raw: str) -> Tuple[Optional[str], Optional[str]]:
+    path, err = _normalize_path(raw)
+    if err:
+        return None, err
+
+    # Reconstruct s for error messages (must match _normalize_path logic)
+    s = raw.strip()
+    if len(s) >= 2 and ((s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")):
+        s = s[1:-1].strip()
 
     if not os.path.exists(path):
         return None, "File not found: {}".format(s)
@@ -215,6 +228,61 @@ def resolve_send_path(raw: str) -> Tuple[Optional[str], Optional[str]]:
         return None, "File is too large (max {})".format(format_size(TG_UPLOAD_MAX_BYTES))
 
     return path, None
+
+
+def resolve_dir(raw: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    if raw is None or not raw.strip():
+        return os.path.realpath(SHELLIE_WORKSPACE), None
+
+    path, error = _normalize_path(raw)
+    if error:
+        return None, error
+
+    stripped_raw = raw.strip()
+    if not os.path.exists(path):
+        return None, "Not found: {}".format(stripped_raw)
+    if not os.path.isdir(path):
+        return None, "Not a directory: {} — use /file".format(stripped_raw)
+
+    return path, None
+
+
+def list_dir(path: str, limit: int = LS_MAX_ENTRIES) -> Tuple[List[Dict[str, Any]], int, Optional[str]]:
+    try:
+        with os.scandir(path) as entries_iter:
+            entries = []
+            for entry in entries_iter:
+                if entry.name.startswith('.'):
+                    continue
+
+                is_dir = False
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=True)
+                except OSError:
+                    pass
+
+                size = None
+                if not is_dir:
+                    try:
+                        size = entry.stat().st_size
+                    except OSError:
+                        pass
+
+                entries.append({
+                    "name": entry.name,
+                    "path": os.path.join(path, entry.name),
+                    "is_dir": is_dir,
+                    "size": size,
+                })
+    except OSError as exc:
+        return [], 0, str(exc)
+
+    entries.sort(key=lambda e: (not e["is_dir"], e["name"].casefold()))
+
+    total_visible = len(entries)
+    limited_entries = entries[:limit]
+
+    return limited_entries, total_visible, None
 
 
 def send_file(chat_id: int, raw_path: str, caption: Optional[str] = None) -> Tuple[bool, str]:
