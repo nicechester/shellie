@@ -197,10 +197,36 @@ def _execute_web_search_run(args: Dict[str, Any]) -> str:
     return call_web_search(str(args.get("query", "")))
 
 
+def _send_file_declaration() -> Dict[str, Any]:
+    return {
+        "name": "send_file",
+        "description": "Sends a file from the host machine to the user in this Telegram chat as a document (max 50 MB). Use it when the user asks for a file, or to deliver a file you generated. Directories must be archived first (e.g. zip).",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "path": {
+                    "type": "STRING",
+                    "description": "Path to the file, relative to the working directory/workspace or absolute",
+                },
+                "caption": {
+                    "type": "STRING",
+                    "description": "Short plain-text caption",
+                },
+            },
+            "required": ["path"],
+        },
+    }
+
+
+def _send_file_run(args: Dict[str, Any]) -> str:
+    return "send_file is only available inside a Telegram chat."
+
+
 TOOL_REGISTRY: List[ToolEntry] = [
     ToolEntry("execute_shell", _execute_shell_declaration, _execute_shell_run),
     ToolEntry("append_memory", _append_memory_declaration, _append_memory_run),
     ToolEntry("execute_web_search", _execute_web_search_declaration, _execute_web_search_run),
+    ToolEntry("send_file", _send_file_declaration, _send_file_run),
 ]
 
 

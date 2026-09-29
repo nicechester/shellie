@@ -4,7 +4,7 @@ import logging
 from typing import Dict, List, Optional
 
 from src.agent.config import settings
-from src.agent.utils.http import http_post
+from src.agent.utils.http import http_download, http_post, http_post_multipart
 
 _LOGGER = logging.getLogger("shellie.telegram.client")
 
@@ -181,6 +181,65 @@ def get_me(token: Optional[str] = None, timeout: int = 10) -> Dict:
 
     if status != 200 or not response.get("ok"):
         return {"_status": status, "_error": mask_token(str(response.get("error", "")))}
+
+    return response
+
+
+def _file_url(file_path: str, token: str) -> str:
+    """Build a Telegram file-download URL. Contains the bot token — never log
+    the return value."""
+    return "https://api.telegram.org/file/bot{}/{}".format(token, file_path)
+
+
+def get_file(file_id: str) -> Dict:
+    token = settings.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        return {"_status": 0, "_error": "token not set"}
+
+    url = _api_url("getFile", token)
+    response, status = http_post(url, {"file_id": file_id})
+
+    if status != 200 or not response.get("ok"):
+        error_str = str(response.get("description") or response.get("error", ""))
+        masked_error = mask_token(error_str)
+        _LOGGER.warning("getFile failed: status=%d error=%s", status, masked_error)
+        return {"_status": status, "_error": masked_error}
+
+    return response
+
+
+def download_file(file_path: str, fileobj, max_bytes: int) -> Optional[str]:
+    token = settings.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        return "token not set"
+
+    url = _file_url(file_path, token)
+    status, _n, error = http_download(url, fileobj, max_bytes)
+
+    if error:
+        return mask_token(error)
+    if status != 200:
+        return mask_token("HTTP {}".format(status))
+    return None
+
+
+def send_document(chat_id: int, path: str, filename: str, caption: Optional[str] = None) -> Dict:
+    token = settings.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        return {"_status": 0, "_error": "token not set"}
+
+    fields: Dict[str, str] = {"chat_id": str(chat_id)}
+    if caption:
+        fields["caption"] = caption
+
+    url = _api_url("sendDocument", token)
+    response, status = http_post_multipart(url, fields, "document", path, filename)
+
+    if status != 200 or not response.get("ok"):
+        error_str = str(response.get("description") or response.get("error", ""))
+        masked_error = mask_token(error_str)
+        _LOGGER.warning("send_document failed: status=%d error=%s", status, masked_error)
+        return {"_status": status, "_error": masked_error}
 
     return response
 

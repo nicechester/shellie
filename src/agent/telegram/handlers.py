@@ -17,6 +17,7 @@ from src.agent.core import tasks
 from src.agent.core.gemini import call_gemini, get_retry_status, parse_response, run_tool
 from src.agent.core.memory import read_memory
 from src.agent.core.shell import execute_shell
+from src.agent.telegram import files as tg_files
 from src.agent.telegram.client import delete_message, send_chat_action, send_message
 
 _LOGGER = logging.getLogger("shellie.telegram.handlers")
@@ -33,10 +34,16 @@ _task_lock = threading.Lock()
 _task_epoch: int = 0
 _active_continuation: int = 0  # worker writes; /queue reads (best-effort, no lock)
 
+# Pending "[system] uploaded file" notes to prepend to the next LLM message.
+# Only touched by the main (polling) thread — process_update and its helpers
+# run there, never from the queue worker thread.
+_pending_upload_notes: List[str] = []
+_MAX_PENDING_UPLOAD_NOTES = 5
+
 _SETTINGS_TOKENS = ("/settings", "/get", "/set", "/unset")
 _BYPASS_TOKENS = (
     "/mem", "/restart", "/reset", "/sh", "/help", "/queue", "/kill", "/systemlog",
-    "/continue", "/discard",
+    "/continue", "/discard", "/file",
 )
 
 _HELP_TEXT = (
@@ -50,6 +57,7 @@ _HELP_TEXT = (
     "<code>/continue</code> — resume the unfinished task\n"
     "<code>/discard</code> — drop the unfinished task\n"
     "<code>/systemlog [N]</code> — show last N lines of agent.log (default 50)\n"
+    "<code>/file &lt;path&gt;</code> — send a file from the host\n"
     "<code>/help</code> — show this message\n"
     "\n"
     "<b>Settings commands</b>\n"
@@ -57,6 +65,9 @@ _HELP_TEXT = (
     "<code>/get KEY</code> — detail for one key\n"
     "<code>/set KEY VALUE</code> — apply an override\n"
     "<code>/unset KEY</code> — remove an override\n"
+    "\n"
+    "<b>Files</b>\n"
+    "Files sent to the bot (documents, photos, videos, audio, voice notes) are saved to the workspace.\n"
     "\n"
     "<b>Anything else</b> — sent to Gemini LLM"
 )
@@ -87,9 +98,6 @@ def process_update(update: Dict[str, Any]) -> None:
     message = update.get("message")
     if not isinstance(message, dict):
         return
-    text = message.get("text")
-    if not isinstance(text, str) or not text:
-        return
     chat = message.get("chat")
     if not isinstance(chat, dict) or "id" not in chat:
         return
@@ -101,16 +109,63 @@ def process_update(update: Dict[str, Any]) -> None:
     user_id = from_user["id"]
     message_id = message.get("message_id")
 
+    # Auth check comes before anything else (fail-closed, silent) so that
+    # files from other users are never downloaded.
     allowed = settings.get("ALLOWED_USER_ID")
     if allowed is None or user_id != allowed:
         _LOGGER.warning("Unauthorized access: user_id=%s", user_id)
+        return
+
+    att = tg_files.extract_attachment(message)
+    if att is not None:
+        _handle_incoming_file(chat_id, user_id, message, att)
+        return
+
+    text = message.get("text")
+    if not isinstance(text, str) or not text:
         return
 
     if _handle_settings_command(chat_id, message_id, text):
         return
     if _handle_bypass_command(chat_id, text):
         return
+    text = _consume_upload_notes(text)
     _task_queue.put(_QueueItem(chat_id, text, user_id=user_id))
+
+
+def _consume_upload_notes(text: str) -> str:
+    if not _pending_upload_notes:
+        return text
+    combined = "\n".join(_pending_upload_notes) + "\n\n" + text
+    _pending_upload_notes.clear()
+    return combined
+
+
+def _handle_incoming_file(
+    chat_id: int, user_id: int, message: Dict[str, Any], att: Dict[str, Any]
+) -> None:
+    send_chat_action(chat_id)
+    path, err = tg_files.save_incoming(att)
+    if err:
+        send_message(chat_id, "⚠️ Upload failed: {}".format(_esc(err)))
+        return
+
+    try:
+        size = os.path.getsize(path)
+        size_str = tg_files.format_size(size)
+    except OSError:
+        size_str = "?"
+
+    send_message(chat_id, "📥 Saved: <code>{}</code> ({})".format(_esc(path), size_str))
+
+    _pending_upload_notes.append(tg_files.upload_note(path, att))
+    while len(_pending_upload_notes) > _MAX_PENDING_UPLOAD_NOTES:
+        _pending_upload_notes.pop(0)
+
+    caption = message.get("caption")
+    if isinstance(caption, str) and caption.strip():
+        text = _consume_upload_notes(caption)
+        _task_queue.put(_QueueItem(chat_id, text, user_id=user_id))
 
 
 def _first_token_command(text: str) -> str:
@@ -401,6 +456,7 @@ def _handle_bypass_command(chat_id: int, text: str) -> bool:
 
     if cmd == "/reset":
         _reset_history()
+        _pending_upload_notes.clear()
         drained = _drain_queue()
         msg = "🔄 Conversation context cleared."
         if drained:
@@ -474,6 +530,16 @@ def _handle_bypass_command(chat_id: int, text: str) -> bool:
 
     if cmd == "/queue":
         send_message(chat_id, _queue_status_text())
+        return True
+
+    if cmd == "/file":
+        parts = text.split(None, 1)
+        if len(parts) < 2 or not parts[1].strip():
+            send_message(chat_id, _esc("Usage: /file <path> (relative to workspace or absolute)"))
+            return True
+        ok, msg = tg_files.send_file(chat_id, parts[1])
+        if not ok:
+            send_message(chat_id, "⚠️ " + _esc(msg))
         return True
 
     return False
@@ -884,6 +950,18 @@ def _fc_wrapup(
     return final_text
 
 
+def _run_tool_for_chat(chat_id: int, name: str, args: Dict[str, Any]) -> str:
+    """Dispatch a single function call. send_file needs the chat_id (not
+    exposed to the model), so it is intercepted here rather than routed
+    through the generic run_tool registry."""
+    if name == "send_file":
+        try:
+            return tg_files.send_file(chat_id, str(args.get("path", "")), args.get("caption") or None)[1]
+        except Exception as exc:
+            return "Error: {}".format(exc)
+    return run_tool(name, args)
+
+
 def _run_llm_turn(
     chat_id: int,
     contents: List[Dict[str, Any]],
@@ -928,7 +1006,7 @@ def _run_llm_turn(
             triples: List[Tuple[str, Dict[str, Any], Any]] = []
             for name, args in parsed.function_calls:
                 _LOGGER.info("tool_call name=%s args=%r", name, args)
-                result = run_tool(name, args)
+                result = _run_tool_for_chat(chat_id, name, args)
                 _LOGGER.info("tool_result name=%s result=%r", name, result[:200] if isinstance(result, str) else result)
                 response_parts.append(
                     {"functionResponse": {"name": name, "response": {"output": result}}}

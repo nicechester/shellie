@@ -9,6 +9,7 @@ from unittest import mock
 
 from src.agent.core import tasks
 from src.agent.settings import Result
+from src.agent.telegram import files
 from src.agent.telegram import handlers
 
 
@@ -75,6 +76,7 @@ class HandlersTestCase(unittest.TestCase):
         handlers._queue_active_item = None
         handlers._task_epoch = 0
         handlers._active_continuation = 0
+        handlers._pending_upload_notes.clear()
         # Drain any leftover items from a previous test.
         while not handlers._task_queue.empty():
             try:
@@ -130,6 +132,7 @@ class HandlersTestCase(unittest.TestCase):
         handlers._queue_active_item = None
         handlers._task_epoch = 0
         handlers._active_continuation = 0
+        handlers._pending_upload_notes.clear()
 
     def _drain_queue(self) -> None:
         """Process all queued LLM items synchronously by calling _handle_llm directly."""
@@ -173,6 +176,17 @@ class HandlersTestCase(unittest.TestCase):
                 "message_id": message_id,
             }
         }
+
+    def _file_update(self, chat_id=1, user_id=111, message_id=42, caption=None, kind="document"):
+        message = {
+            kind: {"file_id": "f1", "file_name": "report.csv"},
+            "chat": {"id": chat_id},
+            "from": {"id": user_id},
+            "message_id": message_id,
+        }
+        if caption is not None:
+            message["caption"] = caption
+        return {"message": message}
 
     def _base_rows(self):
         return [
@@ -1054,6 +1068,129 @@ class TaskCommandTests(HandlersTestCase):
 
         reply = self.mock_send_message.call_args[0][1]
         self.assertIn("interrupted", reply.lower())
+
+
+class FileUploadTests(HandlersTestCase):
+    """Incoming file handling (issue #16): auth gate, save, notes, caption."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._upload_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._upload_dir, ignore_errors=True)
+
+    def _att(self):
+        return {
+            "kind": "document",
+            "file_id": "f1",
+            "file_unique_id": "u1",
+            "file_size": 5,
+            "file_name": "report.csv",
+            "mime_type": "text/csv",
+        }
+
+    def _real_saved_path(self, content=b"hello") -> str:
+        path = os.path.join(self._upload_dir, "report.csv")
+        with open(path, "wb") as f:
+            f.write(content)
+        return path
+
+    def test_unauthorized_document_not_downloaded(self) -> None:
+        with mock.patch.object(files, "extract_attachment") as mock_extract, \
+                mock.patch.object(files, "save_incoming") as mock_save:
+            handlers.process_update(self._file_update(user_id=222))
+
+        mock_extract.assert_not_called()
+        mock_save.assert_not_called()
+        self.mock_send_message.assert_not_called()
+
+    def test_authorized_document_no_caption_saves_and_prepends_note(self) -> None:
+        saved_path = self._real_saved_path()
+        with mock.patch.object(files, "extract_attachment", return_value=self._att()), \
+                mock.patch.object(files, "save_incoming", return_value=(saved_path, None)), \
+                mock.patch.object(files, "upload_note", return_value="[system] note-A"):
+            handlers.process_update(self._file_update())
+
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("Saved", reply)
+        self.assertIn(saved_path, reply)
+        self.assertEqual(handlers._task_queue.qsize(), 0)
+
+        with mock.patch.object(files, "extract_attachment", return_value=None):
+            handlers.process_update(self._update("next message"))
+
+        self.assertEqual(handlers._task_queue.qsize(), 1)
+        item = list(handlers._task_queue.queue)[0]
+        self.assertTrue(item.text.startswith("[system] note-A"))
+        self.assertIn("next message", item.text)
+
+    def test_document_with_caption_queues_note_plus_caption(self) -> None:
+        saved_path = self._real_saved_path()
+        with mock.patch.object(files, "extract_attachment", return_value=self._att()), \
+                mock.patch.object(files, "save_incoming", return_value=(saved_path, None)), \
+                mock.patch.object(files, "upload_note", return_value="[system] note-B"):
+            handlers.process_update(self._file_update(caption="please summarize this"))
+
+        self.assertEqual(handlers._task_queue.qsize(), 1)
+        item = list(handlers._task_queue.queue)[0]
+        self.assertIn("[system] note-B", item.text)
+        self.assertIn("please summarize this", item.text)
+
+    def test_upload_failure_sends_warning_and_no_note(self) -> None:
+        with mock.patch.object(files, "extract_attachment", return_value=self._att()), \
+                mock.patch.object(files, "save_incoming", return_value=(None, "boom")):
+            handlers.process_update(self._file_update())
+
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("Upload failed", reply)
+        self.assertIn("boom", reply)
+        self.assertEqual(handlers._pending_upload_notes, [])
+        self.assertEqual(handlers._task_queue.qsize(), 0)
+
+    def test_reset_clears_pending_upload_notes(self) -> None:
+        handlers._pending_upload_notes.append("[system] leftover")
+        handlers.process_update(self._update("/reset"))
+        self.assertEqual(handlers._pending_upload_notes, [])
+
+
+class FileSendCommandTests(HandlersTestCase):
+    """/file bypass command (issue #16)."""
+
+    def test_file_no_arg_sends_usage(self) -> None:
+        handlers.process_update(self._update("/file"))
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("Usage: /file", reply)
+        self.assertIn("&lt;path&gt;", reply)
+
+    def test_file_with_arg_calls_send_file_and_sends_nothing_on_success(self) -> None:
+        with mock.patch.object(files, "send_file", return_value=(True, "Sent x (1.0 KB)")) as mock_send:
+            handlers.process_update(self._update("/file x"))
+
+        mock_send.assert_called_once_with(1, "x")
+        self.mock_send_message.assert_not_called()
+
+    def test_file_failure_message_is_escaped(self) -> None:
+        with mock.patch.object(files, "send_file", return_value=(False, "<bad>")):
+            handlers.process_update(self._update("/file x"))
+
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertIn("&lt;bad&gt;", reply)
+        self.assertNotIn("<bad>", reply)
+
+
+class SendFileToolRoutingTests(HandlersTestCase):
+    """send_file function-call routes to tg_files.send_file, not run_tool."""
+
+    def test_send_file_tool_call_routes_to_tg_files_with_chat_id(self) -> None:
+        fc_resp = _fc_response([("send_file", {"path": "out.csv", "caption": "here"})])
+        final_resp = _text_response("done")
+        self.mock_call_gemini.side_effect = [(fc_resp, "m1"), (final_resp, "m1")]
+
+        with mock.patch.object(files, "send_file", return_value=(True, "Sent out.csv (1.0 KB)")) as mock_send_file:
+            handlers.process_update(self._update("send the file"))
+            self._drain_queue()
+
+        mock_send_file.assert_called_once_with(1, "out.csv", "here")
+        self.mock_run_tool.assert_not_called()
 
 
 if __name__ == "__main__":

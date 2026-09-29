@@ -62,7 +62,7 @@ bypass, 24/7 via launchd/systemd.
   QuotaFailure.quotaId "PerDay" → RPD (fall back); otherwise RPM (sleep
   server-hinted delay and retry once, then fall back). `ToolEntry` registry:
   execute_shell (dynamic description) + append_memory + execute_web_search
-  (google_search grounding via SEARCH_MODEL). Hybrid skills auto-discovery —
+  (google_search grounding via SEARCH_MODEL) + send_file. Hybrid skills auto-discovery —
   `skills/*.py` (first docstring line) AND `skills/*.md` procedure docs (first
   non-empty line, `#` stripped, 80 chars; README.md and `_`-prefixed excluded);
   only the one-line summary goes into the system prompt, the LLM `cat`s the full
@@ -77,16 +77,24 @@ bypass, 24/7 via launchd/systemd.
   config fingerprint, tools exposed as `mcp_<server>_<tool>`. **No stdio, no
   OAuth, no SSE** (SSE servers skipped with a warning). Configured via
   MCP_SERVERS key (JSON array, secret/web-only).
+- `telegram/files.py` — attachment detection, filename sanitization, unique-path
+  claiming, `save_incoming` to SHELLIE_WORKSPACE root with 0600 + collision
+  suffixes, `resolve_send_path` with .env/settings.json blocked, `send_file`;
+  Telegram limits 20 MB download / 50 MB upload.
 - `telegram/client.py` — call-time token URLs, long-poll get_updates (failures
   return `{"_status", "_error"}` for backoff), `split_message` (4096, `<pre>`
-  continuity, HTML→plain retry), get_me/delete_message, `register_prechecks()`.
+  continuity, HTML→plain retry), get_me/delete_message, `register_prechecks()`,
+  `get_file`/`download_file`/`send_document` (multipart, call-time token, masked
+  errors).
 - `telegram/handlers.py` — routing: auth (fail-closed; unauthorized = **silent**
   + warn log) → settings commands (`/settings /get /set /unset`, excluded from
   history) → bypass (`!`, `/sh`, `/mem`, `/reset` = context + queue drain,
   `/restart` = process exit, `/queue` = queue status + live Gemini retry/cooldown (remaining seconds, attempt), `/kill` = drain queue
   without history reset, `/systemlog [N]` = tail agent.log last N lines (default
-  50, max 500); service-manager detection warns if none; `/continue` / `/discard`
-  = resume/drop unfinished task from task file) → LLM track (FC loop:
+  50, max 500); service-manager detection warns if none; `/file <path>` = send
+  file to user, `/continue` / `/discard` = resume/drop unfinished task from task
+  file; uploads saved to SHELLIE_WORKSPACE + upload-note queue (max 5) prefixes
+  next LLM message) → LLM track (FC loop:
   all functionCalls answered in one user-role turn, FC_MAX_LOOPS cap (1–50, default 15) + repeat-loop detection (3 identical call+result iterations) → tools-disabled wrap-up call (toolConfig NONE), turn preserved in history;
   on reaching FC_MAX_LOOPS, auto-continuation up to FC_MAX_CONTINUATIONS times,
   epoch-guarded, task state persisted; CONTEXT_TURNS pairs + IDLE_RESET_MINUTES idle reset). Task queue: LLM messages
@@ -156,6 +164,8 @@ Phases 0–9 all implemented; issue #4 v1+v2 (auto-continuation + task persisten
   continuation prompts are self-contained (embed original request + last
   wrap-up). Tests: tests/test_tasks.py (new), ContinuationTests +
   TaskCommandTests in test_handlers.py, settings boundary tests.
+- Issue #16 implemented: Telegram file transfer (upload to SHELLIE_WORKSPACE, `/file`
+  bypass command + `send_file` LLM tool, streaming 64KB, no new settings keys).
 - Issue #13 open: OpenAI-compatible LLM backend support.
 
 Outstanding:
