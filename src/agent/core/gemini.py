@@ -114,16 +114,24 @@ class ToolEntry:
 
 def _execute_shell_declaration() -> Dict[str, Any]:
     env = shell.execution_environment()
-    description = "Runs a shell command on {}({}) in {}. Supports file management, script execution, etc.".format(
-        env["os"], env["arch"], env["shell"]
-    )
+    description = (
+        "Runs a shell command on {}({}) in {}. Supports file management, script execution, etc. "
+        "Pass the command exactly as it would be typed in a terminal; never backslash-escape quote "
+        "characters."
+    ).format(env["os"], env["arch"], env["shell"])
     return {
         "name": "execute_shell",
         "description": description,
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "command": {"type": "STRING", "description": "Shell command to execute"},
+                "command": {
+                    "type": "STRING",
+                    "description": (
+                        "Shell command to execute, verbatim as typed in a terminal (no added "
+                        "backslash-escaping of quotes)"
+                    ),
+                },
             },
             "required": ["command"],
         },

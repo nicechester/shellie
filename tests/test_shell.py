@@ -165,6 +165,42 @@ class ExecuteShellRealExecutionTests(unittest.TestCase):
         self.assertIn("G=unset", result)
 
 
+class ExecuteShellQuoteRepairTests(unittest.TestCase):
+    """Preflight quote-repair for over-escaped quote characters (real subprocess execution)."""
+
+    def setUp(self) -> None:
+        self._settings_patcher = mock.patch.object(shell, "settings")
+        self.mock_settings = self._settings_patcher.start()
+        self.addCleanup(self._settings_patcher.stop)
+        self.mock_settings.get.side_effect = _settings_get_factory({})
+
+    def test_over_escaped_single_quotes_repaired(self) -> None:
+        # Literal command: echo '{"q": "\'abc\' in parents"}'
+        command = "echo '{\"q\": \"\\'abc\\' in parents\"}'"
+        result = shell.execute_shell(command)
+        self.assertIn('{"q": "\'abc\' in parents"}', result)
+        self.assertIn("Auto-repaired", result)
+        self.assertNotIn("[exit", result)
+
+    def test_syntax_error_result_includes_hint(self) -> None:
+        result = shell.execute_shell('echo "')
+        self.assertIn("Hint:", result)
+        self.assertIn("[exit", result)
+
+    def test_valid_backslash_double_quote_untouched(self) -> None:
+        # Literal command: echo "say \"hi\""
+        command = 'echo "say \\"hi\\""'
+        result = shell.execute_shell(command)
+        self.assertIn('say "hi"', result)
+        self.assertNotIn("Auto-repaired", result)
+
+    def test_command_without_backslash_quotes_skips_preflight(self) -> None:
+        with mock.patch.object(shell, "_syntax_ok") as mock_syntax_ok:
+            result = shell.execute_shell("echo plain")
+        mock_syntax_ok.assert_not_called()
+        self.assertIn("plain", result)
+
+
 class ExecuteShellTimeoutTests(unittest.TestCase):
     """Timeout handling and grandchild process-group cleanup."""
 

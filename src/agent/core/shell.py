@@ -3,15 +3,27 @@ from __future__ import annotations
 import os
 import platform
 import pwd
+import re
 import signal
 import subprocess
 import sys
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 from src.agent.config import BASE_DIR, SHELLIE_WORKSPACE, settings
 from src.agent.config import parse_dotenv as _parse_dotenv
 
 _active_pgid: Optional[int] = None
+
+# Detects shell parser errors typically caused by over-escaped quotes.
+_SHELL_SYNTAX_ERROR_RE = re.compile(r"unmatched|unexpected EOF|syntax error|unterminated", re.IGNORECASE)
+
+# Hint returned to the LLM when a command fails with a shell syntax error.
+_QUOTING_HINT = (
+    "Hint: the shell rejected the command due to a quoting error. Write the command exactly "
+    "as you would type it in a terminal; do not backslash-escape quote characters (\\' or \\\"). "
+    "To embed a single quote inside a single-quoted string, close and reopen quotes ('\\''), "
+    "or wrap the whole argument in double quotes instead."
+)
 
 
 def _is_usable_shell(path: str) -> bool:
@@ -111,6 +123,53 @@ def kill_active() -> None:
         pass
 
 
+def _syntax_ok(shell_path: str, command: str) -> bool:
+    """Parse-only check (shell -n) that the command is syntactically well-formed.
+
+    Nothing is executed; this fails open (returns True) on any unexpected error
+    so a preflight problem never blocks running the original command.
+    """
+    try:
+        proc = subprocess.run(
+            [shell_path, "-n", "-c", command],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return True
+
+
+def _repair_candidates(command: str) -> List[str]:
+    """Candidate repairs for commands with over-escaped quote characters, in order of preference."""
+    return [
+        # Assume the model meant to embed a literal quote inside a single-quoted
+        # string; rewrite backslash-quote as the shell idiom '\'' (close, escaped
+        # quote, reopen).
+        command.replace("\\'", "'\\''").replace('\\"', '"'),
+        # Naive strip: just drop the stray backslash.
+        command.replace("\\'", "'").replace('\\"', '"'),
+    ]
+
+
+def _preflight_command(shell_path: str, command: str) -> Tuple[str, Optional[str]]:
+    """Detect and, if possible, auto-repair over-escaped quotes before execution.
+
+    Returns (command_to_run, repair_note). repair_note is None unless a repaired
+    candidate was substituted for the original command.
+    """
+    if "\\'" not in command and '\\"' not in command:
+        return command, None
+    if _syntax_ok(shell_path, command):
+        return command, None
+    for candidate in _repair_candidates(command):
+        if candidate != command and _syntax_ok(shell_path, candidate):
+            return candidate, "[note] Auto-repaired over-escaped quotes in the command before execution."
+    return command, None
+
+
 def execute_shell(command: str) -> str:
     global _active_pgid
 
@@ -120,6 +179,8 @@ def execute_shell(command: str) -> str:
         return str(exc)
 
     timeout = settings.get("SHELL_TIMEOUT_SEC")
+
+    command, repair_note = _preflight_command(shell, command)
 
     proc = subprocess.Popen(
         [shell, "-c", command],
@@ -161,8 +222,12 @@ def execute_shell(command: str) -> str:
         body = _combine_streams(stdout, stderr)
         if not body:
             body = "Executed successfully (no output)."
+        if proc.returncode and _SHELL_SYNTAX_ERROR_RE.search(stderr or ""):
+            body = body + "\n" + _QUOTING_HINT
         if proc.returncode:
             body = body + "\n[exit {}]".format(proc.returncode)
+        if repair_note:
+            body = repair_note + "\n" + body
         return _truncate(body)
     finally:
         _active_pgid = None
