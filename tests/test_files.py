@@ -554,6 +554,103 @@ class BuildAttachmentPartTests(FilesTestBase):
         self.assertIn("unavailable", part["text"])
 
 
+class ResolveViewTargetTests(FilesTestBase):
+    def test_jpg_is_media(self) -> None:
+        path = self._write("photo.jpg", b"\xff\xd8\xff\xe0fake-jpeg-bytes")
+        ref, err = files.resolve_view_target("photo.jpg")
+        self.assertIsNone(err)
+        self.assertEqual(ref["mode"], "media")
+        self.assertEqual(ref["mime"], "image/jpeg")
+        self.assertEqual(ref["path"], os.path.realpath(path))
+        self.assertEqual(ref["name"], "photo.jpg")
+
+    def test_pdf_is_media(self) -> None:
+        self._write("doc.pdf", b"x" * 1024)
+        ref, err = files.resolve_view_target("doc.pdf")
+        self.assertIsNone(err)
+        self.assertEqual(ref["mode"], "media")
+        self.assertEqual(ref["mime"], "application/pdf")
+
+    def test_py_file_is_text(self) -> None:
+        self._write("script.py", b"print('hi')\n")
+        ref, err = files.resolve_view_target("script.py")
+        self.assertIsNone(err)
+        self.assertEqual(ref["mode"], "text")
+
+    def test_missing_file(self) -> None:
+        ref, err = files.resolve_view_target("nope.txt")
+        self.assertIsNone(ref)
+        self.assertIn("not found", err.lower())
+
+    def test_directory_rejected(self) -> None:
+        os.makedirs(os.path.join(self.workspace_dir, "adir"))
+        ref, err = files.resolve_view_target("adir")
+        self.assertIsNone(ref)
+        self.assertIn("directory", err.lower())
+        self.assertIn("execute_shell", err)
+
+    def test_empty_file_rejected(self) -> None:
+        self._write("empty.txt", b"")
+        ref, err = files.resolve_view_target("empty.txt")
+        self.assertIsNone(ref)
+        self.assertIn("empty", err.lower())
+
+    def test_env_file_blocked(self) -> None:
+        env_path = os.path.join(self.base_dir, ".env")
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.write("SECRET=1")
+        ref, err = files.resolve_view_target(env_path)
+        self.assertIsNone(ref)
+        self.assertIn("cannot be viewed", err)
+
+    def test_settings_file_blocked(self) -> None:
+        with open(self.settings_file, "w", encoding="utf-8") as f:
+            f.write("{}")
+        ref, err = files.resolve_view_target(self.settings_file)
+        self.assertIsNone(ref)
+        self.assertIn("cannot be viewed", err)
+
+    def test_env_file_blocked_via_symlink(self) -> None:
+        env_path = os.path.join(self.base_dir, ".env")
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.write("SECRET=1")
+        link_path = os.path.join(self.workspace_dir, "link_env")
+        os.symlink(env_path, link_path)
+
+        ref, err = files.resolve_view_target("link_env")
+        self.assertIsNone(ref)
+        self.assertIn("cannot be viewed", err)
+
+    def test_6mb_pdf_too_large(self) -> None:
+        self._write("big.pdf", b"x" * (6 * 1024 * 1024))
+        ref, err = files.resolve_view_target("big.pdf")
+        self.assertIsNone(ref)
+        self.assertIn("too large to view", err)
+        self.assertIn("execute_shell", err)
+
+    def test_zip_cannot_be_viewed_directly(self) -> None:
+        self._write("archive.zip", b"PK\x03\x04")
+        ref, err = files.resolve_view_target("archive.zip")
+        self.assertIsNone(ref)
+        self.assertIn("cannot be viewed directly", err)
+        self.assertIn("execute_shell", err)
+
+    def test_relative_path_resolves_against_workspace(self) -> None:
+        path = self._write("sub/data.txt")
+        ref, err = files.resolve_view_target("sub/data.txt")
+        self.assertIsNone(err)
+        self.assertEqual(ref["path"], os.path.realpath(path))
+
+
+class ViewFilePlaceholderTests(FilesTestBase):
+    def test_placeholder_mentions_view_file(self) -> None:
+        raw = b"hello"
+        path = self._write("note.txt", raw)
+        ref = {"path": path, "name": "note.txt", "mime": "text/plain", "mode": "text", "size": len(raw)}
+        _part, placeholder = files.build_attachment_part(ref)
+        self.assertIn("view_file", placeholder)
+
+
 class HttpDownloadTests(unittest.TestCase):
     class _ChunkedResponse:
         def __init__(self, status, chunks):

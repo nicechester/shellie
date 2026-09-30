@@ -258,6 +258,13 @@ def _normalize_path(raw: str) -> Tuple[Optional[str], Optional[str]]:
     return path, None
 
 
+def _blocked_paths() -> set:
+    return {
+        os.path.realpath(os.path.join(BASE_DIR, ".env")),
+        os.path.realpath(SETTINGS_FILE),
+    }
+
+
 def resolve_send_path(raw: str) -> Tuple[Optional[str], Optional[str]]:
     path, err = _normalize_path(raw)
     if err:
@@ -275,11 +282,7 @@ def resolve_send_path(raw: str) -> Tuple[Optional[str], Optional[str]]:
     if not os.path.isfile(path):
         return None, "Not a regular file: {}".format(s)
 
-    blocked = {
-        os.path.realpath(os.path.join(BASE_DIR, ".env")),
-        os.path.realpath(SETTINGS_FILE),
-    }
-    if path in blocked:
+    if path in _blocked_paths():
         return None, "That file cannot be sent"
 
     size = os.path.getsize(path)
@@ -463,6 +466,53 @@ def classify_upload(att: Dict[str, Any], path: str, size: int) -> Tuple[str, Opt
         return "none", None, "type"
 
 
+def resolve_view_target(raw: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Resolve a path for the view_file LLM tool: same classification
+    (media/text/none) as an upload, and a ref shaped for
+    build_attachment_part. Never raises.
+    """
+    try:
+        path, err = _normalize_path(raw)
+        if err:
+            return None, err
+
+        s = raw.strip()
+        if len(s) >= 2 and ((s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")):
+            s = s[1:-1].strip()
+
+        if not os.path.exists(path):
+            return None, "File not found: {}".format(s)
+        if os.path.isdir(path):
+            return None, "{} is a directory; list it with execute_shell instead".format(s)
+        if not os.path.isfile(path):
+            return None, "Not a regular file: {}".format(s)
+
+        if path in _blocked_paths():
+            return None, "That file cannot be viewed"
+
+        size = os.path.getsize(path)
+        if size == 0:
+            return None, "File is empty"
+
+        name = os.path.basename(path)
+        att = {"file_name": name, "mime_type": None, "kind": "document"}
+        mode, mime, reason = classify_upload(att, path, size)
+
+        if mode == "none" and reason == "size":
+            return None, (
+                "{} is too large to view ({}; max 5 MB for media, 100 KB for text). "
+                "Use execute_shell to inspect parts of it."
+            ).format(name, format_size(size))
+        if mode == "none" and reason == "type":
+            return None, "{} ({}) cannot be viewed directly; use execute_shell to inspect it.".format(
+                name, mime or "unknown type"
+            )
+
+        return {"path": path, "name": name, "mime": mime, "mode": mode, "size": size}, None
+    except Exception as exc:
+        return None, str(exc)
+
+
 def build_attachment_part(ref: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
     """Build one Gemini `contents` part for an already-classified attachment.
 
@@ -475,7 +525,10 @@ def build_attachment_part(ref: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
     name = ref.get("name") or os.path.basename(str(path))
     mime = ref.get("mime")
     mode = ref.get("mode")
-    placeholder = "[attachment removed from history: {} ({}) — saved at {}]".format(name, mime, path)
+    placeholder = (
+        "[attachment removed from history: {} ({}) — saved at {} "
+        "(use view_file to look at it again)]"
+    ).format(name, mime, path)
     unavailable = {"text": "[attachment unavailable: {} could not be read or is now too large]".format(name)}
 
     cap = INLINE_MEDIA_MAX_BYTES if mode == "media" else INLINE_TEXT_MAX_BYTES

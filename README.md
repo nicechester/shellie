@@ -205,7 +205,7 @@ service for you (macOS → launchd, Linux → systemd user unit), and `chmod
 | `/discard` | Bypass (task) | Drop the unfinished task without resuming |
 | `/file <path>` | Bypass | Send a file from SHELLIE_WORKSPACE to the user |
 | `/browse [path]` | Bypass | List files in a directory with an inline-keyboard menu |
-| anything else | LLM (Gemini) | Sent with tools `execute_shell` and `append_memory`; function-calling loop up to `FC_MAX_LOOPS` iterations (or on repeat-loop detection), with final wrap-up call if limit reached, with up to `CONTEXT_TURNS` recent turns of history |
+| anything else | LLM (Gemini) | Sent with tools `execute_shell`, `append_memory`, `execute_web_search`, `send_file`, and `view_file`; function-calling loop up to `FC_MAX_LOOPS` iterations (or on repeat-loop detection), with final wrap-up call if limit reached, with up to `CONTEXT_TURNS` recent turns of history |
 
 ### Attachments (multimodal uploads)
 
@@ -221,6 +221,8 @@ When you send files via Telegram, Shellie includes them in your next Gemini mess
 - **100 KB per text file** (larger text files are saved with a path note only, not inlined).
 
 **No caption?** If you send a file without a message, Shellie replies with "What would you like me to do with it? I'll include it with your next message." — no LLM call. This reply is skipped for subsequent items in an album (media_group_id deduplication).
+
+**Files already on disk:** Files already on disk can be viewed too — ask about a file by name and the model attaches it itself via `view_file`.
 
 **History cleanup:** After each turn, attachment content is removed from conversation history and replaced with "[attachment removed from history: …]" placeholders to keep request sizes bounded. Re-send the file to ask about it again later.
 
