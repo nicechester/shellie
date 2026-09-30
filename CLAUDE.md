@@ -62,7 +62,7 @@ bypass, 24/7 via launchd/systemd.
   QuotaFailure.quotaId "PerDay" → RPD (fall back); otherwise RPM (sleep
   server-hinted delay and retry once, then fall back). `ToolEntry` registry:
   execute_shell (dynamic description) + append_memory + execute_web_search
-  (google_search grounding via SEARCH_MODEL) + send_file. Hybrid skills auto-discovery —
+  (google_search grounding via SEARCH_MODEL) + send_file + view_file. Hybrid skills auto-discovery —
   `skills/*.py` (first docstring line) AND `skills/*.md` procedure docs (first
   non-empty line, `#` stripped, 80 chars; README.md and `_`-prefixed excluded);
   only the one-line summary goes into the system prompt, the LLM `cat`s the full
@@ -111,7 +111,7 @@ bypass, 24/7 via launchd/systemd.
   file; `_pending_uploads` (lazy base64 on worker, refs only, max 5, /reset clears,
   media_group_id dedupes no-caption), _QueueItem carries refs, user turn = media parts +
   text, history stripped in place in _handle_llm's finally, task files never contain base64,
-  saved to SHELLIE_WORKSPACE) → LLM track (FC loop:
+  saved to SHELLIE_WORKSPACE) → LLM track (FC loop: `view_file` intercepted — media appended as sibling parts after the functionResponses in the same user turn, per-turn budget 5 parts / 5 MB shared with upload attachments, duplicate paths refused, results not logged, loop turns never retained in history;
   all functionCalls answered in one user-role turn, FC_MAX_LOOPS cap (1–50, default 15) + repeat-loop detection (3 identical call+result iterations) → tools-disabled wrap-up call (toolConfig NONE), turn preserved in history;
   on reaching FC_MAX_LOOPS, auto-continuation up to FC_MAX_CONTINUATIONS times,
   epoch-guarded, task state persisted; CONTEXT_TURNS pairs + IDLE_RESET_MINUTES idle reset). Task queue: LLM messages
@@ -187,6 +187,7 @@ Phases 0–9 all implemented; issue #4 v1+v2 (auto-continuation + task persisten
   `answer_callback_query` + `edit_message_text` support).
 - Issue #18 implemented: `!!` shell mode with in-place terminal message (s:exit inline button, /reset clears, not persisted).
 - Issue #6 implemented — multimodal uploads to Gemini (inlineData media + inline text files, 5MB/5-attachment/100KB caps, no-caption follow-up question, history stripping).
+- Issue #22 implemented — `view_file` tool (vision on existing workspace files; #6 history placeholders now point to view_file).
 - Issue #13 open: OpenAI-compatible LLM backend support.
 
 Outstanding:

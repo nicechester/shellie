@@ -821,6 +821,30 @@ class SendFileToolFallbackTests(unittest.TestCase):
         self.assertEqual(result, "send_file is only available inside a Telegram chat.")
 
 
+class ViewFileToolFallbackTests(unittest.TestCase):
+    """view_file (issue #22) is declared for the model, but outside a
+    Telegram chat (e.g. direct call_gemini use) it has no way to fetch
+    and process the file, so run_tool falls back to an explanatory message."""
+
+    def test_view_file_declared_in_tools_schema(self) -> None:
+        with mock.patch.object(
+            gemini.shell,
+            "execution_environment",
+            return_value={"os": "Linux", "arch": "x86_64", "shell": "/bin/bash", "cwd": "/base"},
+        ):
+            schema = gemini.build_tools_schema()
+
+        declarations = schema[0]["functionDeclarations"]
+        names = [d["name"] for d in declarations]
+        self.assertIn("view_file", names)
+        view_file_decl = next(d for d in declarations if d["name"] == "view_file")
+        self.assertIn("path", view_file_decl["parameters"]["required"])
+
+    def test_run_tool_view_file_outside_telegram_returns_fallback_message(self) -> None:
+        result = gemini.run_tool("view_file", {"path": "x"})
+        self.assertEqual(result, "view_file is only available inside a Telegram chat.")
+
+
 class ListSkillsTests(unittest.TestCase):
     def test_docstringed_private_and_syntax_error_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1470,6 +1470,271 @@ class SendFileToolRoutingTests(HandlersTestCase):
         self.mock_run_tool.assert_not_called()
 
 
+class ViewFileToolTests(HandlersTestCase):
+    """view_file LLM tool (issue #22): intercepted inside the FC loop before
+    _run_tool_for_chat/run_tool, shares the upload media budget, media parts
+    always land after all functionResponses in the batch."""
+
+    def _media_ref(self, path="/ws/a.jpg", name="a.jpg", mime="image/jpeg", size=1000, mode="media"):
+        return {"path": path, "name": name, "mime": mime, "mode": mode, "size": size}
+
+    def test_media_view_attaches_after_function_response(self) -> None:
+        ref = self._media_ref()
+        part = {"inlineData": {"mimeType": "image/jpeg", "data": "QUJD"}}
+        self.mock_build_attachment_part.return_value = (part, "placeholder")
+        fc_resp = _fc_response([("view_file", {"path": "a.jpg"})])
+        final_resp = _text_response("done")
+        self.mock_call_gemini.side_effect = [(fc_resp, "m1"), (final_resp, "m1")]
+
+        with mock.patch.object(files, "resolve_view_target", return_value=(ref, None)):
+            handlers.process_update(self._update("look at a.jpg"))
+            self._drain_queue()
+
+        self.mock_run_tool.assert_not_called()
+
+        second_call_contents = self.mock_call_gemini.call_args_list[1][0][0]
+        last_turn = second_call_contents[-1]
+        self.assertEqual(last_turn["role"], "user")
+        parts = last_turn["parts"]
+        self.assertEqual(len(parts), 3)
+        self.assertEqual(parts[0]["functionResponse"]["name"], "view_file")
+        self.assertIn("attached", parts[0]["functionResponse"]["response"]["output"])
+        self.assertEqual(parts[1], {"text": "[view_file: {}]".format(ref["path"])})
+        self.assertEqual(parts[2], part)
+
+    def test_text_view_returns_wrapped_content_no_extra_parts(self) -> None:
+        ref = self._media_ref(mode="text", mime="text/plain")
+        part = {"text": "[content of a.jpg]\n<<<\nhello\n>>>"}
+        self.mock_build_attachment_part.return_value = (part, "placeholder")
+        fc_resp = _fc_response([("view_file", {"path": "note.txt"})])
+        final_resp = _text_response("done")
+        self.mock_call_gemini.side_effect = [(fc_resp, "m1"), (final_resp, "m1")]
+
+        with mock.patch.object(files, "resolve_view_target", return_value=(ref, None)):
+            handlers._handle_llm(1, "look at note.txt")
+
+        second_call_contents = self.mock_call_gemini.call_args_list[1][0][0]
+        last_turn = second_call_contents[-1]
+        self.assertEqual(len(last_turn["parts"]), 1)
+        self.assertEqual(
+            last_turn["parts"][0]["functionResponse"]["response"]["output"], part["text"]
+        )
+
+    def test_mixed_batch_function_responses_before_media(self) -> None:
+        ref = self._media_ref()
+        part = {"inlineData": {"mimeType": "image/jpeg", "data": "QUJD"}}
+        self.mock_build_attachment_part.return_value = (part, "placeholder")
+        self.mock_run_tool.return_value = "ls-output"
+        fc_resp = _fc_response(
+            [("execute_shell", {"command": "ls"}), ("view_file", {"path": "a.jpg"})]
+        )
+        final_resp = _text_response("done")
+        self.mock_call_gemini.side_effect = [(fc_resp, "m1"), (final_resp, "m1")]
+
+        with mock.patch.object(files, "resolve_view_target", return_value=(ref, None)):
+            handlers._handle_llm(1, "do both")
+
+        parts = self.mock_call_gemini.call_args_list[1][0][0][-1]["parts"]
+        self.assertEqual(parts[0]["functionResponse"]["name"], "execute_shell")
+        self.assertEqual(parts[1]["functionResponse"]["name"], "view_file")
+        self.assertEqual(parts[2], {"text": "[view_file: {}]".format(ref["path"])})
+        self.assertEqual(parts[3], part)
+
+    def test_sixth_media_view_across_iterations_hits_budget(self) -> None:
+        self._settings_values["FC_MAX_LOOPS"] = 10
+        part = {"inlineData": {"mimeType": "image/jpeg", "data": "QUJD"}}
+        self.mock_build_attachment_part.return_value = (part, "placeholder")
+
+        def _resolve(raw):
+            return self._media_ref(path="/ws/{}".format(raw), name=raw, size=100), None
+
+        call_seq = [_fc_response([("view_file", {"path": "img{}.jpg".format(i)})]) for i in range(6)]
+        final_resp = _text_response("done")
+        self.mock_call_gemini.side_effect = [(r, "m1") for r in call_seq] + [(final_resp, "m1")]
+
+        with mock.patch.object(files, "resolve_view_target", side_effect=_resolve):
+            handlers._handle_llm(1, "view many")
+
+        self.assertEqual(self.mock_call_gemini.call_count, 7)
+        sixth_turn = self.mock_call_gemini.call_args_list[6][0][0][-1]
+        output = sixth_turn["parts"][0]["functionResponse"]["response"]["output"]
+        self.assertIn("limit", output.lower())
+        self.assertEqual(len(sixth_turn["parts"]), 1)  # no media parts appended on refusal
+
+    def test_uploaded_media_already_counts_toward_budget(self) -> None:
+        self._settings_values["FC_MAX_LOOPS"] = 10
+        refs = [
+            {"path": "/ws/u{}.jpg".format(i), "name": "u{}.jpg".format(i),
+             "mime": "image/jpeg", "mode": "media", "size": 100}
+            for i in range(3)
+        ]
+        self.mock_build_attachment_part.return_value = (
+            {"inlineData": {"mimeType": "image/jpeg", "data": "QUJD"}}, "placeholder",
+        )
+        view_ref = self._media_ref(size=100)
+        call_seq = [_fc_response([("view_file", {"path": "v{}.jpg".format(i)})]) for i in range(3)]
+        final_resp = _text_response("done")
+        self.mock_call_gemini.side_effect = [(r, "m1") for r in call_seq] + [(final_resp, "m1")]
+
+        with mock.patch.object(files, "resolve_view_target", return_value=(view_ref, None)):
+            handlers._handle_llm(1, "view stuff", attachments=refs)
+
+        self.assertEqual(self.mock_call_gemini.call_count, 4)
+        third_view_turn = self.mock_call_gemini.call_args_list[3][0][0][-1]
+        output = third_view_turn["parts"][0]["functionResponse"]["response"]["output"]
+        self.assertIn("limit", output.lower())
+
+    def test_byte_budget_refuses_second_over_total(self) -> None:
+        self._settings_values["FC_MAX_LOOPS"] = 10
+        ref_a = self._media_ref(path="/ws/a.jpg", name="a.jpg", size=3 * 1024 * 1024)
+        ref_b = self._media_ref(path="/ws/b.jpg", name="b.jpg", size=3 * 1024 * 1024)
+        part = {"inlineData": {"mimeType": "image/jpeg", "data": "QUJD"}}
+        self.mock_build_attachment_part.return_value = (part, "placeholder")
+
+        refs_by_path = {"a.jpg": ref_a, "b.jpg": ref_b}
+        fc1 = _fc_response([("view_file", {"path": "a.jpg"})])
+        fc2 = _fc_response([("view_file", {"path": "b.jpg"})])
+        final_resp = _text_response("done")
+        self.mock_call_gemini.side_effect = [(fc1, "m1"), (fc2, "m1"), (final_resp, "m1")]
+
+        with mock.patch.object(files, "resolve_view_target", side_effect=lambda raw: (refs_by_path[raw], None)):
+            handlers._handle_llm(1, "view two big files")
+
+        second_turn = self.mock_call_gemini.call_args_list[2][0][0][-1]
+        output = second_turn["parts"][0]["functionResponse"]["response"]["output"]
+        self.assertIn("limit", output.lower())
+
+    def test_same_path_twice_already_attached(self) -> None:
+        ref = self._media_ref()
+        part = {"inlineData": {"mimeType": "image/jpeg", "data": "QUJD"}}
+        self.mock_build_attachment_part.return_value = (part, "placeholder")
+        fc1 = _fc_response([("view_file", {"path": "a.jpg"})])
+        fc2 = _fc_response([("view_file", {"path": "a.jpg"})])
+        final_resp = _text_response("done")
+        self.mock_call_gemini.side_effect = [(fc1, "m1"), (fc2, "m1"), (final_resp, "m1")]
+
+        with mock.patch.object(files, "resolve_view_target", return_value=(ref, None)):
+            handlers._handle_llm(1, "view a.jpg twice")
+
+        second_turn = self.mock_call_gemini.call_args_list[2][0][0][-1]
+        output = second_turn["parts"][0]["functionResponse"]["response"]["output"]
+        self.assertIn("already attached", output)
+        self.assertEqual(len(second_turn["parts"]), 1)
+
+    def test_history_holds_only_user_turn_and_final_model_turn(self) -> None:
+        ref = self._media_ref()
+        part = {"inlineData": {"mimeType": "image/jpeg", "data": "QUJD"}}
+        self.mock_build_attachment_part.return_value = (part, "placeholder")
+        fc_resp = _fc_response([("view_file", {"path": "a.jpg"})])
+        final_resp = _text_response("done")
+        self.mock_call_gemini.side_effect = [(fc_resp, "m1"), (final_resp, "m1")]
+
+        with mock.patch.object(files, "resolve_view_target", return_value=(ref, None)):
+            handlers._handle_llm(1, "view a.jpg")
+
+        self.assertEqual(len(handlers._history), 2)
+        self.assertEqual(handlers._history[0]["role"], "user")
+        self.assertEqual(handlers._history[1]["role"], "model")
+        for turn in handlers._history:
+            for p in turn["parts"]:
+                self.assertNotIn("inlineData", p)
+
+    def test_task_file_never_contains_media_base64(self) -> None:
+        self._settings_values["FC_MAX_LOOPS"] = 1
+        ref = self._media_ref()
+        fake_b64 = "QkFTRTY0ZmFrZWRhdGE="
+        part = {"inlineData": {"mimeType": "image/jpeg", "data": fake_b64}}
+        self.mock_build_attachment_part.return_value = (part, "placeholder")
+        fc1 = _fc_response([("view_file", {"path": "a.jpg"})])
+        fc2 = _fc_response([("view_file", {"path": "a.jpg"})])
+        wrap_resp = _text_response("summary")
+        self.mock_call_gemini.side_effect = [(fc1, "m1"), (fc2, "m1"), (wrap_resp, "m1")]
+
+        saved_records = []
+        original_save = tasks.save_task
+
+        def _capture(record):
+            saved_records.append(dict(record))
+            return original_save(record)
+
+        with mock.patch.object(files, "resolve_view_target", return_value=(ref, None)), \
+                mock.patch.object(tasks, "save_task", side_effect=_capture):
+            item = handlers._QueueItem(1, "describe a.jpg", user_id=111)
+            handlers._task_queue.put(item)
+            self._drain_queue_full()
+
+        self.assertTrue(saved_records)
+        for record in saved_records:
+            self.assertNotIn(fake_b64, record.get("prompt", ""))
+            self.assertNotIn(fake_b64, record.get("last_wrapup", "") or "")
+
+    def test_view_file_text_content_never_logged(self) -> None:
+        secret_content = "TOP_SECRET_CONTENT_1234"
+        ref = self._media_ref(mode="text", mime="text/plain")
+        part = {"text": "[content of note.txt]\n<<<\n{}\n>>>".format(secret_content)}
+        self.mock_build_attachment_part.return_value = (part, "placeholder")
+        fc_resp = _fc_response([("view_file", {"path": "note.txt"})])
+        final_resp = _text_response("done")
+        self.mock_call_gemini.side_effect = [(fc_resp, "m1"), (final_resp, "m1")]
+
+        with mock.patch.object(files, "resolve_view_target", return_value=(ref, None)):
+            with self.assertLogs(handlers._LOGGER, level="INFO") as cm:
+                handlers._handle_llm(1, "view note.txt")
+
+        for line in cm.output:
+            self.assertNotIn(secret_content, line)
+
+    def test_repeat_detector_trips_on_identical_view_file_error_iterations(self) -> None:
+        self._settings_values["FC_MAX_LOOPS"] = 15
+        fc = _fc_response([("view_file", {"path": "nope.jpg"})])
+        wrap_resp = _text_response("wrap")
+        self.mock_call_gemini.side_effect = [(fc, "m1"), (fc, "m1"), (fc, "m1"), (wrap_resp, "m1")]
+
+        with mock.patch.object(
+            files, "resolve_view_target", return_value=(None, "File not found: nope.jpg")
+        ):
+            handlers._handle_llm(1, "loop view missing file")
+
+        self.assertEqual(self.mock_call_gemini.call_count, 4)
+        last_kwargs = self.mock_call_gemini.call_args_list[-1][1]
+        self.assertIs(last_kwargs["allow_tools"], False)
+
+    def test_view_file_with_execute_shell_changing_output_not_flagged(self) -> None:
+        ref = self._media_ref()
+        part = {"inlineData": {"mimeType": "image/jpeg", "data": "QUJD"}}
+        self.mock_build_attachment_part.return_value = (part, "placeholder")
+        self.mock_run_tool.side_effect = ["out-a", "out-b", "out-c"]
+        batch = _fc_response(
+            [("execute_shell", {"command": "ls"}), ("view_file", {"path": "a.jpg"})]
+        )
+        done_resp = _text_response("done")
+        self.mock_call_gemini.side_effect = [(batch, "m1"), (batch, "m1"), (batch, "m1"), (done_resp, "m1")]
+
+        with mock.patch.object(files, "resolve_view_target", return_value=(ref, None)):
+            handlers._handle_llm(1, "poll and view")
+
+        for call in self.mock_call_gemini.call_args_list:
+            self.assertNotIn("allow_tools", call[1])
+
+    def test_resolve_error_becomes_error_output_loop_continues(self) -> None:
+        fc = _fc_response([("view_file", {"path": "missing.jpg"})])
+        final_resp = _text_response("done")
+        self.mock_call_gemini.side_effect = [(fc, "m1"), (final_resp, "m1")]
+
+        with mock.patch.object(
+            files, "resolve_view_target", return_value=(None, "File not found: missing.jpg")
+        ):
+            outcome, _ = handlers._handle_llm(1, "view missing")
+
+        self.assertEqual(outcome, "done")
+        second_call_contents = self.mock_call_gemini.call_args_list[1][0][0]
+        last_turn = second_call_contents[-1]
+        self.assertEqual(
+            last_turn["parts"][0]["functionResponse"]["response"]["output"],
+            "Error: File not found: missing.jpg",
+        )
+
+
 class BrowseCommandTests(HandlersTestCase):
     """/browse and tappable inline-keyboard callbacks (issue #16 delta)."""
 

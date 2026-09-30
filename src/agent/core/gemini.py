@@ -222,11 +222,33 @@ def _send_file_run(args: Dict[str, Any]) -> str:
     return "send_file is only available inside a Telegram chat."
 
 
+def _view_file_declaration() -> Dict[str, Any]:
+    return {
+        "name": "view_file",
+        "description": "Attaches a file from the host so YOU can see or read it: images, PDFs, audio and video are attached natively; text/code files return their content. Use this whenever the user refers to an existing file by name or path (e.g. 'explain photo.jpg', 'summarize report.pdf') instead of guessing its contents. Limits per request: 5 attachments / 5 MB total; text files up to 100 KB. To deliver a file to the user, use send_file instead.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "path": {
+                    "type": "STRING",
+                    "description": "Path to the file, relative to the workspace (cwd) or absolute",
+                },
+            },
+            "required": ["path"],
+        },
+    }
+
+
+def _view_file_run(args: Dict[str, Any]) -> str:
+    return "view_file is only available inside a Telegram chat."
+
+
 TOOL_REGISTRY: List[ToolEntry] = [
     ToolEntry("execute_shell", _execute_shell_declaration, _execute_shell_run),
     ToolEntry("append_memory", _append_memory_declaration, _append_memory_run),
     ToolEntry("execute_web_search", _execute_web_search_declaration, _execute_web_search_run),
     ToolEntry("send_file", _send_file_declaration, _send_file_run),
+    ToolEntry("view_file", _view_file_declaration, _view_file_run),
 ]
 
 

@@ -1393,13 +1393,73 @@ def _fc_wrapup(
 def _run_tool_for_chat(chat_id: int, name: str, args: Dict[str, Any]) -> str:
     """Dispatch a single function call. send_file needs the chat_id (not
     exposed to the model), so it is intercepted here rather than routed
-    through the generic run_tool registry."""
+    through the generic run_tool registry. view_file is intercepted earlier,
+    in the FC loop itself (before this dispatcher is ever called), since it
+    needs the shared per-request media budget rather than just the chat_id."""
     if name == "send_file":
         try:
             return tg_files.send_file(chat_id, str(args.get("path", "")), args.get("caption") or None)[1]
         except Exception as exc:
             return "Error: {}".format(exc)
     return run_tool(name, args)
+
+
+def _initial_media_budget(user_turn: Dict[str, Any]) -> Dict[str, Any]:
+    """Seed the view_file per-request media budget from any inlineData parts
+    already present in this turn's uploads, so view_file tool calls share the
+    same MAX_INLINE_ATTACHMENTS / INLINE_MEDIA_MAX_BYTES budget as uploads."""
+    count = 0
+    total_bytes = 0
+    for part in user_turn.get("parts", []):
+        inline = part.get("inlineData") if isinstance(part, dict) else None
+        if isinstance(inline, dict):
+            data = inline.get("data")
+            if isinstance(data, str):
+                count += 1
+                total_bytes += len(data) * 3 // 4
+    return {"count": count, "bytes": total_bytes, "seen": set()}
+
+
+def _run_view_file(args: Dict[str, Any], budget: Dict[str, Any]) -> Tuple[str, List[Dict[str, Any]]]:
+    """Resolve and attach a file for the view_file LLM tool, sharing the same
+    per-request media budget as uploaded attachments. Never raises; never
+    logs file content (caller must not log the returned text either)."""
+    try:
+        ref, err = tg_files.resolve_view_target(str(args.get("path", "")))
+        if err:
+            return "Error: " + err, []
+
+        if ref["path"] in budget["seen"]:
+            return (
+                "{} is already attached earlier in this request; refer to it.".format(ref["name"]),
+                [],
+            )
+
+        over_bytes = budget["bytes"] + ref["size"] > tg_files.INLINE_MEDIA_MAX_BYTES
+        over_count = ref["mode"] == "media" and budget["count"] >= tg_files.MAX_INLINE_ATTACHMENTS
+        if over_bytes or over_count:
+            return (
+                "Error: view_file limit for this request reached (max 5 attachments / 5 MB). "
+                "Answer with what you have, or tell the user to ask again in a new message."
+            ), []
+
+        part, _placeholder = tg_files.build_attachment_part(ref)
+
+        if "inlineData" not in part:
+            budget["bytes"] += ref["size"]
+            return part["text"], []
+
+        budget["count"] += 1
+        budget["bytes"] += ref["size"]
+        budget["seen"].add(ref["path"])
+        return (
+            "The file {} ({}, {}) is attached after the tool results in this message.".format(
+                ref["name"], ref["mime"], tg_files.format_size(ref["size"])
+            ),
+            [{"text": "[view_file: {}]".format(ref["path"])}, part],
+        )
+    except Exception as exc:
+        return "Error: {}".format(exc), []
 
 
 def _run_llm_turn(
@@ -1412,6 +1472,7 @@ def _run_llm_turn(
     loop_count = 0
     last_text = ""
     on_cooldown = _make_cooldown_notifier(chat_id)
+    budget = _initial_media_budget(user_turn)
 
     trace: List[str] = []
     prev_sig: Optional[Tuple[Any, ...]] = None
@@ -1443,16 +1504,29 @@ def _run_llm_turn(
 
             contents.append(parsed.raw_content)
             response_parts = []
+            extra_parts: List[Dict[str, Any]] = []
             triples: List[Tuple[str, Dict[str, Any], Any]] = []
             for name, args in parsed.function_calls:
                 _LOGGER.info("tool_call name=%s args=%r", name, args)
-                result = _run_tool_for_chat(chat_id, name, args)
-                _LOGGER.info("tool_result name=%s result=%r", name, result[:200] if isinstance(result, str) else result)
+                if name == "view_file":
+                    # Never log view_file's result: a text file's content
+                    # (or a media attachment note) must not hit the log.
+                    result, more_parts = _run_view_file(args, budget)
+                    extra_parts.extend(more_parts)
+                    _LOGGER.info(
+                        "tool_result name=view_file attached=%s len=%d",
+                        bool(more_parts), len(result),
+                    )
+                else:
+                    result = _run_tool_for_chat(chat_id, name, args)
+                    _LOGGER.info("tool_result name=%s result=%r", name, result[:200] if isinstance(result, str) else result)
                 response_parts.append(
                     {"functionResponse": {"name": name, "response": {"output": result}}}
                 )
                 triples.append((name, args, result))
-            contents.append({"role": "user", "parts": response_parts})
+            # Media parts (from view_file) go after all functionResponses so
+            # every call in the batch is answered before any inline data.
+            contents.append({"role": "user", "parts": response_parts + extra_parts})
             loop_count += 1
 
             trace.append(",".join(name for name, _, _ in triples))
@@ -1540,6 +1614,9 @@ def _handle_llm(
             # or _fc_wrapup on success) — mutating "parts" here strips
             # inlineData/text-content from retained history with no other
             # bookkeeping. Harmless if the turn was never saved (error path).
+            # FC-loop turns (including view_file media/text parts appended
+            # inside _run_llm_turn) live only in the local `contents` list,
+            # never in `_history` — only this user_turn ever needs stripping.
             user_turn["parts"] = [{"text": p} for p in placeholders] + [{"text": text}]
 
 
