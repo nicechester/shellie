@@ -674,7 +674,7 @@ class QueueTests(HandlersTestCase):
             item = handlers._QueueItem(chat_id=1, text="test")
             handlers._process_llm_item(item)
 
-        mock_handle_llm.assert_called_once_with(1, "test")
+        mock_handle_llm.assert_called_once_with(1, "test", attachments=[])
         mock_sleep.assert_not_called()
 
     def test_process_llm_item_propagates_exceptions(self) -> None:
@@ -2390,6 +2390,303 @@ class ShellModeTests(HandlersTestCase):
 
         self.mock_execute_shell_in.assert_called_once_with("/shell ls", handlers.SHELLIE_WORKSPACE)
         self.assertIsNotNone(handlers._shell_session)
+
+
+class EnqueueScheduledTests(HandlersTestCase):
+    """enqueue_scheduled (issue #5): ticker-thread callback, touches only
+    settings.get() and the thread-safe queue."""
+
+    def _get_only_item(self):
+        item = handlers._task_queue.get_nowait()
+        handlers._task_queue.task_done()
+        return item
+
+    def test_queues_expected_fields(self) -> None:
+        entry = {"id": 7, "spec": "daily 09:00", "prompt": "say hi", "name": "Morning"}
+        ok = handlers.enqueue_scheduled(entry)
+        self.assertTrue(ok)
+        self.assertEqual(handlers._task_queue.qsize(), 1)
+        item = self._get_only_item()
+        self.assertEqual(item.chat_id, 111)
+        self.assertEqual(item.user_id, 111)
+        self.assertEqual(item.kind, "scheduled")
+        self.assertEqual(item.schedule_id, 7)
+        self.assertEqual(item.schedule_name, "Morning")
+        self.assertIn("scheduled run #7", item.text)
+        self.assertIn("(daily 09:00)", item.text)
+        self.assertIn("say hi", item.text)
+
+    def test_daily_kind_sets_history_out_true(self) -> None:
+        handlers.enqueue_scheduled({"id": 1, "spec": "daily 09:00", "prompt": "x", "name": "n"})
+        self.assertTrue(self._get_only_item().history_out)
+
+    def test_weekdays_kind_sets_history_out_true(self) -> None:
+        handlers.enqueue_scheduled({"id": 1, "spec": "weekdays 09:00", "prompt": "x", "name": "n"})
+        self.assertTrue(self._get_only_item().history_out)
+
+    def test_weekly_kind_sets_history_out_true(self) -> None:
+        handlers.enqueue_scheduled({"id": 1, "spec": "weekly mon 09:00", "prompt": "x", "name": "n"})
+        self.assertTrue(self._get_only_item().history_out)
+
+    def test_every_kind_sets_history_out_false(self) -> None:
+        handlers.enqueue_scheduled({"id": 2, "spec": "every 30m", "prompt": "poll", "name": ""})
+        self.assertFalse(self._get_only_item().history_out)
+
+    def test_hourly_kind_sets_history_out_false(self) -> None:
+        handlers.enqueue_scheduled({"id": 3, "spec": "hourly :15", "prompt": "poll", "name": ""})
+        self.assertFalse(self._get_only_item().history_out)
+
+    def test_returns_false_when_allowed_user_id_unset(self) -> None:
+        self._settings_values["ALLOWED_USER_ID"] = None
+        ok = handlers.enqueue_scheduled({"id": 1, "spec": "daily 09:00", "prompt": "x", "name": "n"})
+        self.assertFalse(ok)
+        self.assertTrue(handlers._task_queue.empty())
+
+    def test_pending_uploads_untouched(self) -> None:
+        handlers._pending_uploads.append({"path": "/x"})
+        handlers.enqueue_scheduled({"id": 1, "spec": "daily 09:00", "prompt": "x", "name": "n"})
+        self.assertEqual(len(handlers._pending_uploads), 1)
+
+
+class ScheduledProcessingTests(HandlersTestCase):
+    """_process_llm_item's kind=="scheduled" branch (issue #5)."""
+
+    def _scheduled_item(self, schedule_id=5, name="Morning", history_out=True, text="scheduled text"):
+        return handlers._QueueItem(
+            chat_id=111, text=text, user_id=111, kind="scheduled",
+            schedule_id=schedule_id, schedule_name=name, history_out=history_out,
+        )
+
+    def test_notice_sent_before_llm_call(self) -> None:
+        self.mock_call_gemini.return_value = (_text_response("done"), "m1")
+        item = self._scheduled_item(schedule_id=5, name="Morning")
+        with mock.patch.object(handlers.scheduler, "mark_finished") as mock_mf:
+            handlers._process_llm_item(item)
+        texts = self._sent_texts()
+        self.assertTrue(texts[0].startswith("⏰ Scheduled run #5"))
+        self.assertIn("Morning", texts[0])
+        mock_mf.assert_called_once_with(5)
+
+    def test_empty_slot_creates_and_completes_task(self) -> None:
+        self.mock_call_gemini.return_value = (_text_response("done"), "m1")
+        item = self._scheduled_item()
+        with mock.patch.object(handlers.scheduler, "mark_finished"):
+            handlers._process_llm_item(item)
+        self.assertIsNone(tasks.load_task())  # "done" outcome deletes the task file
+
+    def test_occupied_slot_does_not_replace_existing_task(self) -> None:
+        existing = tasks.new_task(111, 999, "existing prompt")
+        tasks.save_task(existing)
+        self.mock_call_gemini.return_value = (_text_response("done"), "m1")
+        item = self._scheduled_item()
+        with mock.patch.object(handlers.scheduler, "mark_finished"):
+            handlers._process_llm_item(item)
+        record = tasks.load_task()
+        self.assertIsNotNone(record)
+        self.assertEqual(record["task_id"], existing["task_id"])
+
+    def test_occupied_slot_limit_outcome_sends_hint(self) -> None:
+        existing = tasks.new_task(111, 999, "existing prompt")
+        tasks.save_task(existing)
+        self._settings_values["FC_MAX_LOOPS"] = 1
+        fc1 = _fc_response([("execute_shell", {"command": "ls"})])
+        fc2 = _fc_response([("execute_shell", {"command": "pwd"})])
+        wrap = _text_response("W1")
+        self.mock_call_gemini.side_effect = [(fc1, "m1"), (fc2, "m1"), (wrap, "m1")]
+        self.mock_run_tool.return_value = "out"
+        item = self._scheduled_item(schedule_id=9)
+        with mock.patch.object(handlers.scheduler, "mark_finished"):
+            handlers._process_llm_item(item)
+        texts = self._sent_texts()
+        self.assertTrue(any("Run it again with /schedule run 9" in t for t in texts))
+        # No task-chain continuation/task file for the "no task" path.
+        self.assertEqual(tasks.load_task()["task_id"], existing["task_id"])
+
+    def test_history_in_false_excludes_prior_history(self) -> None:
+        handlers._history.append({"role": "user", "parts": [{"text": "old"}]})
+        handlers._history.append({"role": "model", "parts": [{"text": "old reply"}]})
+        self.mock_call_gemini.return_value = (_text_response("done"), "m1")
+        item = self._scheduled_item(history_out=False)
+        with mock.patch.object(handlers.scheduler, "mark_finished"):
+            handlers._process_llm_item(item)
+        contents = self.mock_call_gemini.call_args[0][0]
+        self.assertEqual(len(contents), 1)
+        self.assertEqual(contents[0]["parts"][-1]["text"], "scheduled text")
+
+    def test_history_out_true_appends_to_history(self) -> None:
+        self.mock_call_gemini.return_value = (_text_response("done"), "m1")
+        item = self._scheduled_item(history_out=True)
+        with mock.patch.object(handlers.scheduler, "mark_finished"):
+            handlers._process_llm_item(item)
+        self.assertEqual(len(handlers._history), 2)
+
+    def test_history_out_false_does_not_append(self) -> None:
+        self.mock_call_gemini.return_value = (_text_response("done"), "m1")
+        item = self._scheduled_item(history_out=False)
+        with mock.patch.object(handlers.scheduler, "mark_finished"):
+            handlers._process_llm_item(item)
+        self.assertEqual(handlers._history, [])
+
+    def test_last_activity_unchanged(self) -> None:
+        handlers._last_activity = 12345.0
+        self.mock_call_gemini.return_value = (_text_response("done"), "m1")
+        item = self._scheduled_item()
+        with mock.patch.object(handlers.scheduler, "mark_finished"):
+            handlers._process_llm_item(item)
+        self.assertEqual(handlers._last_activity, 12345.0)
+
+    def test_mark_finished_called_on_success(self) -> None:
+        self.mock_call_gemini.return_value = (_text_response("done"), "m1")
+        item = self._scheduled_item(schedule_id=42)
+        with mock.patch.object(handlers.scheduler, "mark_finished") as mock_mf:
+            handlers._process_llm_item(item)
+        mock_mf.assert_called_once_with(42)
+
+    def test_mark_finished_called_even_when_an_unhandled_exception_occurs(self) -> None:
+        self.mock_send_message.side_effect = Exception("send failed")
+        item = self._scheduled_item(schedule_id=8)
+        with mock.patch.object(handlers.scheduler, "mark_finished") as mock_mf:
+            with self.assertRaises(Exception):
+                handlers._process_llm_item(item)
+        mock_mf.assert_called_once_with(8)
+
+    def test_processed_even_while_shell_mode_active(self) -> None:
+        handlers._shell_session = handlers._ShellSession(111)
+        self.mock_call_gemini.return_value = (_text_response("done"), "m1")
+        item = self._scheduled_item()
+        with mock.patch.object(handlers.scheduler, "mark_finished"):
+            handlers._process_llm_item(item)
+        self.mock_call_gemini.assert_called_once()
+
+
+class DrainQueueMarksScheduledFinishedTests(HandlersTestCase):
+    def test_kill_drains_scheduled_item_and_marks_finished(self) -> None:
+        item = handlers._QueueItem(
+            chat_id=111, text="t", user_id=111, kind="scheduled",
+            schedule_id=4, schedule_name="n", history_out=False,
+        )
+        handlers._task_queue.put(item)
+        with mock.patch.object(handlers.scheduler, "mark_finished") as mock_mf:
+            handlers.process_update(self._update("/kill"))
+        mock_mf.assert_called_once_with(4)
+
+
+class ScheduleBypassCommandTests(HandlersTestCase):
+    """/schedule bypass command (issue #5)."""
+
+    def test_bare_schedule_lists_when_empty(self) -> None:
+        with mock.patch.object(handlers.scheduler, "list_entries", return_value=[]):
+            handlers.process_update(self._update("/schedule"))
+        self.assertEqual(self._sent_texts()[-1], "No schedules.")
+
+    def test_list_output_is_escaped(self) -> None:
+        with mock.patch.object(handlers.scheduler, "list_entries", return_value=[{"id": 1}]), \
+             mock.patch.object(handlers.scheduler, "format_list", return_value="#1 <b>x</b>"):
+            handlers.process_update(self._update("/schedule list"))
+        reply = self._sent_texts()[-1]
+        self.assertIn("&lt;b&gt;x&lt;/b&gt;", reply)
+        self.assertNotIn("<b>x</b>", reply)
+
+    def test_add_success(self) -> None:
+        with mock.patch.object(
+            handlers.scheduler, "split_spec_prompt",
+            return_value=({"kind": "daily", "text": "daily 09:00"}, "prompt text", None),
+        ), mock.patch.object(
+            handlers.scheduler, "add",
+            return_value=(True, "OK: schedule #3 added — next run Tue 09:00 (in 13h)"),
+        ) as mock_add:
+            handlers.process_update(self._update("/schedule add daily 09:00 prompt text"))
+        mock_add.assert_called_once()
+        reply = self._sent_texts()[-1]
+        self.assertTrue(reply.startswith("✅ "))
+        self.assertIn("schedule #3 added", reply)
+        self.assertNotIn("OK:", reply)
+
+    def test_add_error_is_escaped(self) -> None:
+        with mock.patch.object(
+            handlers.scheduler, "split_spec_prompt",
+            return_value=(None, None, "Invalid interval '5m': expected N followed by m or h"),
+        ):
+            handlers.process_update(self._update("/schedule add every 5m prompt"))
+        reply = self._sent_texts()[-1]
+        self.assertTrue(reply.startswith("⚠️ "))
+        self.assertIn("Invalid interval", reply)
+
+    def test_rm_unknown_id(self) -> None:
+        with mock.patch.object(
+            handlers.scheduler, "remove", return_value=(False, "Unknown schedule id: 99")
+        ):
+            handlers.process_update(self._update("/schedule rm 99"))
+        reply = self._sent_texts()[-1]
+        self.assertTrue(reply.startswith("⚠️ "))
+        self.assertIn("Unknown schedule id", reply)
+
+    def test_on_unknown_id(self) -> None:
+        with mock.patch.object(
+            handlers.scheduler, "set_enabled", return_value=(False, "Unknown schedule id: 5")
+        ) as mock_set:
+            handlers.process_update(self._update("/schedule on 5"))
+        mock_set.assert_called_once_with(5, True)
+        reply = self._sent_texts()[-1]
+        self.assertIn("Unknown schedule id", reply)
+
+    def test_off_unknown_id(self) -> None:
+        with mock.patch.object(
+            handlers.scheduler, "set_enabled", return_value=(False, "Unknown schedule id: 5")
+        ) as mock_set:
+            handlers.process_update(self._update("/schedule off 5"))
+        mock_set.assert_called_once_with(5, False)
+
+    def test_run_runs_now_and_enqueues(self) -> None:
+        entry = {"id": 2, "spec": "daily 09:00", "prompt": "p", "name": "n"}
+        with mock.patch.object(handlers.scheduler, "run_now", return_value=entry) as mock_run_now, \
+             mock.patch.object(handlers, "enqueue_scheduled", return_value=True) as mock_enqueue:
+            handlers.process_update(self._update("/schedule run 2"))
+        mock_run_now.assert_called_once_with(2)
+        mock_enqueue.assert_called_once_with(entry)
+        reply = self._sent_texts()[-1]
+        self.assertIn("Running schedule #2", reply)
+
+    def test_run_unknown_or_in_flight(self) -> None:
+        with mock.patch.object(handlers.scheduler, "run_now", return_value=None):
+            handlers.process_update(self._update("/schedule run 999"))
+        reply = self._sent_texts()[-1]
+        self.assertIn("unknown id or already running", reply)
+
+    def test_unknown_subcommand_shows_usage_with_grammar(self) -> None:
+        handlers.process_update(self._update("/schedule bogus"))
+        reply = self._sent_texts()[-1]
+        self.assertIn("Usage", reply)
+        self.assertIn("15 minutes", reply)
+
+    def test_llm_is_never_called(self) -> None:
+        with mock.patch.object(handlers.scheduler, "list_entries", return_value=[]):
+            handlers.process_update(self._update("/schedule"))
+        self.mock_call_gemini.assert_not_called()
+        self.assertEqual(handlers._task_queue.qsize(), 0)
+
+
+class ManageScheduleNoticeTests(HandlersTestCase):
+    """_run_tool_for_chat's manage_schedule visibility notice (issue #5)."""
+
+    def test_ok_result_sends_notice(self) -> None:
+        self.mock_run_tool.return_value = "OK: schedule #1 added"
+        result = handlers._run_tool_for_chat(111, "manage_schedule", {"action": "add"})
+        self.assertEqual(result, "OK: schedule #1 added")
+        texts = self._sent_texts()
+        self.assertTrue(any(t.startswith("🗓️ ") for t in texts))
+        self.assertTrue(any("OK: schedule #1 added" in t for t in texts))
+
+    def test_list_result_sends_no_notice(self) -> None:
+        self.mock_run_tool.return_value = "No schedules."
+        result = handlers._run_tool_for_chat(111, "manage_schedule", {"action": "list"})
+        self.assertEqual(result, "No schedules.")
+        self.mock_send_message.assert_not_called()
+
+    def test_error_result_sends_no_notice(self) -> None:
+        self.mock_run_tool.return_value = "Error: unknown action foo"
+        handlers._run_tool_for_chat(111, "manage_schedule", {"action": "foo"})
+        self.mock_send_message.assert_not_called()
 
 
 if __name__ == "__main__":

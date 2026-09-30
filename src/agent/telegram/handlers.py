@@ -13,7 +13,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from src.agent.config import settings, SHELLIE_WORKSPACE
-from src.agent.core import tasks
+from src.agent.core import scheduler, tasks
 from src.agent.core.gemini import call_gemini, get_retry_status, parse_response, run_tool
 from src.agent.core.memory import read_memory
 from src.agent.core.shell import execute_shell, execute_shell_in
@@ -98,7 +98,7 @@ _SHELL_DELETE_INPUT = True
 _SETTINGS_TOKENS = ("/settings", "/get", "/env", "/set", "/unset")
 _BYPASS_TOKENS = (
     "/mem", "/restart", "/reset", "/sh", "/help", "/queue", "/kill", "/systemlog",
-    "/continue", "/discard", "/file", "/browse", "/shell",
+    "/continue", "/discard", "/file", "/browse", "/shell", "/schedule",
 )
 
 _HELP_TEXT = (
@@ -116,6 +116,7 @@ _HELP_TEXT = (
     "<code>/systemlog [N]</code> — show last N lines of agent.log (default 50)\n"
     "<code>/file &lt;path&gt;</code> — send a file from the host\n"
     "<code>/browse [path]</code> — browse files; tap a file to download it, a folder to open it\n"
+    "<code>/schedule [list|add|rm|on|off|run] ...</code> — manage recurring/one-shot scheduled prompts\n"
     "<code>/help</code> — show this message\n"
     "\n"
     "<b>Settings commands</b>\n"
@@ -144,9 +145,11 @@ def _drain_queue() -> int:
     drained = 0
     while True:
         try:
-            _task_queue.get_nowait()
+            item: _QueueItem = _task_queue.get_nowait()
             _task_queue.task_done()
             drained += 1
+            if item.kind == "scheduled" and item.schedule_id is not None:
+                scheduler.mark_finished(item.schedule_id)
         except queue.Empty:
             break
     return drained
@@ -840,6 +843,116 @@ def _run_shell_bypass(chat_id: int, command: str) -> None:
     send_message(chat_id, "<pre>{}</pre>".format(html.escape(output)))
 
 
+# ---------------------------------------------------------------------------
+# /schedule bypass command (issue #5): manage recurring/one-shot scheduled
+# prompts. All output HTML-escaped (D5).
+# ---------------------------------------------------------------------------
+
+_SCHEDULE_USAGE = (
+    "Usage:\n"
+    "<code>/schedule</code> or <code>/schedule list</code> — list schedules\n"
+    "<code>/schedule add &lt;spec&gt; &lt;prompt&gt;</code> — add a schedule\n"
+    "<code>/schedule rm &lt;id&gt;</code> — remove a schedule\n"
+    "<code>/schedule on|off &lt;id&gt;</code> — enable/disable a schedule\n"
+    "<code>/schedule run &lt;id&gt;</code> — run a schedule now\n"
+    "\n"
+    "Spec grammar (local time, minimum interval 15 minutes):\n"
+    "<code>daily HH:MM[,HH:MM...]</code>\n"
+    "<code>weekdays HH:MM[,HH:MM...]</code>\n"
+    "<code>weekly mon,tue,... HH:MM[,HH:MM...]</code>\n"
+    "<code>hourly :MM</code>\n"
+    "<code>every N(m|h)</code>\n"
+    "<code>at YYYY-MM-DD HH:MM</code> (one-shot)"
+)
+
+
+def _strip_ok_prefix(message: str) -> str:
+    return message[len("OK: "):] if message.startswith("OK: ") else message
+
+
+def _send_schedule_result(chat_id: int, ok: bool, message: str) -> None:
+    prefix = "✅ " if ok else "⚠️ "
+    send_message(chat_id, prefix + _esc(_strip_ok_prefix(message) if ok else message))
+
+
+def _parse_schedule_id(arg: str) -> Optional[int]:
+    try:
+        return int(arg.strip())
+    except (ValueError, AttributeError):
+        return None
+
+
+def _schedule_id_action(
+    chat_id: int, arg: str, action: Callable[[int], Tuple[bool, str]]
+) -> None:
+    sid = _parse_schedule_id(arg)
+    if sid is None:
+        send_message(chat_id, _SCHEDULE_USAGE)
+        return
+    ok, message = action(sid)
+    _send_schedule_result(chat_id, ok, message)
+
+
+def _handle_schedule_run(chat_id: int, arg: str) -> None:
+    sid = _parse_schedule_id(arg)
+    if sid is None:
+        send_message(chat_id, _SCHEDULE_USAGE)
+        return
+    entry = scheduler.run_now(sid)
+    if entry is None:
+        send_message(chat_id, "⚠️ unknown id or already running")
+        return
+    if not enqueue_scheduled(entry):
+        # Mirrors the ticker's own cleanup (tick()): an enqueue that never
+        # actually queues anything must not leave the id stuck in-flight.
+        scheduler.mark_finished(sid)
+        send_message(chat_id, "⚠️ Failed to queue the run (no ALLOWED_USER_ID configured).")
+        return
+    send_message(chat_id, "✅ Running schedule #{} now.".format(sid))
+
+
+def _handle_schedule_command(chat_id: int, text: str) -> None:
+    parts = text.split(None, 1)
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    rest_tokens = rest.split(None, 1)
+    sub = rest_tokens[0].lower() if rest_tokens else "list"
+
+    if sub == "list":
+        entries = scheduler.list_entries()
+        if not entries:
+            send_message(chat_id, "No schedules.")
+            return
+        send_message(chat_id, "<pre>{}</pre>".format(_esc(scheduler.format_list(entries))))
+        return
+
+    if sub == "add":
+        spec_and_prompt = rest_tokens[1] if len(rest_tokens) > 1 else ""
+        parsed, prompt, err = scheduler.split_spec_prompt(spec_and_prompt)
+        if err:
+            send_message(chat_id, "⚠️ " + _esc(err))
+            return
+        ok, message = scheduler.add(parsed, prompt)
+        _send_schedule_result(chat_id, ok, message)
+        return
+
+    arg = rest_tokens[1].strip() if len(rest_tokens) > 1 else ""
+
+    if sub in ("rm", "remove"):
+        _schedule_id_action(chat_id, arg, scheduler.remove)
+        return
+    if sub in ("on", "enable"):
+        _schedule_id_action(chat_id, arg, lambda sid: scheduler.set_enabled(sid, True))
+        return
+    if sub in ("off", "disable"):
+        _schedule_id_action(chat_id, arg, lambda sid: scheduler.set_enabled(sid, False))
+        return
+    if sub == "run":
+        _handle_schedule_run(chat_id, arg)
+        return
+
+    send_message(chat_id, _SCHEDULE_USAGE)
+
+
 def _handle_restart(chat_id: int) -> None:
     has_systemd = bool(os.environ.get("INVOCATION_ID"))
     xpc = os.environ.get("XPC_SERVICE_NAME")
@@ -979,6 +1092,10 @@ def _handle_bypass_command(chat_id: int, text: str) -> bool:
         _send_listing(chat_id, parts[1] if len(parts) > 1 else None)
         return True
 
+    if cmd == "/schedule":
+        _handle_schedule_command(chat_id, text)
+        return True
+
     return False
 
 
@@ -1017,7 +1134,10 @@ def _markdown_to_html(text: str) -> str:
 
 
 class _QueueItem:
-    __slots__ = ("chat_id", "text", "user_id", "kind", "task_id", "attachments")
+    __slots__ = (
+        "chat_id", "text", "user_id", "kind", "task_id", "attachments",
+        "schedule_id", "schedule_name", "history_out",
+    )
 
     def __init__(
         self,
@@ -1027,6 +1147,9 @@ class _QueueItem:
         kind: str = "message",
         task_id: Optional[str] = None,
         attachments: Optional[List[Dict[str, Any]]] = None,
+        schedule_id: Optional[int] = None,
+        schedule_name: Optional[str] = None,
+        history_out: bool = True,
     ) -> None:
         self.chat_id = chat_id
         self.text = text
@@ -1034,10 +1157,48 @@ class _QueueItem:
         self.kind = kind
         self.task_id = task_id
         self.attachments = list(attachments or [])
+        self.schedule_id = schedule_id
+        self.schedule_name = schedule_name
+        self.history_out = history_out
 
 
 _task_queue: queue.Queue = queue.Queue()  # unbounded
 _queue_active_item: Optional[_QueueItem] = None  # worker thread only (read by /queue on main)
+
+# Schedule kinds whose runs are folded into the normal conversation history;
+# "every"/"hourly" interval pings are not (issue #5).
+_SCHEDULE_HISTORY_KINDS = ("daily", "weekdays", "weekly")
+
+
+def enqueue_scheduled(entry: Dict[str, Any]) -> bool:
+    """Ticker-thread callback (src.agent.core.scheduler.start_ticker): enqueue
+    a due scheduled prompt. Runs on the scheduler's daemon thread — touches
+    only settings.get() and the thread-safe _task_queue.put(), never Telegram
+    or any other module global. Never logs the prompt text."""
+    uid = settings.get("ALLOWED_USER_ID")
+    if not uid:
+        return False
+
+    schedule_id = entry.get("id")
+    spec = str(entry.get("spec") or "")
+    prompt = str(entry.get("prompt") or "")
+    name = str(entry.get("name") or "")
+    kind = spec.split()[0].lower() if spec.split() else ""
+
+    wrapped = (
+        "[scheduled run #{} ({}) — the user set this up in advance and is not actively "
+        "chatting; do it now and report the result concisely. Do not change schedules "
+        "unless this task says to.]\n\n{}"
+    ).format(schedule_id, spec, prompt)
+
+    _task_queue.put(
+        _QueueItem(
+            uid, wrapped, user_id=uid, kind="scheduled",
+            schedule_id=schedule_id, schedule_name=name,
+            history_out=(kind in _SCHEDULE_HISTORY_KINDS),
+        )
+    )
+    return True
 
 
 def start_queue_worker() -> None:
@@ -1170,7 +1331,8 @@ def _run_task_chain(
                 "Continuing the remaining work automatically ({}/{})...".format(n, max_cont),
             )
             outcome, wrapup = _handle_llm(
-                item.chat_id, _build_continuation_prompt(record, "{}/{}".format(n, max_cont))
+                item.chat_id, _build_continuation_prompt(record, "{}/{}".format(n, max_cont)),
+                history_out=item.history_out,
             )
             continue
 
@@ -1219,6 +1381,58 @@ def _process_continue_item(item: _QueueItem) -> None:
     _run_task_chain(item, record, epoch, outcome, wrapup)
 
 
+def _process_scheduled_item(item: _QueueItem) -> None:
+    """Run one scheduled-prompt queue item (issue #5). Always marks the
+    schedule finished (scheduler's at-most-once inflight dedup) regardless of
+    outcome. Never touches conversation history/idle state on input
+    (history_in/touch_activity False); history_out follows item.history_out
+    (daily/weekdays/weekly only)."""
+    try:
+        send_message(
+            item.chat_id,
+            "⏰ Scheduled run #{} {}".format(item.schedule_id, _esc(item.schedule_name or "")),
+        )
+
+        with _task_lock:
+            epoch = _task_epoch
+            existing = tasks.load_task()
+            record = None
+            if existing is None:
+                record = tasks.new_task(item.chat_id, item.user_id, item.text)
+                if not tasks.save_task(record):
+                    _LOGGER.warning("task_save_failed task_id=%s", record["task_id"])
+                item.task_id = record["task_id"]
+
+        if record is not None:
+            _LOGGER.info(
+                "task_created task_id=%s chat_id=%s schedule_id=%s",
+                record["task_id"], item.chat_id, item.schedule_id,
+            )
+            outcome, wrapup = _handle_llm(
+                item.chat_id, item.text,
+                history_in=False, touch_activity=False, history_out=item.history_out,
+            )
+            _run_task_chain(item, record, epoch, outcome, wrapup)
+            return
+
+        _LOGGER.info("schedule_run_no_task schedule_id=%s", item.schedule_id)
+        outcome, _wrapup = _handle_llm(
+            item.chat_id, item.text,
+            history_in=False, touch_activity=False, history_out=item.history_out,
+        )
+        if outcome == "limit":
+            send_message(
+                item.chat_id,
+                "Scheduled run hit the tool-call limit; auto-continuation was skipped to "
+                "keep your unfinished task. Run it again with /schedule run {}.".format(
+                    item.schedule_id
+                ),
+            )
+    finally:
+        if item.schedule_id is not None:
+            scheduler.mark_finished(item.schedule_id)
+
+
 def _process_llm_item(item: _QueueItem) -> None:
     """Process one LLM queue item. call_gemini already handles all retries
     internally (RPM sleep + exponential backoff across the whole chain).
@@ -1228,6 +1442,10 @@ def _process_llm_item(item: _QueueItem) -> None:
     try:
         if item.kind == "continue":
             _process_continue_item(item)
+            return
+
+        if item.kind == "scheduled":
+            _process_scheduled_item(item)
             return
 
         with _task_lock:
@@ -1341,11 +1559,12 @@ def _fc_wrapup(
     n: int,
     last_text: str,
     on_cooldown: Callable[[int, int, float], None],
+    history_out: bool = True,
 ) -> str:
     """Send one tools-disabled final-answer request using the tool results
-    gathered so far, then reply and (if any text is produced) save history.
-    Never runs tools; never raises. Returns the final wrap-up text produced
-    (may be "" if no text was produced).
+    gathered so far, then reply and (if any text is produced and history_out
+    is True) save history. Never runs tools; never raises. Returns the final
+    wrap-up text produced (may be "" if no text was produced).
     """
     if reason == "loop":
         note = _FC_WRAPUP_LOOP_NOTE.format(n)
@@ -1382,7 +1601,7 @@ def _fc_wrapup(
         reply += "\n\n⚠️ Response was truncated at the maximum token limit (MAX_TOKENS)."
     send_message(chat_id, reply)
 
-    if final_text:
+    if final_text and history_out:
         _history.append(user_turn)
         _history.append({"role": "model", "parts": [{"text": final_text}]})
         _trim_history_pairs(context_turns)
@@ -1395,12 +1614,22 @@ def _run_tool_for_chat(chat_id: int, name: str, args: Dict[str, Any]) -> str:
     exposed to the model), so it is intercepted here rather than routed
     through the generic run_tool registry. view_file is intercepted earlier,
     in the FC loop itself (before this dispatcher is ever called), since it
-    needs the shared per-request media budget rather than just the chat_id."""
+    needs the shared per-request media budget rather than just the chat_id.
+    manage_schedule is intercepted here too, to surface model-made schedule
+    changes in chat (prompt-injection visibility, issue #5)."""
     if name == "send_file":
         try:
             return tg_files.send_file(chat_id, str(args.get("path", "")), args.get("caption") or None)[1]
         except Exception as exc:
             return "Error: {}".format(exc)
+    if name == "manage_schedule":
+        result = run_tool(name, args)
+        if isinstance(result, str) and result.startswith("OK:"):
+            try:
+                send_message(chat_id, "🗓️ " + _esc(result))
+            except Exception:
+                _LOGGER.debug("Failed to send schedule change notice", exc_info=True)
+        return result
     return run_tool(name, args)
 
 
@@ -1467,6 +1696,7 @@ def _run_llm_turn(
     contents: List[Dict[str, Any]],
     user_turn: Dict[str, Any],
     context_turns: int,
+    history_out: bool = True,
 ) -> Tuple[str, str]:
     fc_max_loops = settings.get("FC_MAX_LOOPS")
     loop_count = 0
@@ -1499,6 +1729,7 @@ def _run_llm_turn(
                 wrapup_text = _fc_wrapup(
                     chat_id, contents, user_turn, context_turns,
                     reason="limit", n=fc_max_loops, last_text=last_text, on_cooldown=on_cooldown,
+                    history_out=history_out,
                 )
                 return "limit", wrapup_text
 
@@ -1546,6 +1777,7 @@ def _run_llm_turn(
                 wrapup_text = _fc_wrapup(
                     chat_id, contents, user_turn, context_turns,
                     reason="loop", n=repeat_count, last_text=last_text, on_cooldown=on_cooldown,
+                    history_out=history_out,
                 )
                 return "loop", wrapup_text
             continue
@@ -1558,22 +1790,29 @@ def _run_llm_turn(
             reply += "\n\n⚠️ Response was truncated at the maximum token limit (MAX_TOKENS)."
         send_message(chat_id, reply)
 
-        _history.append(user_turn)
-        _history.append(parsed.raw_content)
-        _trim_history_pairs(context_turns)
+        if history_out:
+            _history.append(user_turn)
+            _history.append(parsed.raw_content)
+            _trim_history_pairs(context_turns)
         return "done", ""
 
 
 def _handle_llm(
-    chat_id: int, text: str, attachments: Optional[List[Dict[str, Any]]] = None
+    chat_id: int,
+    text: str,
+    attachments: Optional[List[Dict[str, Any]]] = None,
+    history_in: bool = True,
+    history_out: bool = True,
+    touch_activity: bool = True,
 ) -> Tuple[str, str]:
     global _last_activity
 
-    now = time.time()
-    idle_minutes = settings.get("IDLE_RESET_MINUTES")
-    if idle_minutes and idle_minutes > 0 and _last_activity and (now - _last_activity) > idle_minutes * 60:
-        _reset_history()
-    _last_activity = now
+    if touch_activity:
+        now = time.time()
+        idle_minutes = settings.get("IDLE_RESET_MINUTES")
+        if idle_minutes and idle_minutes > 0 and _last_activity and (now - _last_activity) > idle_minutes * 60:
+            _reset_history()
+        _last_activity = now
 
     context_turns = settings.get("CONTEXT_TURNS")
 
@@ -1592,7 +1831,7 @@ def _handle_llm(
         _LOGGER.info("attachments n=%d mimes=%s bytes=%d", len(refs), ",".join(mimes), total_bytes)
 
     user_turn = {"role": "user", "parts": parts + [{"text": text}]}
-    contents = _trimmed_history(context_turns) + [user_turn]
+    contents = (_trimmed_history(context_turns) if history_in else []) + [user_turn]
 
     send_chat_action(chat_id)
 
@@ -1602,7 +1841,7 @@ def _handle_llm(
     )
     typing_thread.start()
     try:
-        return _run_llm_turn(chat_id, contents, user_turn, context_turns)
+        return _run_llm_turn(chat_id, contents, user_turn, context_turns, history_out=history_out)
     except Exception as exc:
         _LOGGER.exception("Error in LLM track")
         send_message(chat_id, "⚠️ An error occurred: {}".format(html.escape(str(exc))))

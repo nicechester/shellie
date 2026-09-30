@@ -52,6 +52,17 @@ bypass, 24/7 via launchd/systemd.
 - `core/tasks.py` — task-file CRUD: atomic 0600 `current.json` under
   `SHELLIE_HOME/tasks`, single slot, 3-day expiry, corrupt files preserved as
   `.corrupt-*` for debugging.
+- `core/scheduler.py` — recurring scheduled prompts: spec grammar (daily/weekdays/weekly/hourly/every
+  with comma-separated times, aligned to local midnight, min 15m floor, plus one-shot `at YYYY-MM-DD HH:MM` form),
+  optional short name (≤60 chars) per entry, pure `next_after()` / `plan_tick()` logic, locked atomic 0600 `schedules.json`
+  with corrupt-file quarantine, 20s daemon ticker (`start_ticker(enqueue)`) started from `_run_polling_loop` only,
+  save-before-enqueue at-most-once, grace 600s skip-missed (10 min downtime → skipped, never replayed), per-schedule
+  inflight dedup via `mark_finished()`. Max 20 schedules; integer ids never reused; expiry is N/A (user-managed).
+  `list_entries() -> List[Dict]`, `get_schedule(id)`, `add(spec, prompt, name)`, `update_schedule(id, spec, prompt, name)`,
+  `remove(id)`, `set_enabled(id, bool)` return (ok, message) tuples (success messages begin "OK: "); shared plain-text
+  `format_list(entries)`. Ticker thread touches only scheduler+settings+_task_queue.put, never Telegram. Calls
+  `enqueue_scheduled(entry)` when a prompt is due (posts ⏰ notice, runs independently — never replaces interactive tasks).
+  Model-made changes via manage_schedule announced in chat with 🗓️ (prompt-injection visibility). Issue #5.
 - `core/gemini.py` — model-chain fallback (429 / RESOURCE_EXHAUSTED / 5xx /
   transport → next model; snapshot of chain/key/timeouts at call start), plus
   whole-chain retry with cooldown (GEMINI_MAX_RETRIES passes, delay = server
@@ -62,12 +73,13 @@ bypass, 24/7 via launchd/systemd.
   QuotaFailure.quotaId "PerDay" → RPD (fall back); otherwise RPM (sleep
   server-hinted delay and retry once, then fall back). `ToolEntry` registry:
   execute_shell (dynamic description) + append_memory + execute_web_search
-  (google_search grounding via SEARCH_MODEL) + send_file + view_file. Hybrid skills auto-discovery —
+  (google_search grounding via SEARCH_MODEL) + send_file + view_file + manage_schedule. Hybrid skills auto-discovery —
   `skills/*.py` (first docstring line) AND `skills/*.md` procedure docs (first
   non-empty line, `#` stripped, 80 chars; README.md and `_`-prefixed excluded);
   only the one-line summary goes into the system prompt, the LLM `cat`s the full
   .md on demand and follows its steps — `[execution environment]` block
-  (OS/arch/shell/cwd), robust `parse_response()` (multi functionCall parts,
+  (OS/arch/shell/cwd, local time in YYYY-MM-DD HH:MM with TZ and UTC offset, computed at call time),
+  robust `parse_response()` (multi functionCall parts,
   thought-part skip, blocked/finishReason handling). Live retry state (calling /
   cooldown reason 429_rpm·5xx·transport·chain_cooldown, model, until, attempt)
   is published copy-on-write via `get_retry_status()` for display only; reset to
@@ -107,7 +119,9 @@ bypass, 24/7 via launchd/systemd.
   ≤98 entries + parent `⬆️ ..` row; folders `d:<id>` edit listing in place, files
   `f:<id>` answer callback then send via send_file; callback auth on from.id fail-closed
   SILENT; index map ≤1000 ids referenced from callback_data, ids only increment, cleared
-  by `/reset`), `/continue` / `/discard` = resume/drop unfinished task from task
+  by `/reset`), `/schedule [add|rm|on|off] ...` = manage recurring prompts (list, add, remove, enable, disable);
+  thread-safe `enqueue_scheduled(entry)` callback from ticker (posts ⏰ notice, runs independently no task persistence),
+  `/continue` / `/discard` = resume/drop unfinished task from task
   file; `_pending_uploads` (lazy base64 on worker, refs only, max 5, /reset clears,
   media_group_id dedupes no-caption), _QueueItem carries refs, user turn = media parts +
   text, history stripped in place in _handle_llm's finally, task files never contain base64,
@@ -188,6 +202,7 @@ Phases 0–9 all implemented; issue #4 v1+v2 (auto-continuation + task persisten
 - Issue #18 implemented: `!!` shell mode with in-place terminal message (s:exit inline button, /reset clears, not persisted).
 - Issue #6 implemented — multimodal uploads to Gemini (inlineData media + inline text files, 5MB/5-attachment/100KB caps, no-caption follow-up question, history stripping).
 - Issue #22 implemented — `view_file` tool (vision on existing workspace files; #6 history placeholders now point to view_file).
+- Issue #5 implemented — scheduled prompts (`/schedule` bypass commands, `manage_schedule` LLM tool, recurring daily/weekdays/weekly/hourly/every with comma time lists, min 15m, aligned to local midnight; per-schedule inflight dedup, save-before-enqueue, 10min grace skip-missed; ticker only touches scheduler+settings+queue.put, never Telegram; ⏰ notice on run start; daily/weekdays/weekly add to history, interval results are not).
 - Issue #13 open: OpenAI-compatible LLM backend support.
 
 Outstanding:

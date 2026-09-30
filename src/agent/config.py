@@ -47,6 +47,7 @@ SKILLS_DIR = os.path.join(SHELLIE_HOME, "skills")       # user skills (takes pri
 REPO_SKILLS_DIR = os.path.join(BASE_DIR, "skills")      # built-in repo skills
 OFFSET_FILE = os.path.join(SHELLIE_HOME, ".update_offset")
 SETTINGS_FILE = os.path.join(SHELLIE_HOME, "settings.json")
+SCHEDULES_FILE = os.path.join(SHELLIE_HOME, "schedules.json")
 TASKS_DIR = os.path.join(SHELLIE_HOME, "tasks")
 
 os.makedirs(MEMORY_DIR, exist_ok=True)
