@@ -797,6 +797,22 @@ class ToolsRegistryTests(unittest.TestCase):
         result = gemini.run_tool("unknown", {})
         self.assertEqual(result, "Unknown function: unknown")
 
+    def test_build_system_instruction_contains_local_time(self) -> None:
+        """build_system_instruction includes local time in the [execution environment] block."""
+        with mock.patch.object(
+            gemini.shell,
+            "execution_environment",
+            return_value={"os": "Linux", "arch": "x86_64", "shell": "/bin/bash", "cwd": "/base"},
+        ), mock.patch.object(
+            gemini, "read_memory", return_value="test memory"
+        ), mock.patch.object(
+            gemini, "list_skills", return_value=""
+        ):
+            instruction = gemini.build_system_instruction()
+            text = instruction["parts"][0]["text"]
+            self.assertIn("local time:", text)
+            self.assertIn("[execution environment]", text)
+
 
 class SendFileToolFallbackTests(unittest.TestCase):
     """send_file (issue #16) is declared for the model, but outside a
@@ -843,6 +859,189 @@ class ViewFileToolFallbackTests(unittest.TestCase):
     def test_run_tool_view_file_outside_telegram_returns_fallback_message(self) -> None:
         result = gemini.run_tool("view_file", {"path": "x"})
         self.assertEqual(result, "view_file is only available inside a Telegram chat.")
+
+
+class ManageScheduleToolTests(unittest.TestCase):
+    """manage_schedule tool (issue #5) — list, get, add, update, remove, enable, disable actions."""
+
+    def test_manage_schedule_declared_in_tools_schema(self) -> None:
+        with mock.patch.object(
+            gemini.shell,
+            "execution_environment",
+            return_value={"os": "Linux", "arch": "x86_64", "shell": "/bin/bash", "cwd": "/base"},
+        ):
+            schema = gemini.build_tools_schema()
+
+        declarations = schema[0]["functionDeclarations"]
+        names = [d["name"] for d in declarations]
+        self.assertIn("manage_schedule", names)
+        manage_schedule_decl = next(d for d in declarations if d["name"] == "manage_schedule")
+        self.assertIn("action", manage_schedule_decl["parameters"]["required"])
+
+    def test_run_tool_manage_schedule_list_empty(self) -> None:
+        with mock.patch.object(gemini.scheduler, "list_entries", return_value=[]):
+            result = gemini.run_tool("manage_schedule", {"action": "list"})
+        self.assertEqual(result, "No schedules.")
+
+    def test_run_tool_manage_schedule_list_with_entries(self) -> None:
+        entries = [
+            {
+                "id": 1,
+                "spec": "daily 09:00",
+                "prompt": "Daily standup meeting",
+                "enabled": True,
+            },
+            {
+                "id": 2,
+                "spec": "every 2h",
+                "prompt": "Backup check",
+                "enabled": False,
+            },
+        ]
+        with mock.patch.object(gemini.scheduler, "list_entries", return_value=entries), \
+             mock.patch.object(gemini.scheduler, "format_list", return_value="1 [on] daily 09:00\n2 [off] every 2h"):
+            result = gemini.run_tool("manage_schedule", {"action": "list"})
+
+        self.assertIn("1", result)
+        self.assertIn("[on]", result)
+        self.assertIn("daily 09:00", result)
+        self.assertIn("2", result)
+        self.assertIn("[off]", result)
+        self.assertIn("every 2h", result)
+
+    def test_run_tool_manage_schedule_add_success(self) -> None:
+        with mock.patch.object(
+            gemini.scheduler, "add", return_value=(True, "OK: Created schedule 5: daily 10:00; next run in 1 hour")
+        ) as mock_add:
+            result = gemini.run_tool("manage_schedule", {
+                "action": "add",
+                "spec": "daily 10:00",
+                "prompt": "Test",
+                "name": "Daily check",
+            })
+            # Verify the name was passed through to scheduler.add
+            mock_add.assert_called_once_with("daily 10:00", "Test", "Daily check")
+
+        self.assertIn("OK:", result)
+        self.assertIn("Created schedule", result)
+        self.assertIn("5", result)
+        self.assertIn("daily 10:00", result)
+
+    def test_run_tool_manage_schedule_add_missing_spec_prompt(self) -> None:
+        result = gemini.run_tool("manage_schedule", {"action": "add"})
+        self.assertEqual(result, "Error: add requires spec and prompt")
+
+        result = gemini.run_tool("manage_schedule", {"action": "add", "spec": "daily 10:00"})
+        self.assertEqual(result, "Error: add requires spec and prompt")
+
+    def test_run_tool_manage_schedule_add_error(self) -> None:
+        with mock.patch.object(
+            gemini.scheduler, "add", return_value=(False, "Error: invalid spec format")
+        ):
+            result = gemini.run_tool("manage_schedule", {
+                "action": "add",
+                "spec": "invalid",
+                "prompt": "Test",
+            })
+
+        self.assertEqual(result, "Error: invalid spec format")
+
+    def test_run_tool_manage_schedule_get_success(self) -> None:
+        with mock.patch.object(
+            gemini.scheduler, "get_schedule", return_value=(True, "daily 10:00 — 'My daily prompt content here'")
+        ):
+            result = gemini.run_tool("manage_schedule", {
+                "action": "get",
+                "id": 5,
+            })
+
+        self.assertEqual(result, "daily 10:00 — 'My daily prompt content here'")
+
+    def test_run_tool_manage_schedule_get_unknown_id(self) -> None:
+        with mock.patch.object(
+            gemini.scheduler, "get_schedule", return_value=(False, "Error: unknown schedule id 999")
+        ):
+            result = gemini.run_tool("manage_schedule", {
+                "action": "get",
+                "id": 999,
+            })
+
+        self.assertEqual(result, "Error: unknown schedule id 999")
+
+    def test_run_tool_manage_schedule_update_success(self) -> None:
+        with mock.patch.object(
+            gemini.scheduler, "update_schedule", return_value=(True, "OK: Updated schedule 5")
+        ):
+            result = gemini.run_tool("manage_schedule", {
+                "action": "update",
+                "id": 5,
+                "spec": "daily 11:00",
+                "name": "Updated name",
+            })
+
+        self.assertEqual(result, "OK: Updated schedule 5")
+
+    def test_run_tool_manage_schedule_remove_success(self) -> None:
+        with mock.patch.object(gemini.scheduler, "remove", return_value=(True, "OK: Removed 1.")):
+            result = gemini.run_tool("manage_schedule", {
+                "action": "remove",
+                "id": 1,
+            })
+
+        self.assertEqual(result, "OK: Removed 1.")
+
+    def test_run_tool_manage_schedule_remove_unknown_id(self) -> None:
+        with mock.patch.object(gemini.scheduler, "remove", return_value=(False, "Error: unknown schedule id 999")):
+            result = gemini.run_tool("manage_schedule", {
+                "action": "remove",
+                "id": 999,
+            })
+
+        self.assertEqual(result, "Error: unknown schedule id 999")
+
+    def test_run_tool_manage_schedule_enable_success(self) -> None:
+        with mock.patch.object(
+            gemini.scheduler, "set_enabled", return_value=(True, "OK: Schedule 1 enabled; next run in 2 hours")
+        ):
+            result = gemini.run_tool("manage_schedule", {
+                "action": "enable",
+                "id": 1,
+            })
+
+        self.assertIn("OK:", result)
+        self.assertIn("Schedule 1 enabled", result)
+        self.assertIn("in 2 hours", result)
+
+    def test_run_tool_manage_schedule_disable_success(self) -> None:
+        with mock.patch.object(gemini.scheduler, "set_enabled", return_value=(True, "OK: Schedule 1 disabled.")):
+            result = gemini.run_tool("manage_schedule", {
+                "action": "disable",
+                "id": 1,
+            })
+
+        self.assertEqual(result, "OK: Schedule 1 disabled.")
+
+    def test_run_tool_manage_schedule_enable_unknown_id(self) -> None:
+        with mock.patch.object(gemini.scheduler, "set_enabled", return_value=(False, "Error: unknown schedule id 999")):
+            result = gemini.run_tool("manage_schedule", {
+                "action": "enable",
+                "id": 999,
+            })
+
+        self.assertEqual(result, "Error: unknown schedule id 999")
+
+    def test_run_tool_manage_schedule_unknown_action(self) -> None:
+        result = gemini.run_tool("manage_schedule", {"action": "invalid"})
+        self.assertEqual(result, "Error: unknown action invalid")
+
+    def test_run_tool_manage_schedule_exception_caught(self) -> None:
+        with mock.patch.object(
+            gemini.scheduler, "list_entries", side_effect=RuntimeError("boom")
+        ):
+            result = gemini.run_tool("manage_schedule", {"action": "list"})
+
+        self.assertTrue(result.startswith("Error:"))
+        self.assertIn("boom", result)
 
 
 class ListSkillsTests(unittest.TestCase):

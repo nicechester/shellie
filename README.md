@@ -205,7 +205,11 @@ service for you (macOS → launchd, Linux → systemd user unit), and `chmod
 | `/discard` | Bypass (task) | Drop the unfinished task without resuming |
 | `/file <path>` | Bypass | Send a file from SHELLIE_WORKSPACE to the user |
 | `/browse [path]` | Bypass | List files in a directory with an inline-keyboard menu |
-| anything else | LLM (Gemini) | Sent with tools `execute_shell`, `append_memory`, `execute_web_search`, `send_file`, and `view_file`; function-calling loop up to `FC_MAX_LOOPS` iterations (or on repeat-loop detection), with final wrap-up call if limit reached, with up to `CONTEXT_TURNS` recent turns of history |
+| `/schedule` | Bypass (schedule) | List all schedules |
+| `/schedule add <spec> <prompt>` | Bypass (schedule) | Add a new recurring schedule |
+| `/schedule rm <id>` | Bypass (schedule) | Remove a schedule |
+| `/schedule on <id>` / `/schedule off <id>` | Bypass (schedule) | Enable or disable a schedule |
+| anything else | LLM (Gemini) | Sent with tools `execute_shell`, `append_memory`, `execute_web_search`, `send_file`, `view_file`, and `manage_schedule`; function-calling loop up to `FC_MAX_LOOPS` iterations (or on repeat-loop detection), with final wrap-up call if limit reached, with up to `CONTEXT_TURNS` recent turns of history |
 
 ### Attachments (multimodal uploads)
 
@@ -225,6 +229,40 @@ When you send files via Telegram, Shellie includes them in your next Gemini mess
 **Files already on disk:** Files already on disk can be viewed too — ask about a file by name and the model attaches it itself via `view_file`.
 
 **History cleanup:** After each turn, attachment content is removed from conversation history and replaced with "[attachment removed from history: …]" placeholders to keep request sizes bounded. Re-send the file to ask about it again later.
+
+### Scheduled prompts
+
+Shellie can run recurring prompts on a schedule, without you needing to send a message:
+
+**Spec grammar** (in local time, including DST; examples):
+- `daily 09:00` or `daily 09:00,18:00` — every day at that time(s)
+- `weekdays 08:30` or `weekdays 08:30,17:00` — Monday–Friday at that time(s)
+- `weekly mon,thu 09:00` or `weekly mon,thu 09:00,14:00` — specific days and time(s)
+- `hourly :15` — every hour at that minute (e.g. at :15 past each hour)
+- `every 30m` / `every 2h` — every N minutes or hours, aligned to local midnight (min **15 minutes**, max 24 hours). `every 30m` fires at :00 and :30 of each hour; `every 2h` fires at 00:00, 02:00, 04:00, etc. Slots do not drift across restarts.
+- `at 2026-10-05 14:30` — **one-shot, fires once** at that date and time (must be in the future), then shows as done.
+
+**Schedule names:**
+- Optional short label (≤60 chars) to help identify a schedule. The model sets these automatically on `/schedule add` to make future changes easier (e.g. "news briefing" instead of just "id 3").
+
+**Constraints:**
+- **Max 20 schedules** per bot instance.
+- Schedules are stored in `~/.shellie/schedules.json`.
+- Schedule **IDs are small integers, never reused** across the lifetime of the instance.
+- The prompt must be **self-contained** — it runs with no conversation context or chat history.
+- **Scheduled runs never replace an unfinished interactive task** — they run independently and post a ⏰ notice when starting.
+- **History handling:** Daily/weekdays/weekly runs add their results to chat history (you can follow up with questions). Interval (every/hourly) runs are **not** added to history (protects your ongoing conversation context).
+- Missed runs (>10 minutes late due to downtime, laptop sleep, restarts) are **skipped, never replayed**.
+- At most one queued/running instance per schedule.
+- **Quota note:** each run costs Gemini requests; the 15-minute minimum floor protects free-tier daily limits.
+
+**Management:**
+- List schedules: `/schedule`
+- Add a schedule: `/schedule add <spec> <prompt>` (or ask the model via chat with the `manage_schedule` tool)
+- Remove: `/schedule rm <id>`
+- Enable/disable: `/schedule on <id>` / `/schedule off <id>`
+- Model-made schedule changes (via chat) are announced in chat with **🗓️** for visibility.
+- `/reset` clears the conversation history and queue but **does not** affect schedules.
 
 ## 7. Settings
 

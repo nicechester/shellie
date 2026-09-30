@@ -9,9 +9,9 @@ import time
 from typing import Any, Optional
 
 from src.agent.config import BASE_DIR, OFFSET_FILE, SHELLIE_HOME, settings
-from src.agent.core import shell
+from src.agent.core import scheduler, shell
 from src.agent.telegram.client import get_me, get_updates, register_prechecks, send_message
-from src.agent.telegram.handlers import notify_pending_task, process_update, start_queue_worker
+from src.agent.telegram.handlers import enqueue_scheduled, notify_pending_task, process_update, start_queue_worker
 from src.agent.web.server import manager
 
 _LOGGER = logging.getLogger("shellie.main")
@@ -144,6 +144,10 @@ def _run_polling_loop() -> None:
         notify_pending_task()
     except Exception:
         _LOGGER.debug("notify_pending_task failed", exc_info=True)
+    try:
+        scheduler.start_ticker(enqueue_scheduled)
+    except Exception:
+        _LOGGER.exception("Failed to start scheduler")
     offset = _read_offset()
     backoff = 1
 

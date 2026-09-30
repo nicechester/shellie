@@ -8,7 +8,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from src.agent.config import REPO_SKILLS_DIR, SKILLS_DIR, settings
-from src.agent.core import mcp, shell
+from src.agent.core import mcp, scheduler, shell
 from src.agent.core.memory import append_memory, read_memory
 from src.agent.utils.http import http_post_h
 
@@ -243,12 +243,106 @@ def _view_file_run(args: Dict[str, Any]) -> str:
     return "view_file is only available inside a Telegram chat."
 
 
+def _manage_schedule_declaration() -> Dict[str, Any]:
+    return {
+        "name": "manage_schedule",
+        "description": "Create, list, get, enable/disable or remove scheduled prompts that run automatically and report back in this chat. Only add/remove/disable/update when the user explicitly asks. ALWAYS set a short name (≤60 chars) on add. Call `list` first to resolve plain-English references like 'the news briefing' to an id. Minimum interval 15 minutes. Spec grammar (local time, examples): 'daily 09:00', 'daily 09:00,18:00', 'weekdays 08:30', 'weekly mon,thu 09:00', 'hourly :15', 'every 30m', 'at YYYY-MM-DD HH:MM' (one-shot, must be future; min 15m for recurring, aligned to local midnight).",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": "Action to perform: list, get, add, update, remove, enable, or disable",
+                },
+                "spec": {
+                    "type": "STRING",
+                    "description": "Schedule spec (required for add, optional for update)",
+                },
+                "prompt": {
+                    "type": "STRING",
+                    "description": "Prompt text (required for add, optional for update)",
+                },
+                "name": {
+                    "type": "STRING",
+                    "description": "Short schedule name ≤60 chars (recommended for add, optional for update)",
+                },
+                "id": {
+                    "type": "INTEGER",
+                    "description": "Schedule ID (required for get, update, remove, enable, disable)",
+                },
+            },
+            "required": ["action"],
+        },
+    }
+
+
+def _manage_schedule_run(args: Dict[str, Any]) -> str:
+    try:
+        action = str(args.get("action", "")).strip()
+        spec = str(args.get("spec", "")).strip() if args.get("spec") else None
+        prompt = str(args.get("prompt", "")).strip() if args.get("prompt") else None
+        name = str(args.get("name", "")).strip() if args.get("name") else None
+        schedule_id = args.get("id")
+
+        if action == "list":
+            entries = scheduler.list_entries()
+            if not entries:
+                return "No schedules."
+            try:
+                return scheduler.format_list(entries)
+            except Exception:
+                return "No schedules."
+
+        elif action == "get":
+            if schedule_id is None:
+                return "Error: get requires id"
+            ok, message = scheduler.get(schedule_id)
+            return message
+
+        elif action == "add":
+            if not spec or not prompt:
+                return "Error: add requires spec and prompt"
+            ok, message = scheduler.add(spec, prompt, name)
+            return message
+
+        elif action == "update":
+            if schedule_id is None:
+                return "Error: update requires id"
+            ok, message = scheduler.update(schedule_id, spec, prompt, name)
+            return message
+
+        elif action == "remove":
+            if schedule_id is None:
+                return "Error: remove requires id"
+            ok, message = scheduler.remove(schedule_id)
+            return message
+
+        elif action == "enable":
+            if schedule_id is None:
+                return "Error: enable requires id"
+            ok, message = scheduler.set_enabled(schedule_id, True)
+            return message
+
+        elif action == "disable":
+            if schedule_id is None:
+                return "Error: disable requires id"
+            ok, message = scheduler.set_enabled(schedule_id, False)
+            return message
+
+        else:
+            return "Error: unknown action {}".format(action)
+
+    except Exception as exc:
+        return "Error: {}".format(exc)
+
+
 TOOL_REGISTRY: List[ToolEntry] = [
     ToolEntry("execute_shell", _execute_shell_declaration, _execute_shell_run),
     ToolEntry("append_memory", _append_memory_declaration, _append_memory_run),
     ToolEntry("execute_web_search", _execute_web_search_declaration, _execute_web_search_run),
     ToolEntry("send_file", _send_file_declaration, _send_file_run),
     ToolEntry("view_file", _view_file_declaration, _view_file_run),
+    ToolEntry("manage_schedule", _manage_schedule_declaration, _manage_schedule_run),
 ]
 
 
@@ -342,6 +436,21 @@ def build_system_instruction() -> Dict[str, Any]:
     text += "\n\n[execution environment]\nOS: {} / arch: {} / shell: {} / cwd: {}".format(
         env["os"], env["arch"], env["shell"], env["cwd"]
     )
+
+    # Add local time at call time (no caching)
+    try:
+        local_time = time.localtime()
+        local_time_str = time.strftime("%Y-%m-%d %H:%M", local_time)
+        tz_name = time.strftime("%Z", local_time)
+        # Calculate UTC offset: use timezone (standard) or altzone (DST) based on tm_isdst
+        offset_sec = time.altzone if local_time.tm_isdst > 0 else time.timezone
+        offset_hours = -offset_sec // 3600
+        offset_mins = (-offset_sec % 3600) // 60
+        offset_str = "UTC{:+03d}:{:02d}".format(offset_hours, offset_mins)
+        text += "\nlocal time: {} ({}, {})".format(local_time_str, tz_name, offset_str)
+    except Exception:
+        pass
+
     return {"parts": [{"text": text}]}
 
 
