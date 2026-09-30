@@ -807,7 +807,8 @@ class ToolsRegistryTests(unittest.TestCase):
             gemini, "read_memory", return_value="test memory"
         ), mock.patch.object(
             gemini, "list_skills", return_value=""
-        ):
+        ), mock.patch.object(gemini, "settings") as mock_settings:
+            mock_settings.get.side_effect = _settings_get({})
             instruction = gemini.build_system_instruction()
             text = instruction["parts"][0]["text"]
             self.assertIn("local time:", text)

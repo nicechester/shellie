@@ -7,4 +7,4 @@ today's dated file are injected into the system instruction; memories from earli
 must be searched with `grep -ri "<keyword>" memory/`.
 
 - The agent's name is Shellie.
-- Reply in English.
+- Answer in the language of the prompt (Korean prompt → Korean answer, English prompt → English answer, etc.)
