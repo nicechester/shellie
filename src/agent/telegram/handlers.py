@@ -288,6 +288,7 @@ def _handle_incoming_file(
     has_caption = isinstance(caption, str) and bool(caption.strip())
     shell_active = _shell_session is not None and _shell_session.chat_id == chat_id
     media_group_id = message.get("media_group_id")
+    is_voice = att.get("kind") == "voice"
 
     reply = "📥 Saved: <code>{}</code> ({})".format(_esc(path), size_str)
     if shell_active and has_caption:
@@ -295,6 +296,7 @@ def _handle_incoming_file(
     elif (
         not shell_active
         and not has_caption
+        and not is_voice
         and (media_group_id is None or media_group_id != _last_media_group_id)
     ):
         reply += "\nWhat would you like me to do with it? I'll include it with your next message."
@@ -302,8 +304,9 @@ def _handle_incoming_file(
 
     _last_media_group_id = media_group_id
 
-    if has_caption and not shell_active:
-        text, refs = _consume_uploads(caption)
+    if not shell_active and (has_caption or is_voice):
+        prompt = caption if has_caption else "[voice note — transcribe it first, then respond]"
+        text, refs = _consume_uploads(prompt)
         _task_queue.put(_QueueItem(chat_id, text, user_id=user_id, attachments=refs))
 
 

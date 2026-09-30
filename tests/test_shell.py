@@ -263,9 +263,9 @@ class ExecuteShellInTests(unittest.TestCase):
         self.addCleanup(self._settings_patcher.stop)
         self.mock_settings.get.side_effect = _settings_get_factory({})
 
-        self._home_dir = tempfile.mkdtemp()
+        self._home_dir = os.path.realpath(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self._home_dir, ignore_errors=True)
-        self._ws_dir = tempfile.mkdtemp()
+        self._ws_dir = os.path.realpath(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self._ws_dir, ignore_errors=True)
         self._sub_dir = os.path.join(self._ws_dir, "sub")
         os.makedirs(self._sub_dir, exist_ok=True)

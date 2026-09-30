@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os
 import shutil
 import tempfile
@@ -679,7 +680,7 @@ class QueueTests(HandlersTestCase):
 
     def test_process_llm_item_propagates_exceptions(self) -> None:
         """_process_llm_item exceptions propagate to the worker, which notifies the user."""
-        def _fail(chat_id, text):
+        def _fail(chat_id, text, attachments=None):
             raise ValueError("bad input")
 
         with mock.patch.object(handlers, "_handle_llm", side_effect=_fail):
@@ -1211,7 +1212,8 @@ class FileUploadTests(HandlersTestCase):
         self.assertEqual(handlers._task_queue.qsize(), 0)
         self.assertEqual(len(handlers._pending_uploads), 1)
 
-        with mock.patch.object(files, "extract_attachment", return_value=None):
+        with mock.patch.object(files, "extract_attachment", return_value=None), \
+                mock.patch.object(files, "upload_note", return_value="[system] note-A"):
             handlers.process_update(self._update("next message"))
 
         self.assertEqual(handlers._task_queue.qsize(), 1)
@@ -1356,14 +1358,19 @@ class HandleLlmAttachmentTests(HandlersTestCase):
         part = {"inlineData": {"mimeType": "image/jpeg", "data": "QUJD"}}
         placeholder = "[attachment removed from history: photo.jpg (image/jpeg) — saved at /ws/photo.jpg]"
         self.mock_build_attachment_part.return_value = (part, placeholder)
-        self.mock_call_gemini.return_value = (_text_response("ok"), "m1")
+
+        sent_parts = []
+
+        def _capture(contents, *args, **kwargs):
+            sent_parts.append(copy.deepcopy(contents[-1]["parts"]))
+            return (_text_response("ok"), "m1")
+
+        self.mock_call_gemini.side_effect = _capture
 
         outcome, _ = handlers._handle_llm(1, "hi", attachments=[ref])
 
         self.assertEqual(outcome, "done")
-        first_call_contents = self.mock_call_gemini.call_args_list[0][0][0]
-        user_turn = first_call_contents[-1]
-        self.assertEqual(user_turn["parts"], [part, {"text": "hi"}])
+        self.assertEqual(sent_parts[0], [part, {"text": "hi"}])
 
         self.assertEqual(len(handlers._history), 2)
         saved_user_turn = handlers._history[0]
@@ -1571,12 +1578,15 @@ class ViewFileToolTests(HandlersTestCase):
         self.mock_build_attachment_part.return_value = (
             {"inlineData": {"mimeType": "image/jpeg", "data": "QUJD"}}, "placeholder",
         )
-        view_ref = self._media_ref(size=100)
+
+        def _resolve(raw):
+            return (self._media_ref(path="/ws/" + raw, name=raw, size=100), None)
+
         call_seq = [_fc_response([("view_file", {"path": "v{}.jpg".format(i)})]) for i in range(3)]
         final_resp = _text_response("done")
         self.mock_call_gemini.side_effect = [(r, "m1") for r in call_seq] + [(final_resp, "m1")]
 
-        with mock.patch.object(files, "resolve_view_target", return_value=(view_ref, None)):
+        with mock.patch.object(files, "resolve_view_target", side_effect=_resolve):
             handlers._handle_llm(1, "view stuff", attachments=refs)
 
         self.assertEqual(self.mock_call_gemini.call_count, 4)
@@ -2315,7 +2325,8 @@ class ShellModeTests(HandlersTestCase):
         self.assertEqual(len(handlers._pending_uploads), 1)
 
         handlers._exit_shell_mode(notify=False)
-        with mock.patch.object(files, "extract_attachment", return_value=None):
+        with mock.patch.object(files, "extract_attachment", return_value=None), \
+                mock.patch.object(files, "upload_note", return_value="[system] note"):
             handlers.process_update(self._update("now do it"))
 
         self.assertEqual(handlers._task_queue.qsize(), 1)
