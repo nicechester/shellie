@@ -23,7 +23,7 @@ to interact with it:
   the core file plus today's dated file into the system instruction; older
   dated files are not injected but can be found with `grep -ri "<keyword>"
   memory/`.
-- **Runtime-editable settings** — all 22 settings can be changed without a
+- **Runtime-editable settings** — all 23 settings can be changed without a
   restart, either from a local web UI (`http://127.0.0.1:<WEB_PORT>/`) or via
   Telegram `/set`/`/unset` commands. See [§7](#7-settings).
 - **MCP tools (optional)** — configure `MCP_SERVERS` to let the Gemini LLM
@@ -281,7 +281,7 @@ does nothing until you restart — and even after a restart, if an override
 for that key already exists in `settings.json`, your new `.env` value stays
 shadowed until you `/unset` that key (or delete `settings.json`).
 
-### 22-key reference
+### 23-key reference
 
 | Key | Default | Range / format | Telegram-editable | Apply timing |
 |---|---|---|---|---|
@@ -306,6 +306,7 @@ shadowed until you `/unset` that key (or delete `settings.json`).
 | `WEB_PORT` | `8321` | 1024–65535, must bind free (checked before switching) | Yes | listener reconcile |
 | `SHELL_PATH` | `auto` | `auto`, or an absolute path that exists, is executable, and (if `/etc/shells` exists) is listed there | Yes | immediate (next shell command) |
 | `MCP_SERVERS` | `""` (disabled) | JSON array: `name` (`[a-zA-Z0-9_-]{1,32}`, unique), `url` (`http://`/`https://`), optional `headers` (string→string map) | No (web-only, secret) | immediate (next LLM call) |
+| `SEARCH_MODEL` | `gemma-4-26b-a4b-it` | Single model name | Yes | immediate (next web search) |
 
 `auto` resolution order (re-evaluated on every shell command, never cached):
 `/bin/zsh` on macOS → `$SHELL` → the login shell from `pwd.getpwuid()` →
@@ -421,12 +422,14 @@ both. Skills are auto-listed in the LLM's system prompt as
 src/agent/
   __main__.py       entry point: POSIX guard, single-instance lock, polling loop, signal handlers
   config.py         path constants, .env parser (parse_dotenv, pure function)
-  settings.py       18-key SettingSpec catalog + SettingsStore (layering, precheck, persistence)
+  settings.py       23-key SettingSpec catalog + SettingsStore (layering, precheck, persistence)
   core/
     shell.py        POSIX shell resolution + execution (timeout, process group, env scrubbing)
     memory.py       core MEMORY.md + per-day memory/YYYY-MM-DD.md read/append
     gemini.py       Gemini HTTP calls, model fallback chain, response parsing, tool registry
     mcp.py          HTTP MCP client (Streamable HTTP only): tool discovery + invocation
+    scheduler.py    scheduled prompts: spec parsing, persistence, ticker thread
+    tasks.py        task persistence for continuation across restarts
   telegram/
     client.py       Telegram Bot API calls (getUpdates, sendMessage, getMe, ...)
     handlers.py     command routing, settings commands, function-calling loop, history
