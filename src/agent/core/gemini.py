@@ -429,7 +429,8 @@ def build_system_instruction() -> Dict[str, Any]:
     if skills_text:
         text += (
             "\n\n[skills] (.py: run with python3 skills/<name>.py / "
-            ".md: read full text with cat skills/<name>.md and follow the procedure)\n" + skills_text
+            ".md: read full text with cat skills/<name>.md and follow the procedure; "
+            "create new skills in ~/.shellie/skills/)\n" + skills_text
         )
 
     env = shell.execution_environment()
