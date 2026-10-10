@@ -120,13 +120,46 @@ bot token race each other and Telegram returns 409 Conflict to one of them.
 
 ## 5. Service installation
 
+**One-line install** (no checkout needed; macOS or Linux, Python 3.8+):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nicechester/shellie/main/launchd/install.sh | sh
+```
+
+This downloads the latest release into `~/.local/share/shellie/shellie`,
+installs the service, and starts it. To install a specific tag or branch:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nicechester/shellie/main/launchd/install.sh | SHELLIE_REF=v0.1.0 sh
+```
+
+Running the same command again upgrades in place and restarts the service.
+Your `.env` and `settings.json` are kept across upgrades.
+
+**From a checkout:**
+
 ```sh
 sh launchd/install.sh
 ```
 
-This single script detects the OS (`uname -s`) and installs the correct
-service for you (macOS → launchd, Linux → systemd user unit), and `chmod
-600`s `.env`/`settings.json` if present.
+Either way, the script detects the OS (`uname -s`) and installs the correct
+service (macOS → launchd, Linux → systemd user unit), and `chmod 600`s
+`.env`/`settings.json` if present.
+
+**Next steps.** Shellie starts in setup-required mode until
+`TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY` and `ALLOWED_USER_ID` are set. Fill
+them in at `http://127.0.0.1:8321/`, or create `.env` in the project root
+and restart the service.
+
+**Uninstall:**
+
+```sh
+sh ~/.local/share/shellie/shellie/launchd/uninstall.sh   # one-line install
+sh launchd/uninstall.sh                                  # from a checkout
+```
+
+This stops and removes the service. Your data in `~/.shellie` and
+`~/workspace` is kept.
 
 > **Interpreter path:** both service files run `/usr/bin/python3` (the
 > system/CLT Python). If your Python 3.8+ lives elsewhere (e.g. a
@@ -438,7 +471,7 @@ src/agent/
     page.py         HTML rendering (no external JS/CSS)
   utils/
     http.py         stdlib http_get/http_post/http_post_h helpers
-launchd/            macOS launchd plist + install.sh (installs for both OSes)
+launchd/            macOS launchd plist, install.sh and uninstall.sh (both OSes)
 systemd/            Linux/Pi systemd user unit
 skills/             standalone stdlib scripts, auto-listed in the system prompt
 memory/MEMORY.md    core long-term memory file (memory/YYYY-MM-DD.md holds per-day entries)
