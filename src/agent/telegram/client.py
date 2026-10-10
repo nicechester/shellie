@@ -129,7 +129,7 @@ def send_message(chat_id: int, text: str, parse_mode: Optional[str] = "HTML", re
                 response, status = http_post(url, payload_plain)
 
             if status != 200 or not response.get("ok"):
-                error_str = str(response.get("error", ""))
+                error_str = str(response.get("description") or response.get("error", ""))
                 masked_error = mask_token(error_str)
                 _LOGGER.warning(
                     "send_message chunk failed: status=%d error=%s",

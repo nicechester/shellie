@@ -326,7 +326,7 @@ shadowed until you `/unset` that key (or delete `settings.json`).
 | `GEMINI_FALLBACK_DELAY_SEC` | `1` | 0–10 | Yes | immediate |
 | `GEMINI_RETRY_BASE_DELAY_SEC` | `60` | 5–300 | Yes | immediate |
 | `GEMINI_MAX_RETRIES` | `2` | 0–5 | Yes | immediate |
-| `SYSTEM_PROMPT` | platform-neutral Korean default | 1–4000 chars, multi-line allowed | Yes | immediate |
+| `SYSTEM_PROMPT` | language-adaptive default | 1–4000 chars, multi-line allowed | Yes | immediate |
 | `FC_MAX_LOOPS` | `15` | 1–50 | Yes | immediate |
 | `FC_MAX_CONTINUATIONS` | `2` | 0–5 | Yes | immediate |
 | `CONTEXT_TURNS` | `10` | 0–50 (0 = single-shot, no history kept) | Yes | immediate |
