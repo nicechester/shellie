@@ -14,7 +14,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from src.agent.config import settings, SHELLIE_WORKSPACE
 from src.agent.core import scheduler, tasks
-from src.agent.core.gemini import call_gemini, get_retry_status, parse_response, run_tool
+from src.agent.core.gemini import get_retry_status, parse_response, run_tool
+from src.agent.core.llm import call_llm
 from src.agent.core.memory import read_memory
 from src.agent.core.shell import execute_shell, execute_shell_in
 from src.agent.telegram import files as tg_files
@@ -128,7 +129,7 @@ _HELP_TEXT = (
     "<b>Files</b>\n"
     "Files sent to the bot (documents, photos, videos, audio, voice notes) are saved to the workspace.\n"
     "\n"
-    "<b>Anything else</b> — sent to Gemini LLM"
+    "<b>Anything else</b> — sent to the LLM"
 )
 
 _FENCE_RE = re.compile(r"```(?:[^\n`]*\n)?(.*?)```", re.DOTALL)
@@ -1437,7 +1438,7 @@ def _process_scheduled_item(item: _QueueItem) -> None:
 
 
 def _process_llm_item(item: _QueueItem) -> None:
-    """Process one LLM queue item. call_gemini already handles all retries
+    """Process one LLM queue item. call_llm already handles all retries
     internally (RPM sleep + exponential backoff across the whole chain).
     If it still raises, propagate so the worker can notify the user.
     """
@@ -1488,7 +1489,7 @@ def _trim_history_pairs(context_turns: int) -> None:
 
 
 def _make_cooldown_notifier(chat_id: int) -> Callable[[int, int, float], None]:
-    """Best-effort Telegram notice sent while call_gemini() is cooling down
+    """Best-effort Telegram notice sent while call_llm() is cooling down
     between whole-chain retry passes. Never recorded into history/context.
     """
 
@@ -1585,7 +1586,7 @@ def _fc_wrapup(
     finish_reason: Optional[str] = None
     wrapup_model: Optional[str] = None
     try:
-        response, wrapup_model = call_gemini(contents, on_cooldown=on_cooldown, allow_tools=False)
+        response, wrapup_model = call_llm(contents, on_cooldown=on_cooldown, allow_tools=False)
     except Exception:
         _LOGGER.warning("fc_wrapup_failed reason=%s", reason, exc_info=True)
     else:
@@ -1712,7 +1713,7 @@ def _run_llm_turn(
     repeat_count = 0
 
     while True:
-        response, _model = call_gemini(contents, on_cooldown=on_cooldown)
+        response, _model = call_llm(contents, on_cooldown=on_cooldown)
         parsed = parse_response(response)
 
         if parsed.blocked:

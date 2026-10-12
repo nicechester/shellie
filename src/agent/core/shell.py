@@ -103,6 +103,7 @@ def _child_env() -> Dict[str, str]:
     env = dict(os.environ)
     env.pop("TELEGRAM_BOT_TOKEN", None)
     env.pop("GEMINI_API_KEY", None)
+    env.pop("OPENAI_API_KEY", None)
     env["PATH"] = _augmented_path(env.get("PATH", ""))
     return env
 

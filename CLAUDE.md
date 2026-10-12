@@ -29,7 +29,7 @@ bypass, 24/7 via launchd/systemd.
 
 - `config.py` — path constants (BASE_DIR, MEMORY_DIR/FILE, SKILLS_DIR,
   OFFSET_FILE, SETTINGS_FILE), pure `parse_dotenv()`, re-exports `settings`.
-- `settings.py` — `SettingSpec` catalog (**22 keys**) + `SettingsStore`
+- `settings.py` — `SettingSpec` catalog (**27 keys**) + `SettingsStore`
   singleton: 3 layers (defaults < .env/os.environ read once at startup <
   settings.json overrides), copy-on-write lock-free reads, serialized
   all-or-nothing `update/unset` with per-key prechecks, atomic 0600 persist,
@@ -63,6 +63,7 @@ bypass, 24/7 via launchd/systemd.
   `format_list(entries)`. Ticker thread touches only scheduler+settings+_task_queue.put, never Telegram. Calls
   `enqueue_scheduled(entry)` when a prompt is due (posts ⏰ notice, runs independently — never replaces interactive tasks).
   Model-made changes via manage_schedule announced in chat with 🗓️ (prompt-injection visibility). Issue #5.
+- `core/llm.py` — `call_llm()` dispatch on `LLM_BACKEND` (read per call). `core/openai.py` — OpenAI-compatible backend (#13): converts the Gemini-shaped history to chat messages and maps replies back to the Gemini shape, so `parse_response()` is shared; simpler retry (model fallback on 404/408/429/5xx, chain cooldown, no same-model 5xx retries). Gemini key stays required (web search uses it).
 - `core/gemini.py` — model-chain fallback (429 / RESOURCE_EXHAUSTED / 5xx /
   transport → next model; snapshot of chain/key/timeouts at call start), plus
   whole-chain retry with cooldown (GEMINI_MAX_RETRIES passes, delay = server

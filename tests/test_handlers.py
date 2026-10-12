@@ -107,7 +107,7 @@ class HandlersTestCase(unittest.TestCase):
             "execute_shell": mock.patch.object(handlers, "execute_shell"),
             "execute_shell_in": mock.patch.object(handlers, "execute_shell_in"),
             "read_memory": mock.patch.object(handlers, "read_memory"),
-            "call_gemini": mock.patch.object(handlers, "call_gemini"),
+            "call_llm": mock.patch.object(handlers, "call_llm"),
             "run_tool": mock.patch.object(handlers, "run_tool"),
             "classify_upload": mock.patch.object(files, "classify_upload"),
             "build_attachment_part": mock.patch.object(files, "build_attachment_part"),
@@ -127,7 +127,7 @@ class HandlersTestCase(unittest.TestCase):
         self.mock_execute_shell_in = self.mocks["execute_shell_in"]
         self.mock_execute_shell_in.return_value = ("out", "/ws/sub")
         self.mock_read_memory = self.mocks["read_memory"]
-        self.mock_call_gemini = self.mocks["call_gemini"]
+        self.mock_call_llm = self.mocks["call_llm"]
         self.mock_run_tool = self.mocks["run_tool"]
         self.mock_classify_upload = self.mocks["classify_upload"]
         self.mock_build_attachment_part = self.mocks["build_attachment_part"]
@@ -257,7 +257,7 @@ class BypassCommandTests(HandlersTestCase):
         handlers.process_update(self._update("!echo hi"))
         self.mock_execute_shell.assert_called_once_with("echo hi")
         self.mock_execute_shell_in.assert_not_called()
-        self.mock_call_gemini.assert_not_called()
+        self.mock_call_llm.assert_not_called()
         reply = self.mock_send_message.call_args[0][1]
         self.assertEqual(reply, "<pre>hi</pre>")
 
@@ -265,7 +265,7 @@ class BypassCommandTests(HandlersTestCase):
         self.mock_execute_shell.return_value = "hi"
         handlers.process_update(self._update("/sh echo hi"))
         self.mock_execute_shell.assert_called_once_with("echo hi")
-        self.mock_call_gemini.assert_not_called()
+        self.mock_call_llm.assert_not_called()
         reply = self.mock_send_message.call_args[0][1]
         self.assertEqual(reply, "<pre>hi</pre>")
 
@@ -273,7 +273,7 @@ class BypassCommandTests(HandlersTestCase):
         self.mock_read_memory.return_value = "remembered fact"
         handlers.process_update(self._update("/mem"))
         self.mock_read_memory.assert_called_once()
-        self.mock_call_gemini.assert_not_called()
+        self.mock_call_llm.assert_not_called()
         reply = self.mock_send_message.call_args[0][1]
         self.assertIn("remembered fact", reply)
 
@@ -281,7 +281,7 @@ class BypassCommandTests(HandlersTestCase):
         handlers._history.append({"role": "user", "parts": [{"text": "old"}]})
         handlers.process_update(self._update("/reset"))
         self.assertEqual(handlers._history, [])
-        self.mock_call_gemini.assert_not_called()
+        self.mock_call_llm.assert_not_called()
 
 
 class RestartCommandTests(HandlersTestCase):
@@ -338,7 +338,7 @@ class SettingsCommandTests(HandlersTestCase):
         self.mock_settings.update.assert_called_once_with({"SHELL_TIMEOUT_SEC": "60"}, actor="telegram")
         reply = self.mock_send_message.call_args[0][1]
         self.assertIn("SHELL_TIMEOUT_SEC", reply)
-        self.mock_call_gemini.assert_not_called()
+        self.mock_call_llm.assert_not_called()
         self.assertEqual(handlers._history, [])
 
     def test_set_secret_key_is_blocked_and_message_deleted(self) -> None:
@@ -373,7 +373,7 @@ class SettingsCommandTests(HandlersTestCase):
         self.assertTrue(reply.startswith("<pre>"))
         self.assertTrue(reply.endswith("</pre>"))
         self.assertIn("••••", reply)
-        self.mock_call_gemini.assert_not_called()
+        self.mock_call_llm.assert_not_called()
         self.assertEqual(handlers._history, [])
 
     def test_env_no_arg_matches_settings_listing(self) -> None:
@@ -384,7 +384,7 @@ class SettingsCommandTests(HandlersTestCase):
         env_reply = self.mock_send_message.call_args[0][1]
 
         self.assertEqual(settings_reply, env_reply)
-        self.mock_call_gemini.assert_not_called()
+        self.mock_call_llm.assert_not_called()
         self.assertEqual(handlers._history, [])
 
     def test_env_with_key_matches_get(self) -> None:
@@ -400,7 +400,7 @@ class SettingsCommandTests(HandlersTestCase):
 
         self.assertEqual(get_reply, env_reply)
         self.assertIn("GEMINI_MODEL_CHAIN", env_reply)
-        self.mock_call_gemini.assert_not_called()
+        self.mock_call_llm.assert_not_called()
 
     def test_env_with_extra_args_matches_get(self) -> None:
         handlers.process_update(self._update("/get SHELL_TIMEOUT_SEC extra"))
@@ -413,7 +413,7 @@ class SettingsCommandTests(HandlersTestCase):
 
     def test_env_excluded_from_llm_queue(self) -> None:
         handlers.process_update(self._update("/env"))
-        self.mock_call_gemini.assert_not_called()
+        self.mock_call_llm.assert_not_called()
         self.assertEqual(handlers._task_queue.qsize(), 0)
         self.assertEqual(handlers._history, [])
 
@@ -439,7 +439,7 @@ class FunctionCallLoopTests(HandlersTestCase):
         calls_batch = [("execute_shell", {"command": "ls"}), ("append_memory", {"content": "note"})]
         fc_resp = _fc_response(calls_batch)
         final_resp = _text_response("done")
-        self.mock_call_gemini.side_effect = [(fc_resp, "m1"), (final_resp, "m1")]
+        self.mock_call_llm.side_effect = [(fc_resp, "m1"), (final_resp, "m1")]
         self.mock_run_tool.side_effect = ["ls-output", "mem-output"]
 
         handlers.process_update(self._update("do things"))
@@ -449,7 +449,7 @@ class FunctionCallLoopTests(HandlersTestCase):
         self.mock_run_tool.assert_any_call("execute_shell", {"command": "ls"})
         self.mock_run_tool.assert_any_call("append_memory", {"content": "note"})
 
-        second_call_contents = self.mock_call_gemini.call_args_list[1][0][0]
+        second_call_contents = self.mock_call_llm.call_args_list[1][0][0]
         function_response_turn = second_call_contents[-1]
         self.assertEqual(function_response_turn["role"], "user")
         self.assertEqual(len(function_response_turn["parts"]), 2)
@@ -462,7 +462,7 @@ class FunctionCallLoopTests(HandlersTestCase):
         fc_pwd = _fc_response([("execute_shell", {"command": "pwd"})])
         fc_whoami = _fc_response([("execute_shell", {"command": "whoami"})])
         summary_resp = _text_response("summary")
-        self.mock_call_gemini.side_effect = [
+        self.mock_call_llm.side_effect = [
             (fc_ls, "m1"), (fc_pwd, "m1"), (fc_whoami, "m1"), (summary_resp, "m1"),
         ]
         self.mock_run_tool.side_effect = ["ls-output", "pwd-output"]
@@ -470,10 +470,10 @@ class FunctionCallLoopTests(HandlersTestCase):
         handlers.process_update(self._update("loop forever"))
         self._drain_queue()
 
-        self.assertEqual(self.mock_call_gemini.call_count, 4)
+        self.assertEqual(self.mock_call_llm.call_count, 4)
         self.assertEqual(self.mock_run_tool.call_count, 2)  # pending whoami never runs
 
-        last_call_kwargs = self.mock_call_gemini.call_args_list[-1][1]
+        last_call_kwargs = self.mock_call_llm.call_args_list[-1][1]
         self.assertIs(last_call_kwargs["allow_tools"], False)
 
         reply = self.mock_send_message.call_args[0][1]
@@ -483,7 +483,7 @@ class FunctionCallLoopTests(HandlersTestCase):
         self.assertEqual(len(handlers._history), 2)
         self.assertEqual(handlers._history[1]["parts"], [{"text": "summary"}])
 
-        last_call_contents = self.mock_call_gemini.call_args_list[-1][0][0]
+        last_call_contents = self.mock_call_llm.call_args_list[-1][0][0]
         final_turn = last_call_contents[-1]
         self.assertEqual(final_turn["role"], "user")
         self.assertTrue(final_turn["parts"][-1]["text"].startswith("[system]"))
@@ -492,7 +492,7 @@ class FunctionCallLoopTests(HandlersTestCase):
         self._settings_values["FC_MAX_LOOPS"] = 15
         fc_ls = _fc_response([("execute_shell", {"command": "ls"})])
         wrap_resp = _text_response("wrap")
-        self.mock_call_gemini.side_effect = [
+        self.mock_call_llm.side_effect = [
             (fc_ls, "m1"), (fc_ls, "m1"), (fc_ls, "m1"), (wrap_resp, "m1"),
         ]
         self.mock_run_tool.return_value = "same"
@@ -501,9 +501,9 @@ class FunctionCallLoopTests(HandlersTestCase):
         self._drain_queue()
 
         self.assertEqual(self.mock_run_tool.call_count, 3)
-        self.assertEqual(self.mock_call_gemini.call_count, 4)
+        self.assertEqual(self.mock_call_llm.call_count, 4)
 
-        last_call_kwargs = self.mock_call_gemini.call_args_list[-1][1]
+        last_call_kwargs = self.mock_call_llm.call_args_list[-1][1]
         self.assertIs(last_call_kwargs["allow_tools"], False)
 
         reply = self.mock_send_message.call_args[0][1]
@@ -514,7 +514,7 @@ class FunctionCallLoopTests(HandlersTestCase):
     def test_identical_calls_with_changing_results_are_not_flagged(self) -> None:
         fc_ls = _fc_response([("execute_shell", {"command": "ls"})])
         done_resp = _text_response("done")
-        self.mock_call_gemini.side_effect = [
+        self.mock_call_llm.side_effect = [
             (fc_ls, "m1"), (fc_ls, "m1"), (fc_ls, "m1"), (done_resp, "m1"),
         ]
         self.mock_run_tool.side_effect = ["a", "b", "c"]
@@ -524,14 +524,14 @@ class FunctionCallLoopTests(HandlersTestCase):
 
         reply = self.mock_send_message.call_args[0][1]
         self.assertEqual(reply, "done")
-        for call in self.mock_call_gemini.call_args_list:
+        for call in self.mock_call_llm.call_args_list:
             self.assertNotIn("allow_tools", call[1])
 
     def test_reordered_parallel_batch_counts_as_repeat(self) -> None:
         batch_a = _fc_response([("execute_shell", {"command": "ls"}), ("execute_shell", {"command": "pwd"})])
         batch_b = _fc_response([("execute_shell", {"command": "pwd"}), ("execute_shell", {"command": "ls"})])
         wrap_resp = _text_response("wrap")
-        self.mock_call_gemini.side_effect = [
+        self.mock_call_llm.side_effect = [
             (batch_a, "m1"), (batch_b, "m1"), (batch_a, "m1"), (wrap_resp, "m1"),
         ]
 
@@ -544,7 +544,7 @@ class FunctionCallLoopTests(HandlersTestCase):
         self._drain_queue()
 
         # 3 iterations executed before the loop detector fires on the 3rd.
-        self.assertEqual(self.mock_call_gemini.call_count, 4)
+        self.assertEqual(self.mock_call_llm.call_count, 4)
         reply = self.mock_send_message.call_args[0][1]
         self.assertIn("3회 연속 반복", reply)
 
@@ -552,7 +552,7 @@ class FunctionCallLoopTests(HandlersTestCase):
         self._settings_values["FC_MAX_LOOPS"] = 1
         fc_with_text = _fc_response([("execute_shell", {"command": "ls"})], text="partial")
         fc_pending = _fc_response([("execute_shell", {"command": "pwd"})])
-        self.mock_call_gemini.side_effect = [
+        self.mock_call_llm.side_effect = [
             (fc_with_text, "m1"),
             (fc_pending, "m1"),
             Exception("boom"),
@@ -575,7 +575,7 @@ class FunctionCallLoopTests(HandlersTestCase):
         fc_pending_1 = _fc_response([("execute_shell", {"command": "ls"})])
         fc_pending_2 = _fc_response([("execute_shell", {"command": "pwd"})])
         empty_wrapup = _text_response("")
-        self.mock_call_gemini.side_effect = [
+        self.mock_call_llm.side_effect = [
             (fc_pending_1, "m1"),
             (fc_pending_2, "m1"),
             (empty_wrapup, "m1"),
@@ -591,7 +591,7 @@ class FunctionCallLoopTests(HandlersTestCase):
         self.assertEqual(handlers._history, [])
 
     def test_blocked_response_sends_blocked_message_and_history_not_retained(self) -> None:
-        self.mock_call_gemini.return_value = (_blocked_response("SAFETY"), "m1")
+        self.mock_call_llm.return_value = (_blocked_response("SAFETY"), "m1")
         handlers.process_update(self._update("something"))
         self._drain_queue()
         reply = self.mock_send_message.call_args[0][1]
@@ -603,12 +603,12 @@ class HistoryManagementTests(HandlersTestCase):
     def test_context_turns_one_retains_only_last_pair(self) -> None:
         self._settings_values["CONTEXT_TURNS"] = 1
 
-        self.mock_call_gemini.return_value = (_text_response("reply-1"), "m1")
+        self.mock_call_llm.return_value = (_text_response("reply-1"), "m1")
         handlers.process_update(self._update("msg1"))
         self._drain_queue()
         self.assertEqual(len(handlers._history), 2)
 
-        self.mock_call_gemini.return_value = (_text_response("reply-2"), "m1")
+        self.mock_call_llm.return_value = (_text_response("reply-2"), "m1")
         handlers.process_update(self._update("msg2"))
         self._drain_queue()
         self.assertEqual(len(handlers._history), 2)
@@ -616,13 +616,13 @@ class HistoryManagementTests(HandlersTestCase):
 
     def test_context_turns_zero_retains_nothing_and_sends_empty_history(self) -> None:
         self._settings_values["CONTEXT_TURNS"] = 0
-        self.mock_call_gemini.return_value = (_text_response("reply"), "m1")
+        self.mock_call_llm.return_value = (_text_response("reply"), "m1")
 
         handlers.process_update(self._update("msg1"))
         self._drain_queue()
 
         self.assertEqual(handlers._history, [])
-        first_call_contents = self.mock_call_gemini.call_args_list[0][0][0]
+        first_call_contents = self.mock_call_llm.call_args_list[0][0][0]
         self.assertEqual(len(first_call_contents), 1)
         self.assertEqual(first_call_contents[0]["parts"][0]["text"], "msg1")
 
@@ -631,7 +631,7 @@ class HistoryManagementTests(HandlersTestCase):
         handlers._history.append({"role": "model", "parts": [{"text": "old-reply"}]})
         handlers._last_activity = 1.0  # far in the past
         self._settings_values["IDLE_RESET_MINUTES"] = 1
-        self.mock_call_gemini.return_value = (_text_response("reply"), "m1")
+        self.mock_call_llm.return_value = (_text_response("reply"), "m1")
 
         handlers.process_update(self._update("new message"))
         self._drain_queue()
@@ -644,7 +644,7 @@ class HistoryManagementTests(HandlersTestCase):
 class QueueTests(HandlersTestCase):
     def test_llm_message_is_enqueued_not_called_directly(self) -> None:
         handlers.process_update(self._update("hello"))
-        self.mock_call_gemini.assert_not_called()
+        self.mock_call_llm.assert_not_called()
         self.assertEqual(handlers._task_queue.qsize(), 1)
 
     def test_queue_status_idle(self) -> None:
@@ -667,7 +667,7 @@ class QueueTests(HandlersTestCase):
         self.assertIn("what is the weather today", reply)
 
     def test_process_llm_item_delegates_to_handle_llm(self) -> None:
-        """_process_llm_item calls _handle_llm; retry/cooldown now lives in call_gemini."""
+        """_process_llm_item calls _handle_llm; retry/cooldown now lives in call_llm."""
         sleep_patcher = mock.patch.object(handlers.time, "sleep")
         handle_llm_patcher = mock.patch.object(handlers, "_handle_llm")
         with sleep_patcher as mock_sleep, handle_llm_patcher as mock_handle_llm:
@@ -820,7 +820,7 @@ class ContinuationTests(HandlersTestCase):
         fc_pending_2 = _fc_response([("execute_shell", {"command": "pwd"})])
         wrapup_resp = _text_response("W1")
         done_resp = _text_response("all finished")
-        self.mock_call_gemini.side_effect = [
+        self.mock_call_llm.side_effect = [
             (fc_pending_1, "m1"), (fc_pending_2, "m1"), (wrapup_resp, "m1"), (done_resp, "m1"),
         ]
         self.mock_run_tool.return_value = "ls-output"
@@ -828,8 +828,8 @@ class ContinuationTests(HandlersTestCase):
         handlers.process_update(self._update("do the big task"))
         self._drain_queue_full()
 
-        self.assertEqual(self.mock_call_gemini.call_count, 4)
-        continuation_contents = self.mock_call_gemini.call_args_list[3][0][0]
+        self.assertEqual(self.mock_call_llm.call_count, 4)
+        continuation_contents = self.mock_call_llm.call_args_list[3][0][0]
         last_turn = continuation_contents[-1]
         self.assertEqual(last_turn["role"], "user")
         cont_text = last_turn["parts"][-1]["text"]
@@ -848,7 +848,7 @@ class ContinuationTests(HandlersTestCase):
         wrap1 = _text_response("W1")
         wrap2 = _text_response("W2")
         wrap3 = _text_response("W3")
-        self.mock_call_gemini.side_effect = [
+        self.mock_call_llm.side_effect = [
             (fc1, "m1"), (fc2, "m1"), (wrap1, "m1"),
             (fc1, "m1"), (fc2, "m1"), (wrap2, "m1"),
             (fc1, "m1"), (fc2, "m1"), (wrap3, "m1"),
@@ -858,7 +858,7 @@ class ContinuationTests(HandlersTestCase):
         handlers.process_update(self._update("long task"))
         self._drain_queue_full()
 
-        self.assertEqual(self.mock_call_gemini.call_count, 9)
+        self.assertEqual(self.mock_call_llm.call_count, 9)
         texts = self._sent_texts()
         self.assertTrue(any("(1/2)" in t for t in texts))
         self.assertTrue(any("(2/2)" in t for t in texts))
@@ -875,13 +875,13 @@ class ContinuationTests(HandlersTestCase):
         fc1 = _fc_response([("execute_shell", {"command": "ls"})])
         fc2 = _fc_response([("execute_shell", {"command": "pwd"})])
         wrap1 = _text_response("W1")
-        self.mock_call_gemini.side_effect = [(fc1, "m1"), (fc2, "m1"), (wrap1, "m1")]
+        self.mock_call_llm.side_effect = [(fc1, "m1"), (fc2, "m1"), (wrap1, "m1")]
         self.mock_run_tool.return_value = "out"
 
         handlers.process_update(self._update("task"))
         self._drain_queue_full()
 
-        self.assertEqual(self.mock_call_gemini.call_count, 3)
+        self.assertEqual(self.mock_call_llm.call_count, 3)
         record = tasks.load_task()
         self.assertIsNotNone(record)
         self.assertEqual(record["stop_reason"], "limit")
@@ -892,7 +892,7 @@ class ContinuationTests(HandlersTestCase):
         self._settings_values["FC_MAX_LOOPS"] = 15
         fc_ls = _fc_response([("execute_shell", {"command": "ls"})])
         wrap_resp = _text_response("wrap")
-        self.mock_call_gemini.side_effect = [
+        self.mock_call_llm.side_effect = [
             (fc_ls, "m1"), (fc_ls, "m1"), (fc_ls, "m1"), (wrap_resp, "m1"),
         ]
         self.mock_run_tool.return_value = "same"
@@ -909,7 +909,7 @@ class ContinuationTests(HandlersTestCase):
         fc1 = _fc_response([("execute_shell", {"command": "ls"})])
         fc2 = _fc_response([("execute_shell", {"command": "pwd"})])
         wrap_w1 = _text_response("W1")
-        self.mock_call_gemini.side_effect = [
+        self.mock_call_llm.side_effect = [
             (fc1, "m1"), (fc2, "m1"), (wrap_w1, "m1"),
             (fc1, "m1"), (fc2, "m1"), (wrap_w1, "m1"),
         ]
@@ -926,20 +926,20 @@ class ContinuationTests(HandlersTestCase):
     def test_wrapup_no_text_no_continuation(self) -> None:
         fc1 = _fc_response([("execute_shell", {"command": "ls"})])
         fc2 = _fc_response([("execute_shell", {"command": "pwd"})])
-        self.mock_call_gemini.side_effect = [(fc1, "m1"), (fc2, "m1"), Exception("boom")]
+        self.mock_call_llm.side_effect = [(fc1, "m1"), (fc2, "m1"), Exception("boom")]
         self.mock_run_tool.return_value = "out"
 
         handlers.process_update(self._update("silent task"))
         self._drain_queue_full()
 
-        self.assertEqual(self.mock_call_gemini.call_count, 3)
+        self.assertEqual(self.mock_call_llm.call_count, 3)
         record = tasks.load_task()
         self.assertIsNotNone(record)
         self.assertEqual(record["continuations"], 0)
         self.assertEqual(record["stop_reason"], "limit")
 
     def test_blocked_response_deletes_file_no_hint(self) -> None:
-        self.mock_call_gemini.return_value = (_blocked_response("SAFETY"), "m1")
+        self.mock_call_llm.return_value = (_blocked_response("SAFETY"), "m1")
 
         handlers.process_update(self._update("blocked task"))
         self._drain_queue_full()
@@ -948,7 +948,7 @@ class ContinuationTests(HandlersTestCase):
         self.assertEqual(self.mock_send_message.call_count, 1)
 
     def test_handle_llm_error_path_keeps_file(self) -> None:
-        self.mock_call_gemini.side_effect = Exception("kaboom")
+        self.mock_call_llm.side_effect = Exception("kaboom")
 
         handlers.process_update(self._update("error task"))
         self._drain_queue_full()
@@ -972,13 +972,13 @@ class ContinuationTests(HandlersTestCase):
                 return fc2, "m1"
             return wrap1, "m1"
 
-        self.mock_call_gemini.side_effect = _side_effect
+        self.mock_call_llm.side_effect = _side_effect
         self.mock_run_tool.return_value = "out"
 
         handlers.process_update(self._update("abandon me"))
         self._drain_queue_full()
 
-        self.assertEqual(self.mock_call_gemini.call_count, 3)
+        self.assertEqual(self.mock_call_llm.call_count, 3)
         self.assertIsNone(tasks.load_task())
         texts = self._sent_texts()
         self.assertFalse(any("Continuing the remaining work automatically" in t for t in texts))
@@ -1018,10 +1018,10 @@ class TaskCommandTests(HandlersTestCase):
         self.assertEqual(item.kind, "continue")
         self.assertEqual(item.task_id, record["task_id"])
 
-        self.mock_call_gemini.return_value = (_text_response("all done"), "m1")
+        self.mock_call_llm.return_value = (_text_response("all done"), "m1")
         self._drain_queue_full()
 
-        contents = self.mock_call_gemini.call_args_list[0][0][0]
+        contents = self.mock_call_llm.call_args_list[0][0][0]
         last_text = contents[-1]["parts"][-1]["text"]
         self.assertIn("manual", last_text)
         self.assertIsNone(tasks.load_task())
@@ -1034,7 +1034,7 @@ class TaskCommandTests(HandlersTestCase):
 
         reply = self.mock_send_message.call_args[0][1]
         self.assertIn("already finished or discarded", reply)
-        self.mock_call_gemini.assert_not_called()
+        self.mock_call_llm.assert_not_called()
 
     def test_continue_while_active_already_in_progress(self) -> None:
         record = tasks.new_task(chat_id=1, user_id=111, prompt="active task")
@@ -1365,7 +1365,7 @@ class HandleLlmAttachmentTests(HandlersTestCase):
             sent_parts.append(copy.deepcopy(contents[-1]["parts"]))
             return (_text_response("ok"), "m1")
 
-        self.mock_call_gemini.side_effect = _capture
+        self.mock_call_llm.side_effect = _capture
 
         outcome, _ = handlers._handle_llm(1, "hi", attachments=[ref])
 
@@ -1380,21 +1380,21 @@ class HandleLlmAttachmentTests(HandlersTestCase):
         self.assertIn("hi", parts_texts)
 
     def test_no_attachments_behaves_as_before(self) -> None:
-        self.mock_call_gemini.return_value = (_text_response("ok"), "m1")
+        self.mock_call_llm.return_value = (_text_response("ok"), "m1")
 
         outcome, _ = handlers._handle_llm(1, "hi")
 
         self.assertEqual(outcome, "done")
         self.mock_build_attachment_part.assert_not_called()
-        first_call_contents = self.mock_call_gemini.call_args_list[0][0][0]
+        first_call_contents = self.mock_call_llm.call_args_list[0][0][0]
         self.assertEqual(first_call_contents[-1]["parts"], [{"text": "hi"}])
 
-    def test_call_gemini_failure_saves_nothing_to_history(self) -> None:
+    def test_call_llm_failure_saves_nothing_to_history(self) -> None:
         ref = self._ref()
         part = {"inlineData": {"mimeType": "image/jpeg", "data": "QUJD"}}
         placeholder = "[attachment removed from history: photo.jpg (image/jpeg) — saved at /ws/photo.jpg]"
         self.mock_build_attachment_part.return_value = (part, placeholder)
-        self.mock_call_gemini.side_effect = Exception("boom")
+        self.mock_call_llm.side_effect = Exception("boom")
 
         outcome, _ = handlers._handle_llm(1, "hi", attachments=[ref])
 
@@ -1414,7 +1414,7 @@ class TaskAttachmentPersistenceTests(HandlersTestCase):
         )
         self._settings_values["FC_MAX_LOOPS"] = 1
         fc_pending = _fc_response([("execute_shell", {"command": "ls"})])
-        self.mock_call_gemini.side_effect = [
+        self.mock_call_llm.side_effect = [
             (fc_pending, "m1"), (fc_pending, "m1"), (_text_response(""), "m1"),
         ]
         self.mock_run_tool.return_value = "out"
@@ -1467,7 +1467,7 @@ class SendFileToolRoutingTests(HandlersTestCase):
     def test_send_file_tool_call_routes_to_tg_files_with_chat_id(self) -> None:
         fc_resp = _fc_response([("send_file", {"path": "out.csv", "caption": "here"})])
         final_resp = _text_response("done")
-        self.mock_call_gemini.side_effect = [(fc_resp, "m1"), (final_resp, "m1")]
+        self.mock_call_llm.side_effect = [(fc_resp, "m1"), (final_resp, "m1")]
 
         with mock.patch.object(files, "send_file", return_value=(True, "Sent out.csv (1.0 KB)")) as mock_send_file:
             handlers.process_update(self._update("send the file"))
@@ -1491,7 +1491,7 @@ class ViewFileToolTests(HandlersTestCase):
         self.mock_build_attachment_part.return_value = (part, "placeholder")
         fc_resp = _fc_response([("view_file", {"path": "a.jpg"})])
         final_resp = _text_response("done")
-        self.mock_call_gemini.side_effect = [(fc_resp, "m1"), (final_resp, "m1")]
+        self.mock_call_llm.side_effect = [(fc_resp, "m1"), (final_resp, "m1")]
 
         with mock.patch.object(files, "resolve_view_target", return_value=(ref, None)):
             handlers.process_update(self._update("look at a.jpg"))
@@ -1499,7 +1499,7 @@ class ViewFileToolTests(HandlersTestCase):
 
         self.mock_run_tool.assert_not_called()
 
-        second_call_contents = self.mock_call_gemini.call_args_list[1][0][0]
+        second_call_contents = self.mock_call_llm.call_args_list[1][0][0]
         last_turn = second_call_contents[-1]
         self.assertEqual(last_turn["role"], "user")
         parts = last_turn["parts"]
@@ -1515,12 +1515,12 @@ class ViewFileToolTests(HandlersTestCase):
         self.mock_build_attachment_part.return_value = (part, "placeholder")
         fc_resp = _fc_response([("view_file", {"path": "note.txt"})])
         final_resp = _text_response("done")
-        self.mock_call_gemini.side_effect = [(fc_resp, "m1"), (final_resp, "m1")]
+        self.mock_call_llm.side_effect = [(fc_resp, "m1"), (final_resp, "m1")]
 
         with mock.patch.object(files, "resolve_view_target", return_value=(ref, None)):
             handlers._handle_llm(1, "look at note.txt")
 
-        second_call_contents = self.mock_call_gemini.call_args_list[1][0][0]
+        second_call_contents = self.mock_call_llm.call_args_list[1][0][0]
         last_turn = second_call_contents[-1]
         self.assertEqual(len(last_turn["parts"]), 1)
         self.assertEqual(
@@ -1536,12 +1536,12 @@ class ViewFileToolTests(HandlersTestCase):
             [("execute_shell", {"command": "ls"}), ("view_file", {"path": "a.jpg"})]
         )
         final_resp = _text_response("done")
-        self.mock_call_gemini.side_effect = [(fc_resp, "m1"), (final_resp, "m1")]
+        self.mock_call_llm.side_effect = [(fc_resp, "m1"), (final_resp, "m1")]
 
         with mock.patch.object(files, "resolve_view_target", return_value=(ref, None)):
             handlers._handle_llm(1, "do both")
 
-        parts = self.mock_call_gemini.call_args_list[1][0][0][-1]["parts"]
+        parts = self.mock_call_llm.call_args_list[1][0][0][-1]["parts"]
         self.assertEqual(parts[0]["functionResponse"]["name"], "execute_shell")
         self.assertEqual(parts[1]["functionResponse"]["name"], "view_file")
         self.assertEqual(parts[2], {"text": "[view_file: {}]".format(ref["path"])})
@@ -1557,13 +1557,13 @@ class ViewFileToolTests(HandlersTestCase):
 
         call_seq = [_fc_response([("view_file", {"path": "img{}.jpg".format(i)})]) for i in range(6)]
         final_resp = _text_response("done")
-        self.mock_call_gemini.side_effect = [(r, "m1") for r in call_seq] + [(final_resp, "m1")]
+        self.mock_call_llm.side_effect = [(r, "m1") for r in call_seq] + [(final_resp, "m1")]
 
         with mock.patch.object(files, "resolve_view_target", side_effect=_resolve):
             handlers._handle_llm(1, "view many")
 
-        self.assertEqual(self.mock_call_gemini.call_count, 7)
-        sixth_turn = self.mock_call_gemini.call_args_list[6][0][0][-1]
+        self.assertEqual(self.mock_call_llm.call_count, 7)
+        sixth_turn = self.mock_call_llm.call_args_list[6][0][0][-1]
         output = sixth_turn["parts"][0]["functionResponse"]["response"]["output"]
         self.assertIn("limit", output.lower())
         self.assertEqual(len(sixth_turn["parts"]), 1)  # no media parts appended on refusal
@@ -1584,13 +1584,13 @@ class ViewFileToolTests(HandlersTestCase):
 
         call_seq = [_fc_response([("view_file", {"path": "v{}.jpg".format(i)})]) for i in range(3)]
         final_resp = _text_response("done")
-        self.mock_call_gemini.side_effect = [(r, "m1") for r in call_seq] + [(final_resp, "m1")]
+        self.mock_call_llm.side_effect = [(r, "m1") for r in call_seq] + [(final_resp, "m1")]
 
         with mock.patch.object(files, "resolve_view_target", side_effect=_resolve):
             handlers._handle_llm(1, "view stuff", attachments=refs)
 
-        self.assertEqual(self.mock_call_gemini.call_count, 4)
-        third_view_turn = self.mock_call_gemini.call_args_list[3][0][0][-1]
+        self.assertEqual(self.mock_call_llm.call_count, 4)
+        third_view_turn = self.mock_call_llm.call_args_list[3][0][0][-1]
         output = third_view_turn["parts"][0]["functionResponse"]["response"]["output"]
         self.assertIn("limit", output.lower())
 
@@ -1605,12 +1605,12 @@ class ViewFileToolTests(HandlersTestCase):
         fc1 = _fc_response([("view_file", {"path": "a.jpg"})])
         fc2 = _fc_response([("view_file", {"path": "b.jpg"})])
         final_resp = _text_response("done")
-        self.mock_call_gemini.side_effect = [(fc1, "m1"), (fc2, "m1"), (final_resp, "m1")]
+        self.mock_call_llm.side_effect = [(fc1, "m1"), (fc2, "m1"), (final_resp, "m1")]
 
         with mock.patch.object(files, "resolve_view_target", side_effect=lambda raw: (refs_by_path[raw], None)):
             handlers._handle_llm(1, "view two big files")
 
-        second_turn = self.mock_call_gemini.call_args_list[2][0][0][-1]
+        second_turn = self.mock_call_llm.call_args_list[2][0][0][-1]
         output = second_turn["parts"][0]["functionResponse"]["response"]["output"]
         self.assertIn("limit", output.lower())
 
@@ -1621,12 +1621,12 @@ class ViewFileToolTests(HandlersTestCase):
         fc1 = _fc_response([("view_file", {"path": "a.jpg"})])
         fc2 = _fc_response([("view_file", {"path": "a.jpg"})])
         final_resp = _text_response("done")
-        self.mock_call_gemini.side_effect = [(fc1, "m1"), (fc2, "m1"), (final_resp, "m1")]
+        self.mock_call_llm.side_effect = [(fc1, "m1"), (fc2, "m1"), (final_resp, "m1")]
 
         with mock.patch.object(files, "resolve_view_target", return_value=(ref, None)):
             handlers._handle_llm(1, "view a.jpg twice")
 
-        second_turn = self.mock_call_gemini.call_args_list[2][0][0][-1]
+        second_turn = self.mock_call_llm.call_args_list[2][0][0][-1]
         output = second_turn["parts"][0]["functionResponse"]["response"]["output"]
         self.assertIn("already attached", output)
         self.assertEqual(len(second_turn["parts"]), 1)
@@ -1637,7 +1637,7 @@ class ViewFileToolTests(HandlersTestCase):
         self.mock_build_attachment_part.return_value = (part, "placeholder")
         fc_resp = _fc_response([("view_file", {"path": "a.jpg"})])
         final_resp = _text_response("done")
-        self.mock_call_gemini.side_effect = [(fc_resp, "m1"), (final_resp, "m1")]
+        self.mock_call_llm.side_effect = [(fc_resp, "m1"), (final_resp, "m1")]
 
         with mock.patch.object(files, "resolve_view_target", return_value=(ref, None)):
             handlers._handle_llm(1, "view a.jpg")
@@ -1658,7 +1658,7 @@ class ViewFileToolTests(HandlersTestCase):
         fc1 = _fc_response([("view_file", {"path": "a.jpg"})])
         fc2 = _fc_response([("view_file", {"path": "a.jpg"})])
         wrap_resp = _text_response("summary")
-        self.mock_call_gemini.side_effect = [(fc1, "m1"), (fc2, "m1"), (wrap_resp, "m1")]
+        self.mock_call_llm.side_effect = [(fc1, "m1"), (fc2, "m1"), (wrap_resp, "m1")]
 
         saved_records = []
         original_save = tasks.save_task
@@ -1685,7 +1685,7 @@ class ViewFileToolTests(HandlersTestCase):
         self.mock_build_attachment_part.return_value = (part, "placeholder")
         fc_resp = _fc_response([("view_file", {"path": "note.txt"})])
         final_resp = _text_response("done")
-        self.mock_call_gemini.side_effect = [(fc_resp, "m1"), (final_resp, "m1")]
+        self.mock_call_llm.side_effect = [(fc_resp, "m1"), (final_resp, "m1")]
 
         with mock.patch.object(files, "resolve_view_target", return_value=(ref, None)):
             with self.assertLogs(handlers._LOGGER, level="INFO") as cm:
@@ -1698,15 +1698,15 @@ class ViewFileToolTests(HandlersTestCase):
         self._settings_values["FC_MAX_LOOPS"] = 15
         fc = _fc_response([("view_file", {"path": "nope.jpg"})])
         wrap_resp = _text_response("wrap")
-        self.mock_call_gemini.side_effect = [(fc, "m1"), (fc, "m1"), (fc, "m1"), (wrap_resp, "m1")]
+        self.mock_call_llm.side_effect = [(fc, "m1"), (fc, "m1"), (fc, "m1"), (wrap_resp, "m1")]
 
         with mock.patch.object(
             files, "resolve_view_target", return_value=(None, "File not found: nope.jpg")
         ):
             handlers._handle_llm(1, "loop view missing file")
 
-        self.assertEqual(self.mock_call_gemini.call_count, 4)
-        last_kwargs = self.mock_call_gemini.call_args_list[-1][1]
+        self.assertEqual(self.mock_call_llm.call_count, 4)
+        last_kwargs = self.mock_call_llm.call_args_list[-1][1]
         self.assertIs(last_kwargs["allow_tools"], False)
 
     def test_view_file_with_execute_shell_changing_output_not_flagged(self) -> None:
@@ -1718,18 +1718,18 @@ class ViewFileToolTests(HandlersTestCase):
             [("execute_shell", {"command": "ls"}), ("view_file", {"path": "a.jpg"})]
         )
         done_resp = _text_response("done")
-        self.mock_call_gemini.side_effect = [(batch, "m1"), (batch, "m1"), (batch, "m1"), (done_resp, "m1")]
+        self.mock_call_llm.side_effect = [(batch, "m1"), (batch, "m1"), (batch, "m1"), (done_resp, "m1")]
 
         with mock.patch.object(files, "resolve_view_target", return_value=(ref, None)):
             handlers._handle_llm(1, "poll and view")
 
-        for call in self.mock_call_gemini.call_args_list:
+        for call in self.mock_call_llm.call_args_list:
             self.assertNotIn("allow_tools", call[1])
 
     def test_resolve_error_becomes_error_output_loop_continues(self) -> None:
         fc = _fc_response([("view_file", {"path": "missing.jpg"})])
         final_resp = _text_response("done")
-        self.mock_call_gemini.side_effect = [(fc, "m1"), (final_resp, "m1")]
+        self.mock_call_llm.side_effect = [(fc, "m1"), (final_resp, "m1")]
 
         with mock.patch.object(
             files, "resolve_view_target", return_value=(None, "File not found: missing.jpg")
@@ -1737,7 +1737,7 @@ class ViewFileToolTests(HandlersTestCase):
             outcome, _ = handlers._handle_llm(1, "view missing")
 
         self.assertEqual(outcome, "done")
-        second_call_contents = self.mock_call_gemini.call_args_list[1][0][0]
+        second_call_contents = self.mock_call_llm.call_args_list[1][0][0]
         last_turn = second_call_contents[-1]
         self.assertEqual(
             last_turn["parts"][0]["functionResponse"]["response"]["output"],
@@ -1903,7 +1903,7 @@ class BrowseCommandTests(HandlersTestCase):
         with mock.patch.object(files, "send_file", return_value=(True, "Sent")) as mock_send:
             handlers.process_update(self._callback_update("f:1"))
         mock_send.assert_called_once_with(1, "/ws/report.csv")
-        self.mock_call_gemini.assert_not_called()
+        self.mock_call_llm.assert_not_called()
 
     def test_callback_file_tap_answers_before_send_file(self) -> None:
         handlers._ls_index[1] = ("/ws/report.csv", False)
@@ -2044,7 +2044,7 @@ class ShellModeTests(HandlersTestCase):
         self.assertIsNotNone(handlers._shell_session)
         self.assertEqual(handlers._shell_session.message_id, 500)
         self.assertEqual(handlers._shell_session.cwd, handlers.SHELLIE_WORKSPACE)
-        self.mock_call_gemini.assert_not_called()
+        self.mock_call_llm.assert_not_called()
         self.mock_execute_shell.assert_not_called()
         self.mock_execute_shell_in.assert_not_called()
 
@@ -2068,7 +2068,7 @@ class ShellModeTests(HandlersTestCase):
 
         self.mock_delete_message.assert_called_once_with(1, 42)
         self.assertEqual(handlers._task_queue.qsize(), 0)
-        self.mock_call_gemini.assert_not_called()
+        self.mock_call_llm.assert_not_called()
 
     def test_bang_prefixed_command_drops_single_bang(self) -> None:
         self._enter()
@@ -2357,7 +2357,7 @@ class ShellModeTests(HandlersTestCase):
         self.assertIsNotNone(handlers._shell_session)
         self.assertEqual(handlers._shell_session.message_id, 500)
         self.assertEqual(handlers._shell_session.cwd, handlers.SHELLIE_WORKSPACE)
-        self.mock_call_gemini.assert_not_called()
+        self.mock_call_llm.assert_not_called()
         self.mock_execute_shell.assert_not_called()
         self.mock_execute_shell_in.assert_not_called()
 
@@ -2381,7 +2381,7 @@ class ShellModeTests(HandlersTestCase):
 
         self.mock_send_message.assert_called_once()
         self.assertIsNotNone(handlers._shell_session)
-        self.mock_call_gemini.assert_not_called()
+        self.mock_call_llm.assert_not_called()
 
     def test_slash_shell_with_args_outside_mode_enters_shell_mode(self) -> None:
         handlers.process_update(self._update("/shell ls"))
@@ -2390,7 +2390,7 @@ class ShellModeTests(HandlersTestCase):
         self.assertIsNotNone(handlers._shell_session)
         self.mock_execute_shell.assert_not_called()
         self.mock_execute_shell_in.assert_not_called()
-        self.mock_call_gemini.assert_not_called()
+        self.mock_call_llm.assert_not_called()
         self.assertEqual(handlers._task_queue.qsize(), 0)
 
     def test_slash_shell_with_args_while_active_runs_as_command(self) -> None:
@@ -2469,7 +2469,7 @@ class ScheduledProcessingTests(HandlersTestCase):
         )
 
     def test_notice_sent_before_llm_call(self) -> None:
-        self.mock_call_gemini.return_value = (_text_response("done"), "m1")
+        self.mock_call_llm.return_value = (_text_response("done"), "m1")
         item = self._scheduled_item(schedule_id=5, name="Morning")
         with mock.patch.object(handlers.scheduler, "mark_finished") as mock_mf:
             handlers._process_llm_item(item)
@@ -2479,7 +2479,7 @@ class ScheduledProcessingTests(HandlersTestCase):
         mock_mf.assert_called_once_with(5)
 
     def test_empty_slot_creates_and_completes_task(self) -> None:
-        self.mock_call_gemini.return_value = (_text_response("done"), "m1")
+        self.mock_call_llm.return_value = (_text_response("done"), "m1")
         item = self._scheduled_item()
         with mock.patch.object(handlers.scheduler, "mark_finished"):
             handlers._process_llm_item(item)
@@ -2488,7 +2488,7 @@ class ScheduledProcessingTests(HandlersTestCase):
     def test_occupied_slot_does_not_replace_existing_task(self) -> None:
         existing = tasks.new_task(111, 999, "existing prompt")
         tasks.save_task(existing)
-        self.mock_call_gemini.return_value = (_text_response("done"), "m1")
+        self.mock_call_llm.return_value = (_text_response("done"), "m1")
         item = self._scheduled_item()
         with mock.patch.object(handlers.scheduler, "mark_finished"):
             handlers._process_llm_item(item)
@@ -2503,7 +2503,7 @@ class ScheduledProcessingTests(HandlersTestCase):
         fc1 = _fc_response([("execute_shell", {"command": "ls"})])
         fc2 = _fc_response([("execute_shell", {"command": "pwd"})])
         wrap = _text_response("W1")
-        self.mock_call_gemini.side_effect = [(fc1, "m1"), (fc2, "m1"), (wrap, "m1")]
+        self.mock_call_llm.side_effect = [(fc1, "m1"), (fc2, "m1"), (wrap, "m1")]
         self.mock_run_tool.return_value = "out"
         item = self._scheduled_item(schedule_id=9)
         with mock.patch.object(handlers.scheduler, "mark_finished"):
@@ -2516,23 +2516,23 @@ class ScheduledProcessingTests(HandlersTestCase):
     def test_history_in_false_excludes_prior_history(self) -> None:
         handlers._history.append({"role": "user", "parts": [{"text": "old"}]})
         handlers._history.append({"role": "model", "parts": [{"text": "old reply"}]})
-        self.mock_call_gemini.return_value = (_text_response("done"), "m1")
+        self.mock_call_llm.return_value = (_text_response("done"), "m1")
         item = self._scheduled_item(history_out=False)
         with mock.patch.object(handlers.scheduler, "mark_finished"):
             handlers._process_llm_item(item)
-        contents = self.mock_call_gemini.call_args[0][0]
+        contents = self.mock_call_llm.call_args[0][0]
         self.assertEqual(len(contents), 1)
         self.assertEqual(contents[0]["parts"][-1]["text"], "scheduled text")
 
     def test_history_out_true_appends_to_history(self) -> None:
-        self.mock_call_gemini.return_value = (_text_response("done"), "m1")
+        self.mock_call_llm.return_value = (_text_response("done"), "m1")
         item = self._scheduled_item(history_out=True)
         with mock.patch.object(handlers.scheduler, "mark_finished"):
             handlers._process_llm_item(item)
         self.assertEqual(len(handlers._history), 2)
 
     def test_history_out_false_does_not_append(self) -> None:
-        self.mock_call_gemini.return_value = (_text_response("done"), "m1")
+        self.mock_call_llm.return_value = (_text_response("done"), "m1")
         item = self._scheduled_item(history_out=False)
         with mock.patch.object(handlers.scheduler, "mark_finished"):
             handlers._process_llm_item(item)
@@ -2540,14 +2540,14 @@ class ScheduledProcessingTests(HandlersTestCase):
 
     def test_last_activity_unchanged(self) -> None:
         handlers._last_activity = 12345.0
-        self.mock_call_gemini.return_value = (_text_response("done"), "m1")
+        self.mock_call_llm.return_value = (_text_response("done"), "m1")
         item = self._scheduled_item()
         with mock.patch.object(handlers.scheduler, "mark_finished"):
             handlers._process_llm_item(item)
         self.assertEqual(handlers._last_activity, 12345.0)
 
     def test_mark_finished_called_on_success(self) -> None:
-        self.mock_call_gemini.return_value = (_text_response("done"), "m1")
+        self.mock_call_llm.return_value = (_text_response("done"), "m1")
         item = self._scheduled_item(schedule_id=42)
         with mock.patch.object(handlers.scheduler, "mark_finished") as mock_mf:
             handlers._process_llm_item(item)
@@ -2563,11 +2563,11 @@ class ScheduledProcessingTests(HandlersTestCase):
 
     def test_processed_even_while_shell_mode_active(self) -> None:
         handlers._shell_session = handlers._ShellSession(111)
-        self.mock_call_gemini.return_value = (_text_response("done"), "m1")
+        self.mock_call_llm.return_value = (_text_response("done"), "m1")
         item = self._scheduled_item()
         with mock.patch.object(handlers.scheduler, "mark_finished"):
             handlers._process_llm_item(item)
-        self.mock_call_gemini.assert_called_once()
+        self.mock_call_llm.assert_called_once()
 
 
 class DrainQueueMarksScheduledFinishedTests(HandlersTestCase):
@@ -2673,7 +2673,7 @@ class ScheduleBypassCommandTests(HandlersTestCase):
     def test_llm_is_never_called(self) -> None:
         with mock.patch.object(handlers.scheduler, "list_entries", return_value=[]):
             handlers.process_update(self._update("/schedule"))
-        self.mock_call_gemini.assert_not_called()
+        self.mock_call_llm.assert_not_called()
         self.assertEqual(handlers._task_queue.qsize(), 0)
 
 
