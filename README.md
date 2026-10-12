@@ -340,6 +340,11 @@ shadowed until you `/unset` that key (or delete `settings.json`).
 | `SHELL_PATH` | `auto` | `auto`, or an absolute path that exists, is executable, and (if `/etc/shells` exists) is listed there | Yes | immediate (next shell command) |
 | `MCP_SERVERS` | `""` (disabled) | JSON array: `name` (`[a-zA-Z0-9_-]{1,32}`, unique), `url` (`http://`/`https://`), optional `headers` (string→string map) | No (web-only, secret) | immediate (next LLM call) |
 | `SEARCH_MODEL` | `gemma-4-26b-a4b-it` | Single model name | Yes | immediate (next web search) |
+| `LLM_BACKEND` | `gemini` | `gemini` or `openai` | Yes | immediate (next LLM call) |
+| `OPENAI_API_BASE` | `https://api.openai.com/v1` | `http://` or `https://` URL (e.g. `http://localhost:11434/v1` for Ollama) | Yes | immediate (next LLM call) |
+| `OPENAI_API_KEY` | `""` (none) | No whitespace, at most 512 chars; empty for local servers | No (web-only, secret) | immediate (next LLM call) |
+| `OPENAI_MODEL_CHAIN` | `gpt-4o-mini` | 1–5 comma-separated model names (`:` and `/` allowed), no duplicates | Yes | immediate (next LLM call) |
+| `OPENAI_TIMEOUT_SEC` | `120` | 5–300 | Yes | immediate (next LLM call) |
 
 `auto` resolution order (re-evaluated on every shell command, never cached):
 `/bin/zsh` on macOS → `$SHELL` → the login shell from `pwd.getpwuid()` →

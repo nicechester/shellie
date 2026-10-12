@@ -21,6 +21,11 @@ _BOOL_FALSE = ("false", "off", "0", "no")
 _TOKEN_RE = re.compile(r"^\d{5,16}:[A-Za-z0-9_-]{30,64}$")
 _GEMINI_KEY_RE = re.compile(r"^[A-Za-z0-9._-]{20,128}$")
 _MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9.\-]{1,63}$")
+# OpenAI-compatible servers name models freely: Ollama uses "name:tag",
+# some providers use "vendor/model", so the Gemini pattern is too strict.
+_OPENAI_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\-]{0,127}$")
+_OPENAI_BASE_RE = re.compile(r"^https?://[^\s/]+\S*$")
+_LLM_BACKENDS = ("gemini", "openai")
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 _MCP_SERVER_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,32}$")
 _MCP_URL_RE = re.compile(r"^https?://")
@@ -177,7 +182,7 @@ def _parse_mcp_servers(raw: Any) -> str:
     return s
 
 
-def _parse_model_chain(raw: Any) -> Tuple[str, ...]:
+def _split_model_chain(raw: Any, pattern: "re.Pattern[str]") -> Tuple[str, ...]:
     if isinstance(raw, str):
         items = [x.strip() for x in raw.split(",")]
     elif isinstance(raw, (list, tuple)):
@@ -188,12 +193,48 @@ def _parse_model_chain(raw: Any) -> Tuple[str, ...]:
         raise ValueError("Must have 1–5 models")
     seen = set()
     for item in items:
-        if not _MODEL_RE.match(item):
+        if not pattern.match(item):
             raise ValueError("Invalid model name format: {}".format(item))
         if item in seen:
             raise ValueError("Duplicate model name: {}".format(item))
         seen.add(item)
     return tuple(items)
+
+
+def _parse_model_chain(raw: Any) -> Tuple[str, ...]:
+    return _split_model_chain(raw, _MODEL_RE)
+
+
+def _parse_openai_model_chain(raw: Any) -> Tuple[str, ...]:
+    return _split_model_chain(raw, _OPENAI_MODEL_RE)
+
+
+def _parse_llm_backend(raw: Any) -> str:
+    if not isinstance(raw, str):
+        raise ValueError("A string value is required")
+    s = raw.strip().lower()
+    if s not in _LLM_BACKENDS:
+        raise ValueError("Must be one of: {}".format(", ".join(_LLM_BACKENDS)))
+    return s
+
+
+def _parse_openai_api_base(raw: Any) -> str:
+    if not isinstance(raw, str):
+        raise ValueError("A string value is required")
+    s = raw.strip().rstrip("/")
+    if not _OPENAI_BASE_RE.match(s):
+        raise ValueError("Must be an http:// or https:// URL")
+    return s
+
+
+def _parse_openai_key(raw: Any) -> str:
+    # Empty is allowed: local OpenAI-compatible servers (e.g. Ollama) need no key.
+    if not isinstance(raw, str):
+        raise ValueError("A string value is required")
+    s = raw.strip()
+    if len(s) > 512 or any(c.isspace() for c in s):
+        raise ValueError("Invalid format: no whitespace, at most 512 chars")
+    return s
 
 
 class SettingSpec:
@@ -369,6 +410,37 @@ CATALOG: Tuple[SettingSpec, ...] = (
             '"headers":{"Authorization":"Bearer ..."}}]'
         ),
         constraint=_MCP_SERVERS_CONSTRAINT,
+    ),
+    SettingSpec(
+        "LLM_BACKEND", "str", _parse_llm_backend,
+        default="gemini", apply_timing="immediate (next LLM call)",
+        description="LLM backend for chat turns: gemini or openai (OpenAI-compatible)",
+        constraint="gemini | openai",
+    ),
+    SettingSpec(
+        "OPENAI_API_BASE", "str", _parse_openai_api_base,
+        default="https://api.openai.com/v1", apply_timing="immediate (next LLM call)",
+        description="OpenAI-compatible API base URL (e.g. http://localhost:11434/v1 for Ollama)",
+        constraint="http:// or https:// URL",
+    ),
+    SettingSpec(
+        "OPENAI_API_KEY", "str", _parse_openai_key,
+        default="", secret=True, telegram_editable=False, required=False,
+        apply_timing="immediate (next LLM call)",
+        description="OpenAI-compatible API key (empty for local servers that need none)",
+        constraint="no whitespace, at most 512 chars",
+    ),
+    SettingSpec(
+        "OPENAI_MODEL_CHAIN", "list", _parse_openai_model_chain,
+        default=("gpt-4o-mini",), apply_timing="immediate (next LLM call)",
+        description="OpenAI model chain to try in order on 429/5xx/errors",
+        constraint="1–5 comma-separated model names, no duplicates",
+    ),
+    SettingSpec(
+        "OPENAI_TIMEOUT_SEC", "int", _make_int_parser(5, 300),
+        default=120, apply_timing="immediate (next LLM call)",
+        description="OpenAI-compatible API call timeout (seconds)",
+        constraint="5~300",
     ),
     SettingSpec(
         "SEARCH_MODEL", "str", _parse_model_chain,
