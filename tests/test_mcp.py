@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 
 from src.agent.core import mcp
+from src.agent.version import __version__
 
 _SERVER_URL = "https://example.com/mcp"
 
@@ -92,7 +93,7 @@ class InitializeAndToolsListTests(_McpTestCase):
         payload = first_call[0][1]
         self.assertEqual(payload["method"], "initialize")
         self.assertEqual(payload["params"]["protocolVersion"], "2024-11-05")
-        self.assertEqual(payload["params"]["clientInfo"], {"name": "shellie", "version": "1.0.0"})
+        self.assertEqual(payload["params"]["clientInfo"], {"name": "shellie", "version": __version__})
 
     def test_session_id_captured_and_echoed_on_subsequent_calls(self) -> None:
         self._bring_up_server()

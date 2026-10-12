@@ -26,6 +26,7 @@ from src.agent.telegram.client import (
     send_chat_action,
     send_message,
 )
+from src.agent.version import __version__
 
 _LOGGER = logging.getLogger("shellie.telegram.handlers")
 
@@ -101,6 +102,12 @@ _BYPASS_TOKENS = (
     "/mem", "/restart", "/reset", "/sh", "/help", "/queue", "/kill", "/systemlog",
     "/continue", "/discard", "/file", "/browse", "/shell", "/schedule",
 )
+
+
+def _version_header() -> str:
+    """Bold version line prepended to read-only command replies."""
+    return "<b>Shellie v{}</b>\n".format(_esc(__version__))
+
 
 _HELP_TEXT = (
     "<b>Bypass commands</b> (no LLM)\n"
@@ -612,17 +619,19 @@ def _handle_settings_command(chat_id: int, message_id: Optional[int], text: str)
     if cmd not in _SETTINGS_TOKENS:
         return False
 
+    version_header = _version_header()
+
     if cmd == "/settings":
-        send_message(chat_id, _settings_listing_text())
+        send_message(chat_id, version_header + _settings_listing_text())
         return True
 
     if cmd == "/get" or cmd == "/env":
         rest = text.split(None, 1)
         key = rest[1].split()[0] if len(rest) > 1 and rest[1].strip() else ""
         if not key:
-            send_message(chat_id, _settings_listing_text())
+            send_message(chat_id, version_header + _settings_listing_text())
         else:
-            send_message(chat_id, _get_key_detail(key.strip().upper()))
+            send_message(chat_id, version_header + _get_key_detail(key.strip().upper()))
         return True
 
     if cmd == "/set":
@@ -1070,7 +1079,7 @@ def _handle_bypass_command(chat_id: int, text: str) -> bool:
         return True
 
     if cmd == "/help":
-        send_message(chat_id, _HELP_TEXT)
+        send_message(chat_id, _version_header() + _HELP_TEXT)
         return True
 
     if cmd == "/queue":
