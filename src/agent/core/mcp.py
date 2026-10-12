@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from src.agent.config import settings
 from src.agent.utils.http import http_post_h
+from src.agent.version import __version__
 
 _LOGGER = logging.getLogger("shellie.mcp")
 
@@ -22,7 +23,7 @@ _CACHE_TTL_SEC = 300
 _REQUEST_TIMEOUT_SEC = 30
 
 _PROTOCOL_VERSION = "2024-11-05"
-_CLIENT_INFO = {"name": "shellie", "version": "1.0.0"}
+_CLIENT_INFO = {"name": "shellie", "version": __version__}
 
 _SERVER_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,32}$")
 _NAME_SANITIZE_RE = re.compile(r"[^a-zA-Z0-9_-]")

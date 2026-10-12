@@ -370,7 +370,8 @@ class SettingsCommandTests(HandlersTestCase):
     def test_settings_listing_is_pre_wrapped_and_masked(self) -> None:
         handlers.process_update(self._update("/settings"))
         reply = self.mock_send_message.call_args[0][1]
-        self.assertTrue(reply.startswith("<pre>"))
+        self.assertTrue(reply.startswith("<b>Shellie v"))
+        self.assertIn("<pre>", reply)
         self.assertTrue(reply.endswith("</pre>"))
         self.assertIn("••••", reply)
         self.mock_call_llm.assert_not_called()
@@ -432,6 +433,12 @@ class SettingsCommandTests(HandlersTestCase):
         handlers.process_update(self._update("/help"))
         reply = self.mock_send_message.call_args[0][1]
         self.assertIn("/env", reply)
+
+    def test_help_starts_with_version_header(self) -> None:
+        handlers.process_update(self._update("/help"))
+        reply = self.mock_send_message.call_args[0][1]
+        self.assertTrue(reply.startswith("<b>Shellie v"))
+        self.assertIn("<b>Bypass commands</b>", reply)
 
 
 class FunctionCallLoopTests(HandlersTestCase):

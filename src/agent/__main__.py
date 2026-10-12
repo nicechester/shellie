@@ -12,6 +12,7 @@ from src.agent.config import BASE_DIR, OFFSET_FILE, SHELLIE_HOME, settings
 from src.agent.core import scheduler, shell
 from src.agent.telegram.client import get_me, get_updates, register_prechecks, send_message
 from src.agent.telegram.handlers import enqueue_scheduled, notify_pending_task, process_update, start_queue_worker
+from src.agent.version import __version__
 from src.agent.web.server import manager
 
 _LOGGER = logging.getLogger("shellie.main")
@@ -131,7 +132,7 @@ def _notify_startup() -> None:
     if not user_id:
         return
     try:
-        send_message(user_id, "✅ Shellie started.", parse_mode=None)
+        send_message(user_id, "✅ Shellie v{} started.".format(__version__), parse_mode=None)
     except Exception:
         _LOGGER.debug("Failed to send startup notification", exc_info=True)
 
@@ -195,6 +196,7 @@ def main() -> None:
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         stream=sys.stdout,
     )
+    _LOGGER.info("Shellie v%s starting", __version__)
 
     if os.name != "posix":
         print("Unsupported platform (POSIX only).")
