@@ -10,7 +10,7 @@ from __future__ import annotations
 # backends.
 #
 # Stdlib only, via utils.http.http_post_h. The API key is sent in the
-# Authorization header and is never logged. Chain walking, cooldown and
+# Authorization and X-API-Key headers and is never logged. Chain walking, cooldown and
 # fallback live in core/llm.py; this module only builds the request and
 # attempts one model.
 
@@ -266,7 +266,9 @@ def attempt_model(model: str, payload: Dict[str, Any], base: str, key: str, time
         _LOGGER.warning("OpenAI model %s skipped: OPENAI_API_KEY is not set", model)
         return Attempt(False, None, None)
     _set_retry_status("calling", model=model)
-    headers = {"Authorization": "Bearer " + key} if key else {}
+    # Both headers: Authorization is the OpenAI standard, X-API-Key is what
+    # some gateways (e.g. Launch-hosted APIs) require instead.
+    headers = {"Authorization": "Bearer " + key, "X-API-Key": key} if key else {}
     body = dict(payload, model=model)
     res, status, resp_headers = http_post_h(base + "/chat/completions", body, headers=headers, timeout=timeout)
 
