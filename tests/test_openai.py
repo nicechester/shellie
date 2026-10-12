@@ -3,9 +3,9 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from src.agent.core import gemini
+from src.agent.core import gemini, llm
 from src.agent.core import openai as openai_backend
-from src.agent.settings import _parse_openai_api_base, _parse_openai_model_chain
+from src.agent.settings import _parse_llm_model_chain, _parse_openai_api_base
 
 _TOOLS = [{
     "functionDeclarations": [{
@@ -22,10 +22,13 @@ _TOOLS = [{
 
 def _settings_get(overrides: dict):
     defaults = {
-        "OPENAI_MODEL_CHAIN": ("m1", "m2"),
+        "LLM_MODEL_CHAIN": ("openai/m1", "openai/m2"),
         "OPENAI_API_BASE": "http://localhost:11434/v1",
         "OPENAI_API_KEY": "sk-test",
         "OPENAI_TIMEOUT_SEC": 30,
+        "GEMINI_FALLBACK_DELAY_SEC": 1,
+        "GEMINI_RETRY_BASE_DELAY_SEC": 60,
+        "GEMINI_MAX_RETRIES": 0,
     }
     defaults.update(overrides)
     return lambda key: defaults[key]
@@ -122,6 +125,7 @@ class ConversionTests(unittest.TestCase):
 class CallOpenAITests(unittest.TestCase):
     def setUp(self) -> None:
         settings_patcher = mock.patch.object(openai_backend, "settings")
+        llm_settings_patcher = mock.patch.object(llm, "settings")
         http_patcher = mock.patch.object(openai_backend, "http_post_h")
         sleep_patcher = mock.patch.object(openai_backend.time, "sleep")
         system_patcher = mock.patch.object(
@@ -129,12 +133,14 @@ class CallOpenAITests(unittest.TestCase):
         )
         tools_patcher = mock.patch.object(openai_backend, "build_tools_schema", return_value=_TOOLS)
         self.settings = settings_patcher.start()
+        self.llm_settings = llm_settings_patcher.start()
         self.http = http_patcher.start()
         self.sleep = sleep_patcher.start()
         system_patcher.start()
         tools_patcher.start()
         self.addCleanup(mock.patch.stopall)
         self.settings.get.side_effect = _settings_get({})
+        self.llm_settings.get.side_effect = _settings_get({})
 
     def _contents(self):
         return [{"role": "user", "parts": [{"text": "hi"}]}]
@@ -144,14 +150,14 @@ class CallOpenAITests(unittest.TestCase):
             ({}, 429, {}),
             (_completion("ok"), 200, {}),
         ]
-        response, model = openai_backend.call_openai(self._contents())
-        self.assertEqual(model, "m2")
+        response, model = llm.call_llm(self._contents())
+        self.assertEqual(model, "openai/m2")
         self.assertEqual(gemini.parse_response(response).text, "ok")
-        self.sleep.assert_called_with(openai_backend._FALLBACK_DELAY_SEC)
+        self.sleep.assert_called_with(1)  # GEMINI_FALLBACK_DELAY_SEC between entries
 
     def test_sends_bearer_key_and_chat_path(self) -> None:
         self.http.return_value = (_completion("ok"), 200, {})
-        openai_backend.call_openai(self._contents())
+        llm.call_llm(self._contents())
         url = self.http.call_args.args[0]
         headers = self.http.call_args.kwargs["headers"]
         self.assertEqual(url, "http://localhost:11434/v1/chat/completions")
@@ -159,13 +165,14 @@ class CallOpenAITests(unittest.TestCase):
 
     def test_no_auth_header_when_key_is_empty(self) -> None:
         self.settings.get.side_effect = _settings_get({"OPENAI_API_KEY": ""})
+        self.llm_settings.get.side_effect = _settings_get({"OPENAI_API_KEY": ""})
         self.http.return_value = (_completion("ok"), 200, {})
-        openai_backend.call_openai(self._contents())
+        llm.call_llm(self._contents())
         self.assertEqual(self.http.call_args.kwargs["headers"], {})
 
     def test_tools_disabled_sets_tool_choice_none_keeps_tools(self) -> None:
         self.http.return_value = (_completion("ok"), 200, {})
-        openai_backend.call_openai(self._contents(), allow_tools=False)
+        llm.call_llm(self._contents(), allow_tools=False)
         body = self.http.call_args.args[1]
         self.assertEqual(body["tool_choice"], "none")
         self.assertEqual(len(body["tools"]), 1)
@@ -173,13 +180,16 @@ class CallOpenAITests(unittest.TestCase):
     def test_non_fallback_status_raises_without_retry(self) -> None:
         self.http.return_value = ({}, 401, {})
         with self.assertRaises(Exception):
-            openai_backend.call_openai(self._contents())
+            llm.call_llm(self._contents())
         self.assertEqual(self.http.call_count, 1)
 
 
 class SettingsParserTests(unittest.TestCase):
-    def test_model_chain_accepts_ollama_tags(self) -> None:
-        self.assertEqual(_parse_openai_model_chain("llama3.2:latest,qwen/qwen2.5"), ("llama3.2:latest", "qwen/qwen2.5"))
+    def test_model_chain_accepts_ollama_tags_and_inner_slashes(self) -> None:
+        self.assertEqual(
+            _parse_llm_model_chain("openai/llama3.2:latest,openai/openai/gpt-4o-mini"),
+            ("openai/llama3.2:latest", "openai/openai/gpt-4o-mini"),
+        )
 
     def test_api_base_rejects_non_http(self) -> None:
         with self.assertRaises(ValueError):

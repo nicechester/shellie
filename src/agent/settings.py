@@ -25,7 +25,14 @@ _MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9.\-]{1,63}$")
 # some providers use "vendor/model", so the Gemini pattern is too strict.
 _OPENAI_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\-]{0,127}$")
 _OPENAI_BASE_RE = re.compile(r"^https?://[^\s/]+\S*$")
-_LLM_BACKENDS = ("gemini", "openai")
+_LLM_PROVIDERS = ("gemini", "openai")
+# Legacy keys (pre-#33) folded into LLM_MODEL_CHAIN on load; never stored again.
+_LEGACY_CHAIN_KEYS = ("LLM_BACKEND", "GEMINI_MODEL_CHAIN", "OPENAI_MODEL_CHAIN")
+_DEFAULT_LLM_MODEL_CHAIN = (
+    "gemini/gemini-2.5-flash",
+    "gemini/gemini-2.5-pro",
+    "gemini/gemini-2.5-flash-lite",
+)
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 _MCP_SERVER_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,32}$")
 _MCP_URL_RE = re.compile(r"^https?://")
@@ -205,17 +212,71 @@ def _parse_model_chain(raw: Any) -> Tuple[str, ...]:
     return _split_model_chain(raw, _MODEL_RE)
 
 
-def _parse_openai_model_chain(raw: Any) -> Tuple[str, ...]:
-    return _split_model_chain(raw, _OPENAI_MODEL_RE)
+def _as_item_list(raw: Any) -> List[str]:
+    """Comma-separated string or list to a list of stripped, non-empty items.
+    Anything else yields no items, so migration falls back to the default
+    (it runs during load() and must never raise)."""
+    if isinstance(raw, str):
+        items = [x.strip() for x in raw.split(",")]
+    elif isinstance(raw, (list, tuple)):
+        items = [str(x).strip() for x in raw]
+    else:
+        return []
+    return [x for x in items if x]
 
 
-def _parse_llm_backend(raw: Any) -> str:
-    if not isinstance(raw, str):
-        raise ValueError("A string value is required")
-    s = raw.strip().lower()
-    if s not in _LLM_BACKENDS:
-        raise ValueError("Must be one of: {}".format(", ".join(_LLM_BACKENDS)))
-    return s
+def _parse_llm_model_chain(raw: Any) -> Tuple[str, ...]:
+    """Ordered fallback chain of "provider/model" entries. The provider is
+    gemini or openai; the model is split at the FIRST slash only, so names
+    such as openai/gpt-4o-mini (OpenRouter) keep their inner slash. No limit
+    on the number of entries."""
+    if isinstance(raw, str):
+        items = [x.strip() for x in raw.split(",")]
+    elif isinstance(raw, (list, tuple)):
+        items = [str(x).strip() for x in raw]
+    else:
+        raise ValueError("A comma-separated model list string is required")
+    if not items or not all(items):
+        raise ValueError("Must have provider/model entries with no empty items")
+    seen = set()
+    out: List[str] = []
+    for item in items:
+        provider, sep, model = item.partition("/")
+        provider = provider.strip().lower()
+        if not sep or not model:
+            raise ValueError("Entry must be provider/model: {}".format(item))
+        if provider not in _LLM_PROVIDERS:
+            raise ValueError("Unknown provider '{}', use: {}".format(provider, ", ".join(_LLM_PROVIDERS)))
+        pattern = _MODEL_RE if provider == "gemini" else _OPENAI_MODEL_RE
+        if not pattern.match(model):
+            raise ValueError("Invalid model name format: {}".format(item))
+        entry = provider + "/" + model
+        if entry in seen:
+            raise ValueError("Duplicate entry: {}".format(entry))
+        seen.add(entry)
+        out.append(entry)
+    return tuple(out)
+
+
+def _migrate_legacy_chain(layer: Dict[str, Any]) -> Dict[str, Any]:
+    """Fold LLM_BACKEND / GEMINI_MODEL_CHAIN / OPENAI_MODEL_CHAIN from one
+    layer (env or settings.json) into LLM_MODEL_CHAIN. A layer that already
+    sets LLM_MODEL_CHAIN, or has no legacy keys, is returned unchanged."""
+    if "LLM_MODEL_CHAIN" in layer or not any(k in layer for k in _LEGACY_CHAIN_KEYS):
+        return layer
+    backend = str(layer.get("LLM_BACKEND") or "gemini").strip().lower()
+    if backend == "openai":
+        models = _as_item_list(layer.get("OPENAI_MODEL_CHAIN") or "gpt-4o-mini")
+        entries = ["openai/" + m for m in models]
+    else:
+        models = _as_item_list(layer.get("GEMINI_MODEL_CHAIN") or ",".join(
+            e.partition("/")[2] for e in _DEFAULT_LLM_MODEL_CHAIN
+        ))
+        entries = ["gemini/" + m for m in models]
+    out = {k: v for k, v in layer.items() if k not in _LEGACY_CHAIN_KEYS}
+    out["LLM_MODEL_CHAIN"] = ",".join(entries)
+    _LOGGER.info("Migrated legacy LLM settings to LLM_MODEL_CHAIN")
+    return out
 
 
 def _parse_openai_api_base(raw: Any) -> str:
@@ -299,11 +360,10 @@ CATALOG: Tuple[SettingSpec, ...] = (
         constraint="Integer 1–2^53-1, cannot be the bot's own ID",
     ),
     SettingSpec(
-        "GEMINI_MODEL_CHAIN", "list", _parse_model_chain,
-        default=("gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite"),
-        apply_timing="immediate",
-        description="Gemini model chain to try in order on 429/errors",
-        constraint="1–5 comma-separated model names, no duplicates",
+        "LLM_MODEL_CHAIN", "list", _parse_llm_model_chain,
+        default=_DEFAULT_LLM_MODEL_CHAIN, apply_timing="immediate (next LLM call)",
+        description="Chat model fallback chain, tried in order: provider/model entries (gemini or openai)",
+        constraint="provider/model entries, provider gemini|openai, no duplicates",
     ),
     SettingSpec(
         "GEMINI_TIMEOUT_SEC", "int", _make_int_parser(5, 300),
@@ -412,12 +472,6 @@ CATALOG: Tuple[SettingSpec, ...] = (
         constraint=_MCP_SERVERS_CONSTRAINT,
     ),
     SettingSpec(
-        "LLM_BACKEND", "str", _parse_llm_backend,
-        default="gemini", apply_timing="immediate (next LLM call)",
-        description="LLM backend for chat turns: gemini or openai (OpenAI-compatible)",
-        constraint="gemini | openai",
-    ),
-    SettingSpec(
         "OPENAI_API_BASE", "str", _parse_openai_api_base,
         default="https://api.openai.com/v1", apply_timing="immediate (next LLM call)",
         description="OpenAI-compatible API base URL (e.g. http://localhost:11434/v1 for Ollama)",
@@ -429,12 +483,6 @@ CATALOG: Tuple[SettingSpec, ...] = (
         apply_timing="immediate (next LLM call)",
         description="OpenAI-compatible API key (empty for local servers that need none)",
         constraint="no whitespace, at most 512 chars",
-    ),
-    SettingSpec(
-        "OPENAI_MODEL_CHAIN", "list", _parse_openai_model_chain,
-        default=("gpt-4o-mini",), apply_timing="immediate (next LLM call)",
-        description="OpenAI model chain to try in order on 429/5xx/errors",
-        constraint="1–5 comma-separated model names, no duplicates",
     ),
     SettingSpec(
         "OPENAI_TIMEOUT_SEC", "int", _make_int_parser(5, 300),
@@ -478,6 +526,7 @@ class SettingsStore:
             merged.update(os.environ)
         else:
             merged = dict(env)
+        merged = _migrate_legacy_chain(merged)
 
         values: Dict[str, Any] = {}
         sources: Dict[str, str] = {}
@@ -500,7 +549,7 @@ class SettingsStore:
             sources[spec.key] = "env"
             env_layer[spec.key] = parsed
 
-        override_raw = self._read_settings_file(path)
+        override_raw = _migrate_legacy_chain(self._read_settings_file(path))
         overrides: Dict[str, Any] = {}
         for key, raw in override_raw.items():
             spec = self._catalog.get(key)

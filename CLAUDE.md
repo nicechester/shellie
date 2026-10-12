@@ -63,7 +63,7 @@ bypass, 24/7 via launchd/systemd.
   `format_list(entries)`. Ticker thread touches only scheduler+settings+_task_queue.put, never Telegram. Calls
   `enqueue_scheduled(entry)` when a prompt is due (posts ⏰ notice, runs independently — never replaces interactive tasks).
   Model-made changes via manage_schedule announced in chat with 🗓️ (prompt-injection visibility). Issue #5.
-- `core/llm.py` — `call_llm()` dispatch on `LLM_BACKEND` (read per call). `core/openai.py` — OpenAI-compatible backend (#13): converts the Gemini-shaped history to chat messages and maps replies back to the Gemini shape, so `parse_response()` is shared; simpler retry (model fallback on 404/408/429/5xx, chain cooldown, no same-model 5xx retries). Gemini key stays required (web search uses it).
+- `core/llm.py` — `call_llm()` walks the mixed `LLM_MODEL_CHAIN` (`gemini/<m>` and `openai/<m>` entries, read per call; issue #33): per-entry `attempt_model()` from each adapter, pass/cooldown logic here. `core/openai.py` — OpenAI-compatible backend (#13): converts the Gemini-shaped history to chat messages and maps replies back to the Gemini shape, so `parse_response()` is shared; simpler retry (model fallback on 404/408/429/5xx, chain cooldown, no same-model 5xx retries). Gemini key stays required (web search uses it).
 - `core/gemini.py` — model-chain fallback (429 / RESOURCE_EXHAUSTED / 5xx /
   transport → next model; snapshot of chain/key/timeouts at call start), plus
   whole-chain retry with cooldown (GEMINI_MAX_RETRIES passes, delay = server
@@ -84,7 +84,7 @@ bypass, 24/7 via launchd/systemd.
   thought-part skip, blocked/finishReason handling). Live retry state (calling /
   cooldown reason 429_rpm·5xx·transport·chain_cooldown, model, until, attempt)
   is published copy-on-write via `get_retry_status()` for display only; reset to
-  idle in `call_gemini`'s finally.
+  idle in `call_llm`'s finally.
 - `core/mcp.py` — HTTP MCP client (Streamable HTTP JSON-RPC): initialize →
   tools/list → tools/call, Mcp-Session-Id support, 300s TTL cache invalidated by
   config fingerprint, tools exposed as `mcp_<server>_<tool>`. **No stdio, no
@@ -131,7 +131,7 @@ bypass, 24/7 via launchd/systemd.
   on reaching FC_MAX_LOOPS, auto-continuation up to FC_MAX_CONTINUATIONS times,
   epoch-guarded, task state persisted; CONTEXT_TURNS pairs + IDLE_RESET_MINUTES idle reset). Task queue: LLM messages
   serialized via `queue.Queue` + single worker thread; `_process_llm_item` is
-  now a thin wrapper — all retry/cooldown logic lives in `call_gemini`. Output
+  now a thin wrapper — all retry/cooldown logic lives in `core/llm.py`. Output
   is Telegram HTML.
 - `web/` — settings UI on 127.0.0.1 only (hard constant), single-thread
   HTTPServer in one daemon thread (lazy `http.server` import), security gate:
