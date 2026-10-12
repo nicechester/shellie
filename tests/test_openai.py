@@ -155,13 +155,13 @@ class CallOpenAITests(unittest.TestCase):
         self.assertEqual(gemini.parse_response(response).text, "ok")
         self.sleep.assert_called_with(1)  # GEMINI_FALLBACK_DELAY_SEC between entries
 
-    def test_sends_bearer_key_and_chat_path(self) -> None:
+    def test_sends_bearer_and_api_key_headers_and_chat_path(self) -> None:
         self.http.return_value = (_completion("ok"), 200, {})
         llm.call_llm(self._contents())
         url = self.http.call_args.args[0]
         headers = self.http.call_args.kwargs["headers"]
         self.assertEqual(url, "http://localhost:11434/v1/chat/completions")
-        self.assertEqual(headers, {"Authorization": "Bearer sk-test"})
+        self.assertEqual(headers, {"Authorization": "Bearer sk-test", "X-API-Key": "sk-test"})
 
     def test_no_auth_header_when_key_is_empty(self) -> None:
         self.settings.get.side_effect = _settings_get({"OPENAI_API_KEY": ""})
