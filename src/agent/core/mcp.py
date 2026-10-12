@@ -22,7 +22,7 @@ _CACHE_TTL_SEC = 300
 _REQUEST_TIMEOUT_SEC = 30
 
 _PROTOCOL_VERSION = "2024-11-05"
-_CLIENT_INFO = {"name": "shellie", "version": "0.1.0"}
+_CLIENT_INFO = {"name": "shellie", "version": "1.0.0"}
 
 _SERVER_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,32}$")
 _NAME_SANITIZE_RE = re.compile(r"[^a-zA-Z0-9_-]")

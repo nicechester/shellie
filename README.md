@@ -130,7 +130,7 @@ This downloads the latest release into `~/.local/share/shellie/shellie`,
 installs the service, and starts it. To install a specific tag or branch:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/nicechester/shellie/main/launchd/install.sh | SHELLIE_REF=v0.1.0 sh
+curl -fsSL https://raw.githubusercontent.com/nicechester/shellie/main/launchd/install.sh | SHELLIE_REF=1.0.0 sh
 ```
 
 Running the same command again upgrades in place and restarts the service.
