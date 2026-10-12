@@ -10,26 +10,24 @@ from __future__ import annotations
 # backends.
 #
 # Stdlib only, via utils.http.http_post_h. The API key is sent in the
-# Authorization header and is never logged.
+# Authorization header and is never logged. Chain walking, cooldown and
+# fallback live in core/llm.py; this module only builds the request and
+# attempts one model.
 
+import ipaddress
 import json
 import logging
-import time
 from collections import deque
-from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
-from src.agent.config import settings
-from src.agent.core.gemini import _set_retry_status, build_system_instruction, build_tools_schema
+from src.agent.core.gemini import Attempt, _set_retry_status, build_system_instruction, build_tools_schema
 from src.agent.utils.http import http_post_h
 
 _LOGGER = logging.getLogger("shellie.openai")
 
 # Model fallback on these statuses (404 = model not served here, 0 = transport).
 _FALLBACK_STATUSES = (404, 408, 429, 500, 502, 503, 504)
-_MAX_RETRIES = 2            # whole-chain passes after the first
-_FALLBACK_DELAY_SEC = 1     # pause between models in one pass
-_BASE_COOLDOWN_SEC = 30     # whole-chain cooldown base, doubled per pass
-_MAX_COOLDOWN_SEC = 300
 
 _FINISH_REASONS = {
     "stop": "STOP",
@@ -232,7 +230,22 @@ def _system_text() -> str:
     return "".join(part.get("text", "") for part in build_system_instruction().get("parts", []))
 
 
-def _build_payload(contents: List[Dict[str, Any]], allow_tools: bool) -> Dict[str, Any]:
+def _is_local_base(base: str) -> bool:
+    """True for loopback, private-LAN and .local hosts, where an empty API key
+    is allowed (e.g. Ollama or LM Studio on the home network)."""
+    host = (urlsplit(base).hostname or "").lower()
+    if host in ("localhost", "::1") or host.endswith(".local"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_private
+
+
+def build_payload(contents: List[Dict[str, Any]], allow_tools: bool) -> Dict[str, Any]:
+    """OpenAI chat-completions body (without model) for one chat turn. Built
+    once per call by the chain orchestrator (core/llm.py)."""
     payload: Dict[str, Any] = {"messages": to_openai_messages(contents, _system_text())}
     tools = to_openai_tools(build_tools_schema())
     if tools:
@@ -243,74 +256,25 @@ def _build_payload(contents: List[Dict[str, Any]], allow_tools: bool) -> Dict[st
     return payload
 
 
-def call_openai(
-    contents: List[Dict[str, Any]],
-    on_cooldown: Optional[Callable[[int, int, float], None]] = None,
-    allow_tools: bool = True,
-) -> Tuple[Dict[str, Any], str]:
-    """Call the OpenAI-compatible model chain. Returns (Gemini-shaped response,
-    model). Semantics follow gemini.call_gemini at a smaller scale: the
-    settings are snapshotted at the start of the call, the chain falls back
-    to the next model on 404/408/429/5xx/transport, and the whole chain is
-    retried up to _MAX_RETRIES times with a cooldown between passes. Other
-    statuses (400/401/403) raise immediately. on_cooldown(attempt, max, delay)
-    is called before each cooldown, best-effort."""
-    try:
-        return _call_openai_impl(contents, on_cooldown, allow_tools)
-    finally:
-        _set_retry_status("idle")
+def attempt_model(model: str, payload: Dict[str, Any], base: str, key: str, timeout: float) -> Attempt:
+    """Try one OpenAI-compatible model. Returns Attempt(ok=True, response) with
+    the response mapped to the Gemini shape, or Attempt(ok=False, hint=...)
+    on 404/408/429/5xx/transport so the caller falls back. Other statuses
+    raise. An openai/ entry with no API key and a non-local base URL is
+    skipped with a warning, without a request."""
+    if not key and not _is_local_base(base):
+        _LOGGER.warning("OpenAI model %s skipped: OPENAI_API_KEY is not set", model)
+        return Attempt(False, None, None)
+    _set_retry_status("calling", model=model)
+    headers = {"Authorization": "Bearer " + key} if key else {}
+    body = dict(payload, model=model)
+    res, status, resp_headers = http_post_h(base + "/chat/completions", body, headers=headers, timeout=timeout)
 
+    if status == 200:
+        return Attempt(True, to_gemini_response(res), None)
 
-def _call_openai_impl(
-    contents: List[Dict[str, Any]],
-    on_cooldown: Optional[Callable[[int, int, float], None]],
-    allow_tools: bool,
-) -> Tuple[Dict[str, Any], str]:
-    chain = settings.get("OPENAI_MODEL_CHAIN")
-    url = settings.get("OPENAI_API_BASE") + "/chat/completions"
-    key = settings.get("OPENAI_API_KEY")
-    timeout = settings.get("OPENAI_TIMEOUT_SEC")
-    payload = _build_payload(contents, allow_tools)
+    if not (status == 0 or status in _FALLBACK_STATUSES):
+        raise Exception("OpenAI-compatible API call failed (model={}, status={})".format(model, status))
 
-    for attempt in range(_MAX_RETRIES + 1):
-        hinted: Optional[float] = None
-
-        for index, model in enumerate(chain):
-            _set_retry_status("calling", model=model)
-            headers = {"Authorization": "Bearer " + key} if key else {}
-            body = dict(payload, model=model)
-            res, status, resp_headers = http_post_h(url, body, headers=headers, timeout=timeout)
-
-            if status == 200:
-                return to_gemini_response(res), model
-
-            if not (status == 0 or status in _FALLBACK_STATUSES):
-                raise Exception("OpenAI-compatible API call failed (model={}, status={})".format(model, status))
-
-            _LOGGER.warning("OpenAI model %s failed (HTTP %s), switching to next model", model, status)
-            hint = _retry_after(resp_headers)
-            if hint is not None and (hinted is None or hint > hinted):
-                hinted = hint
-            if index < len(chain) - 1:
-                time.sleep(_FALLBACK_DELAY_SEC)
-
-        if attempt == _MAX_RETRIES:
-            raise Exception("All OpenAI models failed (rate limit or transient error).")
-
-        cooldown = min(max(hinted or 0, _BASE_COOLDOWN_SEC * (2 ** attempt)), _MAX_COOLDOWN_SEC)
-        _LOGGER.warning(
-            "All OpenAI models failed on attempt %d/%d, cooling down %.1fs before retry",
-            attempt + 1, _MAX_RETRIES + 1, cooldown,
-        )
-        _set_retry_status(
-            "cooldown", reason="chain_cooldown", model=None, delay=cooldown,
-            attempt=attempt + 1, max_attempts=_MAX_RETRIES,
-        )
-        if on_cooldown is not None:
-            try:
-                on_cooldown(attempt + 1, _MAX_RETRIES, cooldown)
-            except Exception:
-                _LOGGER.debug("on_cooldown callback raised, ignoring", exc_info=True)
-        time.sleep(cooldown)
-
-    raise Exception("All OpenAI models failed (rate limit or transient error).")
+    _LOGGER.warning("OpenAI model %s failed (HTTP %s), switching to next model", model, status)
+    return Attempt(False, None, _retry_after(resp_headers))

@@ -321,7 +321,7 @@ shadowed until you `/unset` that key (or delete `settings.json`).
 | `TELEGRAM_BOT_TOKEN` | *(required)* | `^\d{5,16}:[A-Za-z0-9_-]{30,64}$` | No (web-only, secret) | next poll cycle |
 | `GEMINI_API_KEY` | *(required)* | 20–128 chars, `[A-Za-z0-9._-]` | No (web-only, secret) | immediate |
 | `ALLOWED_USER_ID` | *(required)* | integer 1 – 2^53−1, cannot equal the bot's own ID | No (web-only) | immediate |
-| `GEMINI_MODEL_CHAIN` | `gemini-2.5-flash,gemini-2.5-pro,gemini-2.5-flash-lite` | 1–5 comma-separated model names, no duplicates | Yes | immediate |
+| `LLM_MODEL_CHAIN` | `gemini/gemini-2.5-flash,gemini/gemini-2.5-pro,gemini/gemini-2.5-flash-lite` | Comma-separated `gemini/<model>` and `openai/<model>` entries, tried in order; no limit on count, no duplicates | Yes | immediate (next LLM call) |
 | `GEMINI_TIMEOUT_SEC` | `120` | 5–300 | Yes | immediate |
 | `GEMINI_FALLBACK_DELAY_SEC` | `1` | 0–10 | Yes | immediate |
 | `GEMINI_RETRY_BASE_DELAY_SEC` | `60` | 5–300 | Yes | immediate |
@@ -340,11 +340,37 @@ shadowed until you `/unset` that key (or delete `settings.json`).
 | `SHELL_PATH` | `auto` | `auto`, or an absolute path that exists, is executable, and (if `/etc/shells` exists) is listed there | Yes | immediate (next shell command) |
 | `MCP_SERVERS` | `""` (disabled) | JSON array: `name` (`[a-zA-Z0-9_-]{1,32}`, unique), `url` (`http://`/`https://`), optional `headers` (string→string map) | No (web-only, secret) | immediate (next LLM call) |
 | `SEARCH_MODEL` | `gemma-4-26b-a4b-it` | Single model name | Yes | immediate (next web search) |
-| `LLM_BACKEND` | `gemini` | `gemini` or `openai` | Yes | immediate (next LLM call) |
 | `OPENAI_API_BASE` | `https://api.openai.com/v1` | `http://` or `https://` URL (e.g. `http://localhost:11434/v1` for Ollama) | Yes | immediate (next LLM call) |
 | `OPENAI_API_KEY` | `""` (none) | No whitespace, at most 512 chars; empty for local servers | No (web-only, secret) | immediate (next LLM call) |
-| `OPENAI_MODEL_CHAIN` | `gpt-4o-mini` | 1–5 comma-separated model names (`:` and `/` allowed), no duplicates | Yes | immediate (next LLM call) |
 | `OPENAI_TIMEOUT_SEC` | `120` | 5–300 | Yes | immediate (next LLM call) |
+
+#### LLM fallback chain (`LLM_MODEL_CHAIN`)
+
+Each entry is `<provider>/<model>`, where the provider is `gemini` or `openai`:
+
+```
+gemini/gemini-2.5-flash,gemini/gemini-2.5-pro,openai/gpt-4o-mini
+```
+
+- `gemini/` calls the Gemini API with `GEMINI_API_KEY`.
+- `openai/` calls an OpenAI-compatible server at `OPENAI_API_BASE` with
+  `OPENAI_API_KEY`. One `OPENAI_*` setting set covers OpenAI, OpenRouter, LM Studio and
+  Ollama. Use the server's own model names, for example `openai/openai/gpt-4o-mini` on
+  OpenRouter. The entry is split at the first `/` only.
+- Any other provider prefix is rejected when the setting is saved.
+- A fallback-eligible failure (429, 5xx, transport, and 404/408 on `openai/`) moves to the
+  next entry. When a whole pass fails, the chain cools down and repeats, governed by
+  `GEMINI_RETRY_BASE_DELAY_SEC` and `GEMINI_MAX_RETRIES`. Those timing settings apply to
+  every provider in the chain.
+- An `openai/` entry with an empty `OPENAI_API_KEY` is skipped with a warning, unless
+  `OPENAI_API_BASE` points at a local or LAN address (for example Ollama).
+- Conversations keep working when the chain switches provider mid-conversation.
+
+Migration: `LLM_BACKEND`, `GEMINI_MODEL_CHAIN` and `OPENAI_MODEL_CHAIN` are read once
+from `.env` and `settings.json` and folded into `LLM_MODEL_CHAIN`. With
+`LLM_BACKEND=openai`, the result is the `openai/` entries from `OPENAI_MODEL_CHAIN`.
+Otherwise it is the `gemini/` entries from `GEMINI_MODEL_CHAIN`. Once a layer sets
+`LLM_MODEL_CHAIN`, its legacy keys are ignored.
 
 `auto` resolution order (re-evaluated on every shell command, never cached):
 `/bin/zsh` on macOS → `$SHELL` → the login shell from `pwd.getpwuid()` →

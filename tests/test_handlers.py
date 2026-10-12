@@ -389,17 +389,17 @@ class SettingsCommandTests(HandlersTestCase):
 
     def test_env_with_key_matches_get(self) -> None:
         self.mock_settings.rows.return_value = self._base_rows() + [
-            _row("GEMINI_MODEL_CHAIN", value="flash,pro,lite")
+            _row("LLM_MODEL_CHAIN", value="gemini/flash,gemini/pro,gemini/lite")
         ]
 
-        handlers.process_update(self._update("/get GEMINI_MODEL_CHAIN"))
+        handlers.process_update(self._update("/get LLM_MODEL_CHAIN"))
         get_reply = self.mock_send_message.call_args[0][1]
 
-        handlers.process_update(self._update("/env GEMINI_MODEL_CHAIN"))
+        handlers.process_update(self._update("/env LLM_MODEL_CHAIN"))
         env_reply = self.mock_send_message.call_args[0][1]
 
         self.assertEqual(get_reply, env_reply)
-        self.assertIn("GEMINI_MODEL_CHAIN", env_reply)
+        self.assertIn("LLM_MODEL_CHAIN", env_reply)
         self.mock_call_llm.assert_not_called()
 
     def test_env_with_extra_args_matches_get(self) -> None:

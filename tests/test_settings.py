@@ -153,27 +153,57 @@ class TestBoundaryValidation(_SettingsTestCase):
                     with self.assertRaises(ValueError):
                         parser(raw)
 
-    def test_gemini_model_chain_valid(self):
-        parser = _CATALOG_BY_KEY["GEMINI_MODEL_CHAIN"].parser
+    def test_llm_model_chain_mixes_providers(self):
+        parser = _CATALOG_BY_KEY["LLM_MODEL_CHAIN"].parser
         self.assertEqual(
-            parser("gemini-2.5-flash,gemini-2.5-pro"),
-            ("gemini-2.5-flash", "gemini-2.5-pro"),
+            parser("gemini/gemini-2.5-flash, openai/gpt-4o-mini"),
+            ("gemini/gemini-2.5-flash", "openai/gpt-4o-mini"),
         )
 
-    def test_gemini_model_chain_rejects_bad_regex_item(self):
-        parser = _CATALOG_BY_KEY["GEMINI_MODEL_CHAIN"].parser
-        with self.assertRaises(ValueError):
-            parser("Gemini-Pro")
+    def test_llm_model_chain_splits_on_first_slash_only(self):
+        parser = _CATALOG_BY_KEY["LLM_MODEL_CHAIN"].parser
+        self.assertEqual(parser("openai/openai/gpt-4o-mini"), ("openai/openai/gpt-4o-mini",))
 
-    def test_gemini_model_chain_rejects_duplicates(self):
-        parser = _CATALOG_BY_KEY["GEMINI_MODEL_CHAIN"].parser
-        with self.assertRaises(ValueError):
-            parser("gemini-2.5-flash,gemini-2.5-flash")
+    def test_llm_model_chain_accepts_any_number_of_entries(self):
+        parser = _CATALOG_BY_KEY["LLM_MODEL_CHAIN"].parser
+        raw = ",".join("openai/m{}".format(i) for i in range(12))
+        self.assertEqual(len(parser(raw)), 12)
 
-    def test_gemini_model_chain_rejects_trailing_comma(self):
-        parser = _CATALOG_BY_KEY["GEMINI_MODEL_CHAIN"].parser
+    def test_llm_model_chain_rejects_unknown_provider(self):
+        parser = _CATALOG_BY_KEY["LLM_MODEL_CHAIN"].parser
         with self.assertRaises(ValueError):
-            parser("gemini-2.5-flash,")
+            parser("anthropic/claude-x")
+
+    def test_llm_model_chain_rejects_missing_prefix(self):
+        parser = _CATALOG_BY_KEY["LLM_MODEL_CHAIN"].parser
+        with self.assertRaises(ValueError):
+            parser("gemini-2.5-flash")
+
+    def test_llm_model_chain_rejects_bad_regex_item(self):
+        parser = _CATALOG_BY_KEY["LLM_MODEL_CHAIN"].parser
+        with self.assertRaises(ValueError):
+            parser("gemini/Gemini-Pro")
+
+    def test_llm_model_chain_rejects_duplicates(self):
+        parser = _CATALOG_BY_KEY["LLM_MODEL_CHAIN"].parser
+        with self.assertRaises(ValueError):
+            parser("gemini/gemini-2.5-flash,gemini/gemini-2.5-flash")
+
+    def test_llm_model_chain_rejects_trailing_comma(self):
+        parser = _CATALOG_BY_KEY["LLM_MODEL_CHAIN"].parser
+        with self.assertRaises(ValueError):
+            parser("gemini/gemini-2.5-flash,")
+
+    def test_legacy_chain_keys_migrate_per_layer(self):
+        from src.agent.settings import _migrate_legacy_chain
+        gem = _migrate_legacy_chain({"GEMINI_MODEL_CHAIN": "flash,pro", "LLM_BACKEND": "gemini"})
+        self.assertEqual(gem, {"LLM_MODEL_CHAIN": "gemini/flash,gemini/pro"})
+        oai = _migrate_legacy_chain({"LLM_BACKEND": "openai", "OPENAI_MODEL_CHAIN": "gpt-4o-mini"})
+        self.assertEqual(oai, {"LLM_MODEL_CHAIN": "openai/gpt-4o-mini"})
+        explicit = {"LLM_MODEL_CHAIN": "openai/x", "GEMINI_MODEL_CHAIN": "flash"}
+        self.assertIs(_migrate_legacy_chain(explicit), explicit)
+        plain = {"SYSTEM_PROMPT": "x"}
+        self.assertIs(_migrate_legacy_chain(plain), plain)
 
     def test_gemini_api_key_accepts_dotted_format(self):
         parser = _CATALOG_BY_KEY["GEMINI_API_KEY"].parser

@@ -5,12 +5,12 @@ import tempfile
 import unittest
 from unittest import mock
 
-from src.agent.core import gemini
+from src.agent.core import gemini, llm
 
 
 def _settings_get(overrides: dict):
     defaults = {
-        "GEMINI_MODEL_CHAIN": ("m1", "m2"),
+        "LLM_MODEL_CHAIN": ("gemini/m1", "gemini/m2"),
         "GEMINI_API_KEY": "test-api-key-1234567890",
         "GEMINI_TIMEOUT_SEC": 30,
         "GEMINI_FALLBACK_DELAY_SEC": 1,
@@ -28,12 +28,13 @@ def _settings_get(overrides: dict):
 
 
 class CallGeminiFallbackTests(unittest.TestCase):
-    """Fallback matrix and header/URL contract for call_gemini()."""
+    """Fallback matrix and header/URL contract for the Gemini chain via llm.call_llm()."""
 
     def setUp(self) -> None:
         self.api_key = "test-api-key-1234567890"
 
         settings_patcher = mock.patch.object(gemini, "settings")
+        llm_settings_patcher = mock.patch.object(llm, "settings")
         http_post_patcher = mock.patch.object(gemini, "http_post_h")
         sleep_patcher = mock.patch.object(gemini.time, "sleep")
         read_memory_patcher = mock.patch.object(gemini, "read_memory", return_value="mem")
@@ -45,6 +46,7 @@ class CallGeminiFallbackTests(unittest.TestCase):
         )
 
         self.mock_settings = settings_patcher.start()
+        self.mock_llm_settings = llm_settings_patcher.start()
         self.mock_http_post = http_post_patcher.start()
         self.mock_sleep = sleep_patcher.start()
         read_memory_patcher.start()
@@ -53,6 +55,7 @@ class CallGeminiFallbackTests(unittest.TestCase):
 
         for patcher in (
             settings_patcher,
+            llm_settings_patcher,
             http_post_patcher,
             sleep_patcher,
             read_memory_patcher,
@@ -66,6 +69,7 @@ class CallGeminiFallbackTests(unittest.TestCase):
 
     def _configure_settings(self, overrides: dict) -> None:
         self.mock_settings.get.side_effect = _settings_get(overrides)
+        self.mock_llm_settings.get.side_effect = _settings_get(overrides)
 
     def _contents(self):
         return [{"role": "user", "parts": [{"text": "hi"}]}]
@@ -107,9 +111,9 @@ class CallGeminiFallbackTests(unittest.TestCase):
         res2 = {"candidates": [], "_marker": "second"}
         self.mock_http_post.side_effect = [(self._rpd_429(), 429, {}), (res2, 200, {})]
 
-        result, model = gemini.call_gemini(self._contents())
+        result, model = llm.call_llm(self._contents())
 
-        self.assertEqual(model, "m2")
+        self.assertEqual(model, "gemini/m2")
         self.assertEqual(result, res2)
         self.assertEqual(self.mock_http_post.call_count, 2)
         second_url = self.mock_http_post.call_args_list[1][0][0]
@@ -120,9 +124,9 @@ class CallGeminiFallbackTests(unittest.TestCase):
         res2 = {"candidates": [], "_marker": "retry"}
         self.mock_http_post.side_effect = [(self._rpm_429("30s"), 429, {}), (res2, 200, {})]
 
-        result, model = gemini.call_gemini(self._contents())
+        result, model = llm.call_llm(self._contents())
 
-        self.assertEqual(model, "m1")
+        self.assertEqual(model, "gemini/m1")
         self.assertEqual(result, res2)
         self.assertEqual(self.mock_http_post.call_count, 2)
         self.assertIn("m1", self.mock_http_post.call_args_list[0][0][0])
@@ -138,9 +142,9 @@ class CallGeminiFallbackTests(unittest.TestCase):
             (res2, 200, {}),
         ]
 
-        result, model = gemini.call_gemini(self._contents())
+        result, model = llm.call_llm(self._contents())
 
-        self.assertEqual(model, "m2")
+        self.assertEqual(model, "gemini/m2")
         self.assertEqual(result, res2)
 
     def test_resource_exhausted_body_on_non_200_falls_back(self) -> None:
@@ -149,9 +153,9 @@ class CallGeminiFallbackTests(unittest.TestCase):
         res2 = {"candidates": []}
         self.mock_http_post.side_effect = [(res1, 403, {}), (res2, 200, {})]
 
-        result, model = gemini.call_gemini(self._contents())
+        result, model = llm.call_llm(self._contents())
 
-        self.assertEqual(model, "m2")
+        self.assertEqual(model, "gemini/m2")
         self.assertEqual(result, res2)
 
     def test_503_retries_same_model_then_succeeds(self) -> None:
@@ -160,9 +164,9 @@ class CallGeminiFallbackTests(unittest.TestCase):
         res_ok = {"candidates": []}
         self.mock_http_post.side_effect = [(res_503, 503, {}), (res_ok, 200, {})]
 
-        _result, model = gemini.call_gemini(self._contents())
+        _result, model = llm.call_llm(self._contents())
 
-        self.assertEqual(model, "m1")
+        self.assertEqual(model, "gemini/m1")
         # First retry sleep is _5XX_RETRY_BASE_SEC * 2^0 = 1
         self.mock_sleep.assert_called_once_with(gemini._5XX_RETRY_BASE_SEC)
 
@@ -174,9 +178,9 @@ class CallGeminiFallbackTests(unittest.TestCase):
         side = [(res_503, 503, {})] * (1 + gemini._5XX_MAX_RETRIES) + [(res_ok, 200, {})]
         self.mock_http_post.side_effect = side
 
-        _result, model = gemini.call_gemini(self._contents())
+        _result, model = llm.call_llm(self._contents())
 
-        self.assertEqual(model, "m2")
+        self.assertEqual(model, "gemini/m2")
         # Sleeps: 1s, 2s, 4s (backoff) then fallback_delay (1s) before m2
         expected_sleeps = [
             mock.call(gemini._5XX_RETRY_BASE_SEC * (2 ** i))
@@ -191,9 +195,9 @@ class CallGeminiFallbackTests(unittest.TestCase):
         side = [(res_503, 503, {})] * (1 + gemini._5XX_MAX_RETRIES) + [(res_ok, 200, {})]
         self.mock_http_post.side_effect = side
 
-        _result, model = gemini.call_gemini(self._contents())
+        _result, model = llm.call_llm(self._contents())
 
-        self.assertEqual(model, "m2")
+        self.assertEqual(model, "gemini/m2")
 
     def test_status_zero_falls_back(self) -> None:
         res_err = {"error": "transport failure"}
@@ -201,16 +205,16 @@ class CallGeminiFallbackTests(unittest.TestCase):
         side = [(res_err, 0, {})] * (1 + gemini._5XX_MAX_RETRIES) + [(res_ok, 200, {})]
         self.mock_http_post.side_effect = side
 
-        _result, model = gemini.call_gemini(self._contents())
+        _result, model = llm.call_llm(self._contents())
 
-        self.assertEqual(model, "m2")
+        self.assertEqual(model, "gemini/m2")
 
     def test_400_raises_immediately_without_second_call(self) -> None:
         res1 = {"error": {"status": "INVALID_ARGUMENT", "message": "bad request"}}
         self.mock_http_post.side_effect = [(res1, 400, {})]
 
         with self.assertRaises(Exception) as ctx:
-            gemini.call_gemini(self._contents())
+            llm.call_llm(self._contents())
 
         self.assertEqual(self.mock_http_post.call_count, 1)
         self.assertNotIn(self.api_key, str(ctx.exception))
@@ -222,7 +226,7 @@ class CallGeminiFallbackTests(unittest.TestCase):
         self.mock_http_post.side_effect = [(res, 503, {})] * (per_model * 2)  # 2 models
 
         with self.assertRaises(Exception) as ctx:
-            gemini.call_gemini(self._contents())
+            llm.call_llm(self._contents())
 
         self.assertIn("All Gemini models", str(ctx.exception))
 
@@ -230,7 +234,7 @@ class CallGeminiFallbackTests(unittest.TestCase):
         res = {"candidates": []}
         self.mock_http_post.return_value = (res, 200, {})
 
-        gemini.call_gemini(self._contents(), allow_tools=False)
+        llm.call_llm(self._contents(), allow_tools=False)
 
         args, _kwargs = self.mock_http_post.call_args
         payload = args[1]
@@ -241,7 +245,7 @@ class CallGeminiFallbackTests(unittest.TestCase):
         res = {"candidates": []}
         self.mock_http_post.return_value = (res, 200, {})
 
-        gemini.call_gemini(self._contents())
+        llm.call_llm(self._contents())
 
         args, _kwargs = self.mock_http_post.call_args
         payload = args[1]
@@ -251,7 +255,7 @@ class CallGeminiFallbackTests(unittest.TestCase):
         res = {"candidates": []}
         self.mock_http_post.return_value = (res, 200, {})
 
-        gemini.call_gemini(self._contents())
+        llm.call_llm(self._contents())
 
         args, kwargs = self.mock_http_post.call_args
         url = args[0]
@@ -276,30 +280,30 @@ class CallGeminiFallbackTests(unittest.TestCase):
         res2 = {"candidates": []}
         self.mock_http_post.side_effect = [(res1, 429, {}), (res2, 200, {})]
 
-        gemini.call_gemini(self._contents())
+        llm.call_llm(self._contents())
 
         self.mock_sleep.assert_called_once_with(4)
 
     def test_retry_after_cooldown_succeeds_on_second_pass(self) -> None:
         """After all models fail (RPD), the whole chain is retried after cooldown."""
         self._configure_settings({
-            "GEMINI_MODEL_CHAIN": ("m1",),
+            "LLM_MODEL_CHAIN": ("gemini/m1",),
             "GEMINI_MAX_RETRIES": 1,
             "GEMINI_RETRY_BASE_DELAY_SEC": 60,
         })
         res2 = {"candidates": [], "_marker": "second-pass"}
         self.mock_http_post.side_effect = [(self._rpd_429(), 429, {}), (res2, 200, {})]
 
-        result, model = gemini.call_gemini(self._contents())
+        result, model = llm.call_llm(self._contents())
 
-        self.assertEqual(model, "m1")
+        self.assertEqual(model, "gemini/m1")
         self.assertEqual(result, res2)
         self.mock_sleep.assert_called_once_with(60)
 
     def test_server_hint_overrides_exponential_backoff(self) -> None:
         """RPD 429 with a server retryDelay hint larger than base_delay uses the hint for cooldown."""
         self._configure_settings({
-            "GEMINI_MODEL_CHAIN": ("m1",),
+            "LLM_MODEL_CHAIN": ("gemini/m1",),
             "GEMINI_MAX_RETRIES": 1,
             "GEMINI_RETRY_BASE_DELAY_SEC": 60,
         })
@@ -319,13 +323,13 @@ class CallGeminiFallbackTests(unittest.TestCase):
         res2 = {"candidates": []}
         self.mock_http_post.side_effect = [(res1, 429, {}), (res2, 200, {})]
 
-        gemini.call_gemini(self._contents())
+        llm.call_llm(self._contents())
 
         self.mock_sleep.assert_called_once_with(90.0)
 
     def test_exponential_backoff_growth_then_raises(self) -> None:
         self._configure_settings({
-            "GEMINI_MODEL_CHAIN": ("m1",),
+            "LLM_MODEL_CHAIN": ("gemini/m1",),
             "GEMINI_MAX_RETRIES": 2,
             "GEMINI_RETRY_BASE_DELAY_SEC": 60,
         })
@@ -335,7 +339,7 @@ class CallGeminiFallbackTests(unittest.TestCase):
         self.mock_http_post.side_effect = [(res, 503, {})] * (per_pass * 3)
 
         with self.assertRaises(Exception) as ctx:
-            gemini.call_gemini(self._contents())
+            llm.call_llm(self._contents())
 
         self.assertIn("All Gemini models", str(ctx.exception))
         # Chain-retry cooldown sleeps: 60, 120 (exponential backoff between passes)
@@ -344,14 +348,14 @@ class CallGeminiFallbackTests(unittest.TestCase):
 
     def test_cooldown_delay_is_capped(self) -> None:
         self._configure_settings({
-            "GEMINI_MODEL_CHAIN": ("m1",),
+            "LLM_MODEL_CHAIN": ("gemini/m1",),
             "GEMINI_MAX_RETRIES": 2,
             "GEMINI_RETRY_BASE_DELAY_SEC": 200,
         })
         res2 = {"candidates": []}
         self.mock_http_post.side_effect = [(self._rpd_429(), 429, {}), (self._rpd_429(), 429, {}), (res2, 200, {})]
 
-        gemini.call_gemini(self._contents())
+        llm.call_llm(self._contents())
 
         self.assertEqual(
             self.mock_sleep.call_args_list,
@@ -360,21 +364,21 @@ class CallGeminiFallbackTests(unittest.TestCase):
 
     def test_non_fallback_status_raises_without_retry_or_cooldown(self) -> None:
         self._configure_settings({
-            "GEMINI_MODEL_CHAIN": ("m1",),
+            "LLM_MODEL_CHAIN": ("gemini/m1",),
             "GEMINI_MAX_RETRIES": 2,
         })
         res = {"error": {"status": "PERMISSION_DENIED", "message": "forbidden"}}
         self.mock_http_post.side_effect = [(res, 403, {})]
 
         with self.assertRaises(Exception):
-            gemini.call_gemini(self._contents())
+            llm.call_llm(self._contents())
 
         self.assertEqual(self.mock_http_post.call_count, 1)
         self.mock_sleep.assert_not_called()
 
     def test_on_cooldown_callback_invoked_and_survives_exception(self) -> None:
         self._configure_settings({
-            "GEMINI_MODEL_CHAIN": ("m1",),
+            "LLM_MODEL_CHAIN": ("gemini/m1",),
             "GEMINI_MAX_RETRIES": 1,
             "GEMINI_RETRY_BASE_DELAY_SEC": 60,
         })
@@ -382,7 +386,7 @@ class CallGeminiFallbackTests(unittest.TestCase):
         self.mock_http_post.side_effect = [(self._rpd_429(), 429, {}), (res2, 200, {})]
         on_cooldown = mock.Mock(side_effect=RuntimeError("boom"))
 
-        result, _model = gemini.call_gemini(self._contents(), on_cooldown=on_cooldown)
+        result, _model = llm.call_llm(self._contents(), on_cooldown=on_cooldown)
 
         on_cooldown.assert_called_once_with(1, 1, 60)
         self.assertEqual(result, res2)
@@ -390,14 +394,14 @@ class CallGeminiFallbackTests(unittest.TestCase):
     def test_no_inter_model_sleep_after_last_model_in_pass(self) -> None:
         """No inter-model fallback sleep after the last model in a pass."""
         self._configure_settings({
-            "GEMINI_MODEL_CHAIN": ("m1", "m2"),
+            "LLM_MODEL_CHAIN": ("gemini/m1", "gemini/m2"),
             "GEMINI_MAX_RETRIES": 0,
             "GEMINI_FALLBACK_DELAY_SEC": 4,
         })
         self.mock_http_post.side_effect = [(self._rpd_429(), 429, {}), (self._rpd_429(), 429, {})]
 
         with self.assertRaises(Exception):
-            gemini.call_gemini(self._contents())
+            llm.call_llm(self._contents())
 
         self.mock_sleep.assert_called_once_with(4)
 
@@ -416,7 +420,7 @@ class CallGeminiFallbackTests(unittest.TestCase):
         self.assertEqual(gemini.get_retry_status()["phase"], "idle")
 
         # Call
-        gemini.call_gemini(self._contents())
+        llm.call_llm(self._contents())
 
         # After call
         self.assertEqual(gemini.get_retry_status()["phase"], "idle")
@@ -434,9 +438,9 @@ class CallGeminiFallbackTests(unittest.TestCase):
         snapshots = []
         self.mock_sleep.side_effect = lambda s: snapshots.append(gemini.get_retry_status())
 
-        result, model = gemini.call_gemini(self._contents())
+        result, model = llm.call_llm(self._contents())
 
-        self.assertEqual(model, "m1")
+        self.assertEqual(model, "gemini/m1")
         self.assertEqual(len(snapshots), 1)
         snap = snapshots[0]
         self.assertEqual(snap["phase"], "cooldown")
@@ -458,10 +462,10 @@ class CallGeminiFallbackTests(unittest.TestCase):
             snapshots.append(gemini.get_retry_status())
         self.mock_sleep.side_effect = _capture_sleep
 
-        result, model = gemini.call_gemini(self._contents())
+        result, model = llm.call_llm(self._contents())
 
         # m1 exhausts its retry budget, so the success comes from m2.
-        self.assertEqual(model, "m2")
+        self.assertEqual(model, "gemini/m2")
         # 3 5xx sleeps, then 1 inter-model delay sleep
         self.assertEqual(len(snapshots), 4)
 
@@ -490,10 +494,10 @@ class CallGeminiFallbackTests(unittest.TestCase):
         snapshots = []
         self.mock_sleep.side_effect = lambda s: snapshots.append(gemini.get_retry_status())
 
-        result, model = gemini.call_gemini(self._contents())
+        result, model = llm.call_llm(self._contents())
 
         # m1 exhausts its retry budget, so the success comes from m2.
-        self.assertEqual(model, "m2")
+        self.assertEqual(model, "gemini/m2")
         # First transport retry, then inter-model delay
         self.assertGreaterEqual(len(snapshots), 1)
         # Find transport reason in snapshots
@@ -503,7 +507,7 @@ class CallGeminiFallbackTests(unittest.TestCase):
     def test_retry_status_chain_cooldown_matches_on_cooldown_args(self) -> None:
         """Chain cooldown: on_cooldown receives phase cooldown, reason chain_cooldown, model None, attempt/max matching."""
         self._configure_settings({
-            "GEMINI_MODEL_CHAIN": ("m1",),
+            "LLM_MODEL_CHAIN": ("gemini/m1",),
             "GEMINI_MAX_RETRIES": 1,
             "GEMINI_RETRY_BASE_DELAY_SEC": 60,
         })
@@ -514,9 +518,9 @@ class CallGeminiFallbackTests(unittest.TestCase):
         def _on_cooldown(attempt, max_retries, delay):
             cooldown_snapshots.append(gemini.get_retry_status())
 
-        result, model = gemini.call_gemini(self._contents(), on_cooldown=_on_cooldown)
+        result, model = llm.call_llm(self._contents(), on_cooldown=_on_cooldown)
 
-        self.assertEqual(model, "m1")
+        self.assertEqual(model, "gemini/m1")
         self.assertEqual(len(cooldown_snapshots), 1)
         snap = cooldown_snapshots[0]
         self.assertEqual(snap["phase"], "cooldown")
@@ -535,7 +539,7 @@ class CallGeminiFallbackTests(unittest.TestCase):
         self.mock_http_post.side_effect = [(res, 503, {})] * (per_model * 2)
 
         with self.assertRaises(Exception):
-            gemini.call_gemini(self._contents())
+            llm.call_llm(self._contents())
 
         self.assertEqual(gemini.get_retry_status()["phase"], "idle")
 
@@ -545,7 +549,7 @@ class CallGeminiFallbackTests(unittest.TestCase):
         self.mock_http_post.side_effect = [(res, 400, {})]
 
         with self.assertRaises(Exception):
-            gemini.call_gemini(self._contents())
+            llm.call_llm(self._contents())
 
         self.assertEqual(gemini.get_retry_status()["phase"], "idle")
 
@@ -817,7 +821,7 @@ class ToolsRegistryTests(unittest.TestCase):
 
 class SendFileToolFallbackTests(unittest.TestCase):
     """send_file (issue #16) is declared for the model, but outside a
-    Telegram chat (e.g. direct call_gemini use) it has no chat_id to send
+    Telegram chat (e.g. direct Gemini call use) it has no chat_id to send
     to, so run_tool falls back to an explanatory message instead of routing
     through Telegram."""
 
@@ -840,7 +844,7 @@ class SendFileToolFallbackTests(unittest.TestCase):
 
 class ViewFileToolFallbackTests(unittest.TestCase):
     """view_file (issue #22) is declared for the model, but outside a
-    Telegram chat (e.g. direct call_gemini use) it has no way to fetch
+    Telegram chat (e.g. direct Gemini call use) it has no way to fetch
     and process the file, so run_tool falls back to an explanatory message."""
 
     def test_view_file_declared_in_tools_schema(self) -> None:

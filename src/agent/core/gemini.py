@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import time
+from collections import namedtuple
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from src.agent.config import REPO_SKILLS_DIR, SKILLS_DIR, settings
@@ -21,13 +22,16 @@ _FALLBACK_5XX = (500, 502, 503, 504)
 # Cap for a single cooldown sleep between whole-chain retry passes.
 _MAX_COOLDOWN_SEC = 300
 
+# Outcome of one chain entry: ok + response, or fallback + server delay hint.
+Attempt = namedtuple("Attempt", ["ok", "response", "hint"])
+
 # Short exponential backoff for 5xx/transport errors (transient overload).
 # Retries the same model up to this many times before falling back.
 _5XX_RETRY_BASE_SEC = 10
 _5XX_MAX_RETRIES = 3
 
 # Live retry/cooldown status, for display purposes only (e.g. web UI / bypass
-# commands). Updated by the task-queue worker thread as call_gemini
+# commands). Updated by the task-queue worker thread as the LLM chain
 # progresses; never consulted for retry/backoff/fallback decisions.
 _RETRY_STATUS: Dict[str, Any] = {
     "phase": "idle",
@@ -578,184 +582,105 @@ def _parse_retry_delay(res: Dict[str, Any]) -> Optional[float]:
     return None
 
 
-def call_gemini(
-    contents: List[Dict[str, Any]],
-    on_cooldown: Optional[Callable[[int, int, float], None]] = None,
-    allow_tools: bool = True,
-) -> Tuple[Dict[str, Any], str]:
-    """Call the Gemini model chain, retrying the whole chain with a cooldown
-    on rate limit / transient errors.
-
-    Settings (chain, key, timeout, inter-model fallback delay, retry base
-    delay, max retries) are snapshotted once at the top of the call; the
-    snapshot covers the whole call including all retry passes. If every
-    model in the chain fails with a fallback-eligible status (429/5xx/
-    transport/RESOURCE_EXHAUSTED), the whole chain is retried up to
-    GEMINI_MAX_RETRIES times, sleeping a cooldown between passes: the
-    largest server-suggested retry delay seen in the pass (if any),
-    otherwise exponential backoff from GEMINI_RETRY_BASE_DELAY_SEC, capped
-    at _MAX_COOLDOWN_SEC. Non-fallback statuses (e.g. 400/401/403) raise
-    immediately without any retry. `on_cooldown(attempt, max_retries, delay)`
-    is invoked (best-effort, exceptions swallowed) right before each
-    cooldown sleep, so callers can notify the user. When `allow_tools` is
-    False, function calling is disabled for this call (mode "NONE") while
-    the tool declarations stay in the payload so history referencing prior
-    functionCall/functionResponse parts remains valid.
-
-    Live retry/cooldown state is published for display via
-    get_retry_status(); it is reset to idle when the call returns or raises.
-    """
-    try:
-        return _call_gemini_impl(contents, on_cooldown, allow_tools)
-    finally:
-        _set_retry_status("idle")
-
-
-def _call_gemini_impl(
-    contents: List[Dict[str, Any]],
-    on_cooldown: Optional[Callable[[int, int, float], None]],
-    allow_tools: bool,
-) -> Tuple[Dict[str, Any], str]:
-    """Implementation of call_gemini; see call_gemini for semantics."""
-    chain = settings.get("GEMINI_MODEL_CHAIN")
-    key = settings.get("GEMINI_API_KEY")
-    timeout = settings.get("GEMINI_TIMEOUT_SEC")
-    delay = settings.get("GEMINI_FALLBACK_DELAY_SEC")
-    base_delay = settings.get("GEMINI_RETRY_BASE_DELAY_SEC")
-    max_retries = settings.get("GEMINI_MAX_RETRIES")
-
-    payload = {
+def build_payload(contents: List[Dict[str, Any]], allow_tools: bool) -> Dict[str, Any]:
+    """Gemini generateContent body for one chat turn. Built once per call by
+    the chain orchestrator (core/llm.py) and reused by every Gemini entry.
+    When allow_tools is False, function calling is disabled (mode "NONE")
+    while the tool declarations stay in the payload so history referencing
+    prior functionCall/functionResponse parts remains valid."""
+    payload: Dict[str, Any] = {
         "contents": contents,
         "systemInstruction": build_system_instruction(),
         "tools": build_tools_schema(),
     }
     if not allow_tools:
         payload["toolConfig"] = {"functionCallingConfig": {"mode": "NONE"}}
+    return payload
 
-    for attempt in range(max_retries + 1):
-        hinted_delay: Optional[float] = None
 
-        for index, model in enumerate(chain):
-            _set_retry_status("calling", model=model)
-            url = _GEMINI_URL_TEMPLATE.format(model)
-            req_headers = {"x-goog-api-key": key}
-            _LOGGER.debug("Gemini request model=%s url=%s", model, url)
-            res, status, resp_headers = http_post_h(url, payload, headers=req_headers, timeout=timeout)
-            _LOGGER.debug("Gemini raw response model=%s status=%s body=%s", model, status, res)
+def attempt_model(model: str, payload: Dict[str, Any], key: str, timeout: float, delay: float) -> Attempt:
+    """Try one Gemini model, including its same-model retries: one RPM sleep
+    and retry on 429, and exponential backoff on 5xx/transport errors.
 
-            if status == 200:
-                return res, model
+    Returns Attempt(ok=True, response=...) on success. Returns
+    Attempt(ok=False, hint=...) when the caller should fall back to the next
+    chain entry; hint is the server-suggested delay in seconds, or None.
+    Raises for non-fallback statuses (e.g. 400/401/403). The pause between
+    chain entries (delay) is the caller's job, not this function's."""
+    url = _GEMINI_URL_TEMPLATE.format(model)
+    req_headers = {"x-goog-api-key": key}
+    _set_retry_status("calling", model=model)
+    _LOGGER.debug("Gemini request model=%s url=%s", model, url)
+    res, status, resp_headers = http_post_h(url, payload, headers=req_headers, timeout=timeout)
+    _LOGGER.debug("Gemini raw response model=%s status=%s body=%s", model, status, res)
 
-            if status == 429:
-                parsed_delay = _parse_retry_delay_with_headers(res, resp_headers)
-                if _is_rpd_limit(res, parsed_delay):
-                    # RPD exhaustion: this model is done for the day, fall back.
-                    _LOGGER.warning(
-                        "Gemini model %s RPD limit hit, falling back to next model", model
-                    )
-                    if parsed_delay is not None and (hinted_delay is None or parsed_delay > hinted_delay):
-                        hinted_delay = parsed_delay
-                    if index < len(chain) - 1:
-                        time.sleep(delay)
-                    continue
-                else:
-                    # RPM/TPM: short-lived rate limit, sleep and retry same model.
-                    rpm_sleep = parsed_delay if parsed_delay is not None else delay
-                    hint_source = "server hint" if parsed_delay is not None else "fallback delay (no server hint)"
-                    _LOGGER.warning(
-                        "Gemini model %s 429 RPM/TPM, sleeping %.1fs (%s) before retry",
-                        model, rpm_sleep, hint_source,
-                    )
-                    _set_retry_status(
-                        "cooldown", reason="429_rpm", model=model, delay=rpm_sleep, attempt=1, max_attempts=1
-                    )
-                    time.sleep(rpm_sleep)
-                    _set_retry_status("calling", model=model)
-                    # Retry same model: redo this iteration.
-                    res, status, resp_headers = http_post_h(url, payload, headers=req_headers, timeout=timeout)
-                    _LOGGER.debug("Gemini raw response model=%s status=%s body=%s", model, status, res)
-                    if status == 200:
-                        return res, model
-                    # Still failing after one RPM retry — treat as fallback.
-                    parsed_delay2 = _parse_retry_delay_with_headers(res, resp_headers)
-                    if parsed_delay2 is not None and (hinted_delay is None or parsed_delay2 > hinted_delay):
-                        hinted_delay = parsed_delay2
-                    if index < len(chain) - 1:
-                        time.sleep(delay)
-                    continue
+    if status == 200:
+        return Attempt(True, res, None)
 
-            if status in _FALLBACK_5XX or status == 0:
-                # Transient overload/transport error: retry same model with short
-                # exponential backoff before giving up and falling back.
-                for retry in range(1, _5XX_MAX_RETRIES + 1):
-                    backoff = _5XX_RETRY_BASE_SEC * (2 ** (retry - 1))
-                    _LOGGER.warning(
-                        "Gemini model %s transient error (HTTP %s), retry %d/%d in %.1fs",
-                        model, status, retry, _5XX_MAX_RETRIES, backoff,
-                    )
-                    _set_retry_status(
-                        "cooldown",
-                        reason="5xx" if status in _FALLBACK_5XX else "transport",
-                        model=model,
-                        delay=backoff,
-                        attempt=retry,
-                        max_attempts=_5XX_MAX_RETRIES,
-                    )
-                    time.sleep(backoff)
-                    _set_retry_status("calling", model=model)
-                    res, status, resp_headers = http_post_h(url, payload, headers=req_headers, timeout=timeout)
-                    _LOGGER.debug("Gemini raw response model=%s status=%s body=%s", model, status, res)
-                    if status == 200:
-                        return res, model
-                    if status not in _FALLBACK_5XX and status != 0:
-                        break  # non-transient error, stop retrying
-                # All same-model retries exhausted, fall back to next model.
-                _LOGGER.warning(
-                    "Gemini model %s still failing after %d retries, falling back",
-                    model, _5XX_MAX_RETRIES,
-                )
-                if index < len(chain) - 1:
-                    time.sleep(delay)
-                continue
-
-            if _should_fallback(status, res):
-                _LOGGER.warning(
-                    "Gemini model %s call failed (%s), switching to next model", model, _fallback_reason(status, res)
-                )
-                parsed_delay = _parse_retry_delay_with_headers(res, resp_headers)
-                if parsed_delay is not None and (hinted_delay is None or parsed_delay > hinted_delay):
-                    hinted_delay = parsed_delay
-                if index < len(chain) - 1:
-                    time.sleep(delay)
-                continue
-
-            raise Exception("Gemini API call failed (model={}, status={})".format(model, status))
-
-        if attempt == max_retries:
-            raise Exception("All Gemini models failed (rate limit or transient error).")
-
-        cooldown = min(max(hinted_delay or 0, base_delay * (2 ** attempt)), _MAX_COOLDOWN_SEC)
-        if hinted_delay is not None and cooldown == hinted_delay:
-            cooldown_source = "server hint"
-        elif attempt == 0:
-            cooldown_source = "base delay"
-        else:
-            cooldown_source = "exponential backoff (attempt {})".format(attempt + 1)
+    if status == 429:
+        parsed_delay = _parse_retry_delay_with_headers(res, resp_headers)
+        if _is_rpd_limit(res, parsed_delay):
+            # RPD exhaustion: this model is done for the day, fall back.
+            _LOGGER.warning("Gemini model %s RPD limit hit, falling back to next model", model)
+            return Attempt(False, None, parsed_delay)
+        # RPM/TPM: short-lived rate limit, sleep and retry same model once.
+        rpm_sleep = parsed_delay if parsed_delay is not None else delay
+        hint_source = "server hint" if parsed_delay is not None else "fallback delay (no server hint)"
         _LOGGER.warning(
-            "All Gemini models failed on attempt %d/%d, cooling down %.1fs before retry (source=%s)",
-            attempt + 1, max_retries + 1, cooldown, cooldown_source,
+            "Gemini model %s 429 RPM/TPM, sleeping %.1fs (%s) before retry",
+            model, rpm_sleep, hint_source,
         )
         _set_retry_status(
-            "cooldown", reason="chain_cooldown", model=None, delay=cooldown, attempt=attempt + 1, max_attempts=max_retries
+            "cooldown", reason="429_rpm", model=model, delay=rpm_sleep, attempt=1, max_attempts=1
         )
-        if on_cooldown is not None:
-            try:
-                on_cooldown(attempt + 1, max_retries, cooldown)
-            except Exception:
-                _LOGGER.debug("on_cooldown callback raised, ignoring", exc_info=True)
-        time.sleep(cooldown)
+        time.sleep(rpm_sleep)
+        _set_retry_status("calling", model=model)
+        res, status, resp_headers = http_post_h(url, payload, headers=req_headers, timeout=timeout)
+        _LOGGER.debug("Gemini raw response model=%s status=%s body=%s", model, status, res)
+        if status == 200:
+            return Attempt(True, res, None)
+        # Still failing after one RPM retry: treat as fallback.
+        return Attempt(False, None, _parse_retry_delay_with_headers(res, resp_headers))
 
-    raise Exception("All Gemini models failed (rate limit or transient error).")
+    if status in _FALLBACK_5XX or status == 0:
+        # Transient overload/transport error: retry same model with short
+        # exponential backoff before giving up and falling back.
+        for retry in range(1, _5XX_MAX_RETRIES + 1):
+            backoff = _5XX_RETRY_BASE_SEC * (2 ** (retry - 1))
+            _LOGGER.warning(
+                "Gemini model %s transient error (HTTP %s), retry %d/%d in %.1fs",
+                model, status, retry, _5XX_MAX_RETRIES, backoff,
+            )
+            _set_retry_status(
+                "cooldown",
+                reason="5xx" if status in _FALLBACK_5XX else "transport",
+                model=model,
+                delay=backoff,
+                attempt=retry,
+                max_attempts=_5XX_MAX_RETRIES,
+            )
+            time.sleep(backoff)
+            _set_retry_status("calling", model=model)
+            res, status, resp_headers = http_post_h(url, payload, headers=req_headers, timeout=timeout)
+            _LOGGER.debug("Gemini raw response model=%s status=%s body=%s", model, status, res)
+            if status == 200:
+                return Attempt(True, res, None)
+            if status not in _FALLBACK_5XX and status != 0:
+                break  # non-transient error, stop retrying
+        # All same-model retries exhausted, fall back to next model.
+        _LOGGER.warning(
+            "Gemini model %s still failing after %d retries, falling back",
+            model, _5XX_MAX_RETRIES,
+        )
+        return Attempt(False, None, None)
+
+    if _should_fallback(status, res):
+        _LOGGER.warning(
+            "Gemini model %s call failed (%s), switching to next model", model, _fallback_reason(status, res)
+        )
+        return Attempt(False, None, _parse_retry_delay_with_headers(res, resp_headers))
+
+    raise Exception("Gemini API call failed (model={}, status={})".format(model, status))
 
 
 class ParsedReply:
