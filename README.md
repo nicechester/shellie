@@ -1,7 +1,7 @@
 # Shellie
 
 A personal Telegram agent that runs on your own machine. Zero pip dependencies —
-Python 3.8+ standard library only.
+Python 3.8+ standard library only. Current version: **1.1.1**.
 
 ## 1. Overview
 
@@ -9,27 +9,41 @@ Shellie is a single-user Telegram bot that runs continuously on a
 machine you own (a Mac, a Linux PC, or a Raspberry Pi) and gives you two ways
 to interact with it:
 
-- **Bypass track** — `!<cmd>`, `/sh <cmd>`, `/mem`, `/restart`, `/reset`, and
-  the settings commands (`/settings`, `/get`, `/set`, `/unset`) are handled
-  directly, with no LLM call. Shell commands run in ~0.1s.
-- **Gemini LLM track** — any other message is sent to Gemini
-  (`gemini-2.5-flash` → `gemini-2.5-pro` → `gemini-2.5-flash-lite` by default,
-  falling back to the next model on 429/`RESOURCE_EXHAUSTED`/5xx/transport
-  errors) with function calling. The model can call `execute_shell` and
-  `append_memory`, looping up to `FC_MAX_LOOPS` times per message; on reaching the limit or on detecting a repeated tool-call loop, the agent makes a final tools-disabled call to summarize results. If `FC_MAX_CONTINUATIONS` > 0, the agent can automatically resume the unfinished task up to that limit; otherwise `/continue` can be used to manually resume.
+- **Bypass track** — commands are handled directly, with no LLM call: shell
+  (`!<cmd>`, `/sh`, `/shell`), memory (`/mem`), session (`/reset`, `/restart`,
+  `/queue`, `/kill`), tasks (`/continue`, `/discard`), files (`/file`,
+  `/browse`), schedules (`/schedule`), MCP login (`/mcp`), logs (`/systemlog`),
+  and settings (`/settings`, `/get`, `/set`, `/unset`). Shell commands run in ~0.1s.
+- **LLM track** — any other message goes to the LLM. The chain is
+  `LLM_MODEL_CHAIN`, a mix of Gemini (`gemini/<model>`) and any
+  OpenAI-compatible server (`openai/<model>`, for example OpenRouter, Groq,
+  LM Studio or Ollama). The default chain is Gemini only. Entries are tried in
+  order and the next one is used on 429, 5xx or transport errors. The model has
+  these tools:
+  - `execute_shell`, `append_memory`, `execute_web_search`
+  - `send_file`, `view_file` (look at a workspace file, including images)
+  - `manage_schedule` (add, change or remove scheduled prompts)
+  - `manage_skill` (create, update or remove user skills)
+  - `propose_mcp_server` (propose adding or removing an MCP server; applied only after you confirm)
+  - every tool exposed by configured MCP servers
+
+  The model loops up to `FC_MAX_LOOPS` times per message. On reaching the limit,
+  or on a detected repeat loop, it makes one final tools-disabled call to summarize.
+  With `FC_MAX_CONTINUATIONS` > 0 it can resume an unfinished task automatically;
+  otherwise use `/continue`.
 - **Long-term memory** — split into a core file, `memory/MEMORY.md`
   (user-curated, permanent), and per-day files `memory/YYYY-MM-DD.md` that
   the LLM appends to with `append_memory`. `/mem` and every LLM call inject
   the core file plus today's dated file into the system instruction; older
   dated files are not injected but can be found with `grep -ri "<keyword>"
   memory/`.
-- **Runtime-editable settings** — all 23 settings can be changed without a
-  restart, either from a local web UI (`http://127.0.0.1:<WEB_PORT>/`) or via
-  Telegram `/set`/`/unset` commands. See [§7](#7-settings).
-- **MCP tools (optional)** — configure `MCP_SERVERS` to let the Gemini LLM
-  also call tools exposed by remote HTTP MCP (Model Context Protocol)
-  servers, alongside the built-in `execute_shell`/`append_memory` tools. See
-  [MCP servers (HTTP)](#mcp-servers-http) in [§7](#7-settings).
+- **Runtime-editable settings** — all 25 settings can be changed without a
+  restart, from the local web UI or from Telegram with `/set` and `/unset`
+  (except the web-only keys, listed in [§7](#7-settings)). See [§7](#7-settings).
+- **MCP servers (optional)** — remote tools over Streamable HTTP, with static
+  headers or an OAuth 2.0 login. Setup walkthrough, including a Google Drive
+  example: **[docs/mcp-setup.md](docs/mcp-setup.md)**. Summary in [§7](#mcp-servers-http).
+- **Skills** — built-in and user skills the LLM can use. See [§8](#8-skills).
 
 **Design goals:** zero pip dependencies (Python 3.8+ standard library only),
 steady-state RSS under 30MB, and 24/7 operation via the OS's own service
@@ -49,7 +63,8 @@ manager (no custom supervisor process).
 - Python 3.8 or newer. No `pip install` of anything — the project has zero
   third-party dependencies (`pyproject.toml` declares `dependencies = []`).
 - Working outbound HTTPS to `api.telegram.org` and
-  `generativelanguage.googleapis.com`.
+  `generativelanguage.googleapis.com`. Add the host of any OpenAI-compatible
+  server you use, and of any MCP server you configure.
 - **SSL certificates:** this only matters for python.org-distributed macOS
   builds, which ship without a root CA bundle — run
   `/Applications/Python 3.x/Install Certificates.command` once, or every
@@ -70,9 +85,10 @@ manager (no custom supervisor process).
 Shellie uses two separate directories:
 
 - **`SHELLIE_HOME`** (default: `~/.shellie/`) — configuration and context:
-  settings.json, memory files, user skills, offset file
+  `settings.json`, memory files, user skills (`skills/`), MCP login tokens
+  (`mcp_oauth.json`), schedules, the task file and the offset file
 - **`SHELLIE_WORKSPACE`** (default: `~/workspace/`) — work products: job
-  outputs, generated code, documents created by the LLM
+  outputs, generated code, documents created by the LLM, and files you upload
 
 You can configure both via environment variables or `.env` file:
 
@@ -114,9 +130,9 @@ then either enters setup-required mode or starts the Telegram polling loop.
 
 **Warning: never run a foreground instance while the launchd/systemd service
 is also installed and running.** The `flock` guard makes the second process
-print "다른 인스턴스가 실행 중입니다." and exit(1) immediately — but even if
-that guard were bypassed, two processes polling `getUpdates` with the same
-bot token race each other and Telegram returns 409 Conflict to one of them.
+exit immediately — but even if that guard were bypassed, two processes polling
+`getUpdates` with the same bot token race each other and Telegram returns 409
+Conflict to one of them.
 
 ## 5. Service installation
 
@@ -223,33 +239,46 @@ This stops and removes the service. Your data in `~/.shellie` and
 
 | Command | Track | Behavior |
 |---|---|---|
-| `!<cmd>` | Bypass (shell) | Runs `<cmd>` in the resolved shell (see `SHELL_PATH` in [§7](#7-settings)), no LLM call |
-| `/sh <cmd>` | Bypass (shell) | Same as `!<cmd>`, explicit form |
+| `!<cmd>` / `/sh <cmd>` | Bypass (shell) | Runs `<cmd>` in the resolved shell (see `SHELL_PATH` in [§7](#7-settings)), no LLM call |
 | `!!` / `/shell` | Bypass (shell mode) | Toggles shell mode: every following message runs as a shell command in one terminal message edited in place, with no LLM calls. `cd` persists within the session (shown in the terminal header); variables/exports do not. Requires a POSIX shell (sh/bash/zsh/dash/ksh); with other shells commands run in the last directory without tracking `cd`. Your command messages are deleted to keep the terminal visible. `/reset` also leaves shell mode. Not persisted across restarts. |
 | `exit` *(in shell mode)* | Bypass (shell mode) | Leaves shell mode. Only special while shell mode is active; otherwise it goes to the LLM like any text. |
 | `/mem` | Bypass | Prints long-term memory: core `MEMORY.md` plus today's dated file (`memory/YYYY-MM-DD.md`) |
-| `/reset` | Bypass | Clears the in-process conversation history (context only, not `MEMORY.md`) |
-| `/restart` | Bypass | Exits the process; the service manager (launchd/systemd) restarts it. Warns if no service manager is detected. Now mainly useful for picking up **code** changes — setting changes already hot-apply |
-| `/settings`, `/get`, `/env` | Bypass (settings) | Lists all 20 keys with current value (masked if secret), source, and apply timing |
+| `/reset` | Bypass | Clears conversation history and the queue (context only, not `MEMORY.md`, not schedules) |
+| `/kill` | Bypass | Drains the queue and discards the unfinished task, keeping conversation history |
+| `/queue` | Bypass | Shows queue status, plus live Gemini retry or cooldown state |
+| `/restart` | Bypass | Exits the process; the service manager restarts it. Warns if no service manager is detected. Use it to pick up **code** changes — setting changes already hot-apply |
+| `/systemlog [N]` | Bypass | Last N log lines (default 50, max 500): from the journal under systemd, from `agent.log` under launchd |
+| `/help` | Bypass | Shows the version and the command reference |
+| `/settings`, `/env` | Bypass (settings) | Lists all 25 keys with current value (masked if secret), source, and apply timing |
 | `/get KEY`, `/env KEY` | Bypass (settings) | Detail view for one key: value, source, default, constraint, apply timing |
 | `/set KEY VALUE` | Bypass (settings) | Applies an override immediately (rejected for web-only keys) |
 | `/unset KEY` | Bypass (settings) | Removes an override, falling back to the env/default layer |
 | `/continue` | Bypass (task) | Resume the unfinished task (stopped, errored, or left over from a restart) |
 | `/discard` | Bypass (task) | Drop the unfinished task without resuming |
-| `/file <path>` | Bypass | Send a file from SHELLIE_WORKSPACE to the user |
-| `/browse [path]` | Bypass | List files in a directory with an inline-keyboard menu |
+| `/file <path>` | Bypass | Send a file from `SHELLIE_WORKSPACE` to you |
+| `/browse [path]` | Bypass | List files in a directory with an inline-keyboard menu: tap a folder to open it, a file to download it |
 | `/schedule` | Bypass (schedule) | List all schedules |
-| `/schedule add <spec> <prompt>` | Bypass (schedule) | Add a new recurring schedule |
+| `/schedule add <spec> <prompt>` | Bypass (schedule) | Add a new recurring or one-shot schedule |
 | `/schedule rm <id>` | Bypass (schedule) | Remove a schedule |
-| `/schedule on <id>` / `/schedule off <id>` | Bypass (schedule) | Enable or disable a schedule |
-| anything else | LLM (Gemini) | Sent with tools `execute_shell`, `append_memory`, `execute_web_search`, `send_file`, `view_file`, and `manage_schedule`; function-calling loop up to `FC_MAX_LOOPS` iterations (or on repeat-loop detection), with final wrap-up call if limit reached, with up to `CONTEXT_TURNS` recent turns of history |
+| `/schedule on <id>` / `/schedule off <id>` / `/schedule run <id>` | Bypass (schedule) | Enable, disable, or run a schedule now |
+| `/mcp` | Bypass (MCP) | Shows the login state of OAuth MCP servers |
+| `/mcp auth <server>` | Bypass (MCP) | Sends the approval link for an OAuth server (valid 15 minutes) |
+| `/mcp finish <server> <URL>` | Bypass (MCP) | Completes an OAuth login from the address you copied back. Shellie deletes that message, since it holds a one-time code |
+| `/mcp logout <server>` | Bypass (MCP) | Forgets the stored login for a server |
+| anything else | LLM | Sent with the tools listed in [§1](#1-overview). Function-calling loop up to `FC_MAX_LOOPS`, with up to `CONTEXT_TURNS` recent turns of history |
+
+Adding skills and MCP servers needs no command: ask in chat, for example
+`add MCP server gdrive at https://drivemcp.googleapis.com/mcp/v1 with OAuth`,
+or `create a skill that …`. MCP changes show a 🔌 proposal with ✅ Confirm and
+✖ Cancel, and nothing changes until you confirm. Skill changes are announced
+with 🧩.
 
 ### Attachments (multimodal uploads)
 
-When you send files via Telegram, Shellie includes them in your next Gemini message:
+When you send files via Telegram, Shellie includes them in your next LLM message:
 
 **Supported types:**
-- **Images, PDFs, audio, and video** → sent to Gemini as base64 `inlineData` parts (Gemini processes them directly).
+- **Images, PDFs, audio, and video** → sent to the model as base64 `inlineData` parts (processed directly).
 - **Text and code files** → content is inlined as plain text in your message.
 
 **Limits:**
@@ -259,7 +288,7 @@ When you send files via Telegram, Shellie includes them in your next Gemini mess
 
 **No caption?** If you send a file without a message, Shellie replies with "What would you like me to do with it? I'll include it with your next message." — no LLM call. This reply is skipped for subsequent items in an album (media_group_id deduplication).
 
-**Files already on disk:** Files already on disk can be viewed too — ask about a file by name and the model attaches it itself via `view_file`.
+**Files already on disk:** Files already in the workspace can be viewed too — ask about a file by name and the model attaches it itself via `view_file`.
 
 **History cleanup:** After each turn, attachment content is removed from conversation history and replaced with "[attachment removed from history: …]" placeholders to keep request sizes bounded. Re-send the file to ask about it again later.
 
@@ -276,7 +305,7 @@ Shellie can run recurring prompts on a schedule, without you needing to send a m
 - `at 2026-10-05 14:30` — **one-shot, fires once** at that date and time (must be in the future), then shows as done.
 
 **Schedule names:**
-- Optional short label (≤60 chars) to help identify a schedule. The model sets these automatically on `/schedule add` to make future changes easier (e.g. "news briefing" instead of just "id 3").
+- Optional short label (≤60 chars) to help identify a schedule. The model sets these automatically on add to make future changes easier (e.g. "news briefing" instead of just "id 3").
 
 **Constraints:**
 - **Max 20 schedules** per bot instance.
@@ -287,13 +316,10 @@ Shellie can run recurring prompts on a schedule, without you needing to send a m
 - **History handling:** Daily/weekdays/weekly runs add their results to chat history (you can follow up with questions). Interval (every/hourly) runs are **not** added to history (protects your ongoing conversation context).
 - Missed runs (>10 minutes late due to downtime, laptop sleep, restarts) are **skipped, never replayed**.
 - At most one queued/running instance per schedule.
-- **Quota note:** each run costs Gemini requests; the 15-minute minimum floor protects free-tier daily limits.
+- **Quota note:** each run costs LLM requests; the 15-minute minimum floor protects free-tier daily limits.
 
 **Management:**
-- List schedules: `/schedule`
-- Add a schedule: `/schedule add <spec> <prompt>` (or ask the model via chat with the `manage_schedule` tool)
-- Remove: `/schedule rm <id>`
-- Enable/disable: `/schedule on <id>` / `/schedule off <id>`
+- List, add, remove, enable, disable and run: see the `/schedule` commands in [§6](#6-telegram-commands), or ask the model in chat (it uses `manage_schedule`).
 - Model-made schedule changes (via chat) are announced in chat with **🗓️** for visibility.
 - `/reset` clears the conversation history and queue but **does not** affect schedules.
 
@@ -314,7 +340,7 @@ does nothing until you restart — and even after a restart, if an override
 for that key already exists in `settings.json`, your new `.env` value stays
 shadowed until you `/unset` that key (or delete `settings.json`).
 
-### 23-key reference
+### 25-key reference
 
 | Key | Default | Range / format | Telegram-editable | Apply timing |
 |---|---|---|---|---|
@@ -338,7 +364,7 @@ shadowed until you `/unset` that key (or delete `settings.json`).
 | `WEB_ENABLED` | `true` | bool (`true/false/on/off/1/0/yes/no/켜기/끄기`) | Yes | listener reconcile |
 | `WEB_PORT` | `8321` | 1024–65535, must bind free (checked before switching) | Yes | listener reconcile |
 | `SHELL_PATH` | `auto` | `auto`, or an absolute path that exists, is executable, and (if `/etc/shells` exists) is listed there | Yes | immediate (next shell command) |
-| `MCP_SERVERS` | `""` (disabled) | JSON array: `name` (`[a-zA-Z0-9_-]{1,32}`, unique), `url` (`http://`/`https://`), optional `headers` (string→string map) | No (web-only, secret) | immediate (next LLM call) |
+| `MCP_SERVERS` | `""` (disabled) | JSON array; see [MCP servers](#mcp-servers-http) | No (web-only, secret) | immediate (next LLM call) |
 | `SEARCH_MODEL` | `gemma-4-26b-a4b-it` | Single model name | Yes | immediate (next web search) |
 | `OPENAI_API_BASE` | `https://api.openai.com/v1` | `http://` or `https://` URL (e.g. `http://localhost:11434/v1` for Ollama) | Yes | immediate (next LLM call) |
 | `OPENAI_API_KEY` | `""` (none) | No whitespace, at most 512 chars; empty for local servers | No (web-only, secret) | immediate (next LLM call) |
@@ -354,16 +380,19 @@ gemini/gemini-2.5-flash,gemini/gemini-2.5-pro,openai/gpt-4o-mini
 
 - `gemini/` calls the Gemini API with `GEMINI_API_KEY`.
 - `openai/` calls an OpenAI-compatible server at `OPENAI_API_BASE` with
-  `OPENAI_API_KEY`. One `OPENAI_*` setting set covers OpenAI, OpenRouter, LM Studio and
-  Ollama. Use the server's own model names, for example `openai/openai/gpt-4o-mini` on
-  OpenRouter. The entry is split at the first `/` only.
+  `OPENAI_API_KEY`. One `OPENAI_*` set covers OpenAI, OpenRouter, Groq, LM Studio
+  and Ollama. Use the server's own model names: for example, on OpenRouter the
+  entry is `openai/openai/gpt-4o-mini`, because the entry is split at the first `/`
+  only. Groq's `openai/gpt-oss-120b` is entered as `openai/openai/gpt-oss-120b`.
 - Any other provider prefix is rejected when the setting is saved.
 - A fallback-eligible failure (429, 5xx, transport, and 404/408 on `openai/`) moves to the
   next entry. When a whole pass fails, the chain cools down and repeats, governed by
   `GEMINI_RETRY_BASE_DELAY_SEC` and `GEMINI_MAX_RETRIES`. Those timing settings apply to
-  every provider in the chain.
+  every provider in the chain. Other statuses (for example 401 or 403) fail immediately.
 - An `openai/` entry with an empty `OPENAI_API_KEY` is skipped with a warning, unless
   `OPENAI_API_BASE` points at a local or LAN address (for example Ollama).
+- Requests to OpenAI-compatible servers send a `Shellie/<version>` User-Agent. Some
+  hosts behind Cloudflare reject Python's default User-Agent with 403.
 - Conversations keep working when the chain switches provider mid-conversation.
 
 Migration: `LLM_BACKEND`, `GEMINI_MODEL_CHAIN` and `OPENAI_MODEL_CHAIN` are read once
@@ -379,10 +408,17 @@ ending in `nologin`/`false`.
 
 ### MCP servers (HTTP)
 
-`MCP_SERVERS` lets the Gemini LLM call tools exposed by remote MCP (Model
-Context Protocol) servers, in addition to the built-in `execute_shell` and
-`append_memory` tools. It is JSON: an array of `{"name": ..., "url": ...,
-"headers": ...}` objects, e.g.:
+`MCP_SERVERS` lets the LLM call tools on remote MCP (Model Context Protocol)
+servers, alongside the built-in tools. The full walkthrough, including a Google
+Drive example, is in **[docs/mcp-setup.md](docs/mcp-setup.md)**. This section is
+the reference.
+
+**Supported:** Streamable HTTP only (each call is a JSON POST to `url`), static
+`headers`, OAuth 2.0 with PKCE, and JSON responses. SSE responses
+(`text/event-stream`) and stdio servers are not supported; an SSE-only server is
+logged and its tools are skipped.
+
+Each entry is an object with `name`, `url`, and optional `headers` and `oauth`:
 
 ```json
 [
@@ -394,33 +430,67 @@ Context Protocol) servers, in addition to the built-in `execute_shell` and
 ]
 ```
 
-**Supported:** the Streamable HTTP transport (every call is a single JSON
-POST to `url`), static per-server `headers` (e.g. bearer tokens), and JSON
-(non-streaming) responses.
+- `name`: 1–32 characters, letters, digits, `-` and `_`. Unique.
+- Each remote tool is exposed to the LLM as `mcp_<server>_<tool>` (sanitized and
+  truncated to 63 characters), with its description prefixed `[MCP:<server>]`.
+- Tool lists are cached for 300 seconds. Changes apply on the next LLM call.
 
-**Not supported (by design):** the stdio transport, OAuth flows, and SSE
-(`text/event-stream`) responses — a server that answers a call with an
-`text/event-stream` Content-Type is logged as unsupported and its tools are
-skipped for that server (see `src/agent/core/mcp.py`).
+**OAuth (optional):** an `oauth` block runs the authorization-code flow with PKCE.
+Shellie runs headless, so the login is copy-paste based:
 
-Because the value can contain bearer tokens or other credentials in
-`headers`, `MCP_SERVERS` is treated as a secret: it can only be set from the
-local web UI (masked everywhere, including `/settings`/`/get`), the same as
-`TELEGRAM_BOT_TOKEN`/`GEMINI_API_KEY`.
+```json
+{
+  "name": "bank",
+  "url": "https://mcp.example.com/",
+  "oauth": {
+    "authorization_url": "https://auth.example.com/authorize",
+    "token_url": "https://auth.example.com/token",
+    "redirect_uri": "http://localhost:8787/callback",
+    "client_id": "<client id>",
+    "client_secret": "<optional, for confidential clients>",
+    "scope": "<optional>"
+  }
+}
+```
 
-Each remote tool is exposed to Gemini as `mcp_<server>_<tool>` (sanitized to
-`[a-zA-Z0-9_-]` and truncated to 63 characters), with its description
-prefixed `[MCP:<server>]` so replies can be traced back to their source.
-Failures degrade gracefully: an unreachable server, invalid config, or an
-SSE-only server simply has its tools omitted from that request — the
-built-in tools and the rest of the chat continue to work normally.
+1. `/mcp auth bank` sends an approval link, valid 15 minutes.
+2. Open the link on your own device and approve. The browser then fails to load
+   `redirect_uri`. That's expected.
+3. Copy the full address from the address bar and send `/mcp finish bank <URL>`.
+   Shellie deletes that message, checks the state, and exchanges the code for tokens.
+
+Rules:
+- `authorization_url` and `token_url` must be `https://` (plain `http://` only for
+  `localhost` and loopback addresses).
+- Shellie asks for offline access, so the provider can issue a refresh token. The
+  access token renews without another login. A login made before this was added
+  needs `/mcp logout bank`, then `/mcp auth bank`.
+- Tokens are stored in `~/.shellie/mcp_oauth.json` (0600). A stored login applies
+  only while the server's `url`, `token_url` and `client_id` stay the same.
+- If the provider rejects the refresh token (`invalid_grant`), the stored login is
+  removed and you're asked to log in again.
+- `redirect_uri` must be registered with the provider exactly as written.
+
+**Adding a server:**
+
+- **From chat:** ask in plain words. Shellie shows a 🔌 proposal with ✅ Confirm and
+  ✖ Cancel. Nothing changes until you tap Confirm, and proposals expire after 10
+  minutes. For an OAuth server, Confirm also sends the approval link. Chat can add
+  or remove a server without headers or a `client_secret`. Each confirmed change is
+  recorded in the settings audit log as actor `chat`.
+- **From the web settings page:** required for static headers and for a
+  `client_secret`, because `MCP_SERVERS` is a web-only secret. See
+  [§7 Web UI](#web-ui) for remote access.
+
+Because `MCP_SERVERS` can contain bearer tokens or client secrets, it is masked
+everywhere, including `/settings` and `/get`, and it cannot be set with `/set`.
 
 ### Secrets policy
 
-`TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY`, and `ALLOWED_USER_ID` can only be
-changed from the local web UI. A Telegram `/set`/`/unset` attempt on any of
-them is rejected with a "🔒 web-only" reply. For the two actual secrets
-(`TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY`) the bot additionally makes a
+`TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY`, `ALLOWED_USER_ID`, `OPENAI_API_KEY` and
+`MCP_SERVERS` can only be changed from the local web UI. A Telegram `/set`/`/unset`
+attempt on any of them is rejected with a "🔒 web-only" reply. For the two actual
+secrets (`TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY`) the bot additionally makes a
 best-effort attempt to delete the triggering message and recommends
 rotating the value, since it may already be visible in the chat history;
 `ALLOWED_USER_ID` is blocked the same way but is not masked or deleted since
@@ -429,16 +499,34 @@ with a live `getMe` call before being accepted; a successful change also
 shows a one-time "new bot @username" notice on the web page (useful if you
 pointed the bot at a different Telegram bot account).
 
+Chat-driven MCP changes (`propose_mcp_server` and the Confirm button) never write
+headers or a `client_secret`, so they stay within this rule.
+
 ### Web UI
 
-Always use `http://127.0.0.1:<WEB_PORT>/` — **not** `localhost` — the server
-binds IPv4 only, and some systems resolve `localhost` to `::1` first, which
-would fail to connect. There is no login, but every request is checked
-against: Host header (must be `127.0.0.1:<port>` or `localhost:<port>`),
-Origin (same-origin only, if present), `Sec-Fetch-Site` (`same-origin`/`none`
-only, if present), and — for POSTs — a per-process CSRF token embedded in
-the form. Changing `ALLOWED_USER_ID` requires an extra confirmation
-checkbox and, once applied, notifies both the old and new Telegram user IDs.
+The web UI listens on `127.0.0.1` only. The bind address is fixed in code and
+can't be changed from settings. There is no login, so this is deliberate: anyone
+on the network could otherwise change the bot token or API keys.
+
+Open it on the same machine as `http://127.0.0.1:<WEB_PORT>/` — **not**
+`localhost`, because the server binds IPv4 only, and some systems resolve
+`localhost` to `::1` first.
+
+**From another machine (for example, your laptop):** use an SSH tunnel and keep
+the local port equal to `WEB_PORT`, because the server only accepts the Host
+`127.0.0.1:<port>` or `localhost:<port>`:
+
+```sh
+ssh -L 8321:127.0.0.1:8321 <pi-user>@<pi-host>
+```
+
+Then open `http://127.0.0.1:8321` on your laptop while the tunnel is running.
+
+Every request is checked against: Host header, Origin (same-origin only, if
+present), `Sec-Fetch-Site` (`same-origin`/`none` only, if present), and — for
+POSTs — a per-process CSRF token embedded in the form. Changing `ALLOWED_USER_ID`
+requires an extra confirmation checkbox and, once applied, notifies both the old
+and new Telegram user IDs.
 
 ### Lockout recovery
 
@@ -455,13 +543,27 @@ In-flight task state is persisted to `~/.shellie/tasks/current.json` (mode 0600)
 
 ## 8. Skills
 
-`skills/` is a hybrid library: `.py` files are standalone scripts the LLM
-runs deterministically via its `execute_shell` tool, and `.md` files are
-procedure documents the LLM reads on demand and follows step by step. See
-[`skills/README.md`](skills/README.md) for the authoring convention for
-both. Skills are auto-listed in the LLM's system prompt as
+Skills come in two places, and a user skill with the same name overrides a built-in one:
+
+- **Built-in** — `skills/` in the repository. `.py` files are standalone scripts that
+  the LLM runs through `execute_shell`. `.md` files are procedure documents the LLM
+  reads and follows step by step. See [`skills/README.md`](skills/README.md) for the
+  authoring convention.
+- **User** — `~/.shellie/skills/`. Created or changed by the LLM with the
+  `manage_skill` tool when you ask in chat (for example, "create a skill that …"),
+  or by you directly in the folder.
+
+Skills are auto-listed in the LLM's system prompt as
 `- skills/<name>.py: <first docstring line>` or
-`- skills/<name>.md: <first line>` — there is no loader.
+`- skills/<name>.md: <first line>`. A new or changed skill is visible on the next message; there is no loader.
+
+`manage_skill` rules:
+- Names are lowercase letters, digits, `-` and `_`, ending in `.md` or `.py`.
+- Built-in names can't be changed or removed.
+- Content is limited to 20,000 characters, and must not be empty.
+- Every change is announced in chat with 🧩.
+- A `.py` skill runs through `execute_shell`, which the model already has. Only ask
+  for skills you trust, and read them before running.
 
 ## 9. Security notes
 
@@ -470,13 +572,20 @@ both. Skills are auto-listed in the LLM's system prompt as
   the process refuses to start polling without a valid value (fail-closed).
 - `.env` and `settings.json` are created with `0600` permissions;
   `settings.json`'s permissions are checked and auto-corrected on every load
-  if group/other-readable.
+  if group/other-readable. MCP login tokens are kept in `mcp_oauth.json` (0600).
 - `TELEGRAM_BOT_TOKEN` and `GEMINI_API_KEY` are stripped from the shell
   child's environment before every `execute_shell` call, so a plain `env` or
   `printenv` run by the LLM cannot exfiltrate them.
-- Prompt injection via shell output or file contents is an inherent risk of
-  an LLM that can call `execute_shell` without confirmation — don't point
-  this bot at untrusted repositories, files, or command output.
+- Prompt injection via shell output, file contents, web search results, MCP tool
+  output, or Drive documents is an inherent risk of an LLM that can call
+  `execute_shell` without confirmation. Don't point this bot at untrusted
+  repositories, files, or command output.
+- MCP servers receive whatever the model sends them, including the arguments of
+  each tool call. Add only servers you trust. Chat-proposed servers still need your
+  Confirm tap, and the proposal shows the URL.
+- OAuth: codes are single-use, the pending login is held in memory for 15 minutes,
+  and the state is checked before the code is exchanged. The client secret must be
+  entered in the web UI.
 
 ## 10. Development
 
@@ -486,17 +595,23 @@ both. Skills are auto-listed in the LLM's system prompt as
 src/agent/
   __main__.py       entry point: POSIX guard, single-instance lock, polling loop, signal handlers
   config.py         path constants, .env parser (parse_dotenv, pure function)
-  settings.py       23-key SettingSpec catalog + SettingsStore (layering, precheck, persistence)
+  settings.py       25-key SettingSpec catalog + SettingsStore (layering, precheck, persistence)
+  version.py        __version__ (keep in sync with pyproject.toml)
   core/
     shell.py        POSIX shell resolution + execution (timeout, process group, env scrubbing)
     memory.py       core MEMORY.md + per-day memory/YYYY-MM-DD.md read/append
-    gemini.py       Gemini HTTP calls, model fallback chain, response parsing, tool registry
+    gemini.py       LLM call loop, model chain fallback, response parsing, tool registry
+    openai.py       OpenAI-compatible backend (message conversion, attempt_model)
+    llm.py          call_llm: walks the mixed LLM_MODEL_CHAIN across providers
     mcp.py          HTTP MCP client (Streamable HTTP only): tool discovery + invocation
+    mcp_oauth.py    OAuth code+PKCE login for MCP servers (copy-paste, token store, refresh)
+    chat_admin.py   skill create/update/remove and MCP add/remove proposals with confirmation
     scheduler.py    scheduled prompts: spec parsing, persistence, ticker thread
     tasks.py        task persistence for continuation across restarts
   telegram/
     client.py       Telegram Bot API calls (getUpdates, sendMessage, getMe, ...)
-    handlers.py     command routing, settings commands, function-calling loop, history
+    handlers.py     command routing, settings and /mcp commands, function-calling loop, history
+    files.py        attachments, uploads, /file and /browse helpers
   web/
     server.py       single-thread HTTPServer, security gate, routes
     page.py         HTML rendering (no external JS/CSS)
@@ -504,10 +619,11 @@ src/agent/
     http.py         stdlib http_get/http_post/http_post_h helpers
 launchd/            macOS launchd plist, install.sh and uninstall.sh (both OSes)
 systemd/            Linux/Pi systemd user unit
-skills/             standalone stdlib scripts, auto-listed in the system prompt
+skills/             built-in skills, auto-listed in the system prompt
 memory/MEMORY.md    core long-term memory file (memory/YYYY-MM-DD.md holds per-day entries)
+docs/mcp-setup.md   MCP server setup guide, with a Google Drive example
+docs/gemini_429_observations.md   notes on Gemini 429 behavior
 tests/              unittest suite
-docs/VERIFICATION.md manual acceptance/verification playbook
 ```
 
 ### Coding rules
@@ -518,14 +634,12 @@ docs/VERIFICATION.md manual acceptance/verification playbook
   make 3.9+ *runtime* syntax legal. Do not use, among others: dict `|`
   merge/union, `str.removeprefix`/`removesuffix`, `match` statements,
   `zoneinfo`, `functools.cache`, `subprocess.process_group=` (use
-  `start_new_session=True` instead). See `dev-plan.md` §7 ("3.8 호환 코딩
-  규칙") for the full list.
+  `start_new_session=True` instead).
 - Settings are read with `settings.get(KEY)` **at call time**, never at
   import time and never cached in a module-level variable — this is what
   makes hot-apply work.
-- Comments and docstrings are in English. User-facing strings (Telegram
-  replies, web UI text, log messages) are Korean by design — do not
-  translate them.
+- Comments, docstrings and user-facing strings (Telegram replies, web UI text,
+  log messages) are in English.
 
 ### Tests
 
@@ -536,7 +650,3 @@ PYTHONPATH=. python3 -m unittest discover tests -v
 Some shell tests spawn real short-lived subprocesses (`sleep`, `echo`) to
 exercise timeout/process-group handling, so they are not fully hermetic and
 take a few seconds.
-
-See [`docs/VERIFICATION.md`](docs/VERIFICATION.md) for the manual, on-device
-acceptance playbook, and `dev-plan.md` for the full design history, decision
-log, and risk checklist.

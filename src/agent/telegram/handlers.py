@@ -13,7 +13,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from src.agent.config import settings, SHELLIE_WORKSPACE
-from src.agent.core import scheduler, tasks
+from src.agent.core import chat_admin, mcp, mcp_oauth, scheduler, tasks
 from src.agent.core.gemini import get_retry_status, parse_response, run_tool
 from src.agent.core.llm import call_llm
 from src.agent.core.memory import read_memory
@@ -69,6 +69,8 @@ _LS_INDEX_MAX = 1000
 _BROWSE_MAX_ENTRIES = 98
 _BROWSE_LABEL_MAX = 40
 _CALLBACK_RE = re.compile(r"^([df]):(\d{1,9})$")
+_MCP_PROPOSAL_RE = re.compile(r"^mcp:([yn]):([0-9a-f]{8})$")
+_PROPOSAL_ID_RE = re.compile(r"proposal ([0-9a-f]{8}) ")
 
 
 # Shell mode (issue #18): a single in-place "terminal" message where every
@@ -121,7 +123,7 @@ _HELP_TEXT = (
     "<code>/kill</code> — drain queue and discard pending tasks\n"
     "<code>/continue</code> — resume the unfinished task\n"
     "<code>/discard</code> — drop the unfinished task\n"
-    "<code>/systemlog [N]</code> — show last N lines of agent.log (default 50)\n"
+    "<code>/systemlog [N]</code> — show last N log lines (default 50)\n"
     "<code>/file &lt;path&gt;</code> — send a file from the host\n"
     "<code>/browse [path]</code> — browse files; tap a file to download it, a folder to open it\n"
     "<code>/schedule [list|add|rm|on|off|run] ...</code> — manage recurring/one-shot scheduled prompts\n"
@@ -135,6 +137,27 @@ _HELP_TEXT = (
     "\n"
     "<b>Files</b>\n"
     "Files sent to the bot (documents, photos, videos, audio, voice notes) are saved to the workspace.\n"
+    "\n"
+    "<b>MCP servers</b>\n"
+    "<code>/mcp</code> — login state of OAuth servers\n"
+    "<code>/mcp auth &lt;server&gt;</code> / <code>/mcp finish &lt;server&gt; &lt;URL&gt;</code> — OAuth login\n"
+    "<code>/mcp logout &lt;server&gt;</code> — forget a login\n"
+    "\n"
+    "<b>Add an MCP server</b> — just ask in chat, e.g. "
+    "<i>add MCP server bank at https://… with OAuth …</i>. "
+    "Shellie shows the details with ✅ Confirm / ✖ Cancel; nothing changes until you confirm.\n"
+    "1. For an OAuth server, confirm, then open the approval link on your own device and grant access.\n"
+    "2. The browser then fails to load the redirect page. Copy the full address from the address bar and send "
+    "<code>/mcp finish &lt;server&gt; &lt;URL&gt;</code>.\n"
+    "3. Check the result with <code>/mcp</code>.\n"
+    "\n"
+    "Servers that need a static header or a client secret are set in the local web settings, "
+    "not from chat. Use an SSH tunnel: <code>ssh -L 8321:127.0.0.1:8321 &lt;pi-user&gt;@&lt;pi-host&gt;</code>, "
+    "then open http://127.0.0.1:8321 and edit <code>MCP_SERVERS</code>.\n"
+    "\n"
+    "<b>Skills</b>\n"
+    "Ask in chat to add, change or remove a skill (e.g. <i>create a skill that …</i>). "
+    "Changes are announced with 🧩.\n"
     "\n"
     "<b>Anything else</b> — sent to the LLM"
 )
@@ -208,6 +231,8 @@ def process_update(update: Dict[str, Any]) -> None:
         return
 
     if _handle_settings_command(chat_id, message_id, text):
+        return
+    if _handle_mcp_command(chat_id, message_id, text):
         return
     if _handle_bypass_command(chat_id, text):
         return
@@ -722,6 +747,26 @@ def _send_listing(chat_id: int, raw: Optional[str]) -> None:
     send_message(chat_id, text, reply_markup=markup)
 
 
+def _handle_mcp_proposal_callback(
+    cq_id: Any, chat_id: int, message_id: int, yes: bool, pid: str
+) -> None:
+    """Confirm or cancel a model-proposed MCP server change. Only the allowed user reaches here."""
+    summary = chat_admin.describe(pid) or "MCP server request"
+    if not yes:
+        chat_admin.discard(pid)
+        edit_message_text(chat_id, message_id, "✖ Cancelled: " + _esc(summary), reply_markup={"inline_keyboard": []})
+        answer_callback_query(cq_id, "Cancelled")
+        return
+
+    ok, msg, entry = chat_admin.confirm(pid)
+    edit_message_text(
+        chat_id, message_id, ("✅ " if ok else "⚠️ ") + _esc(msg), reply_markup={"inline_keyboard": []}
+    )
+    answer_callback_query(cq_id, "Done" if ok else "Not applied")
+    if ok and entry is not None and isinstance(entry.get("oauth"), dict):
+        _send_mcp_auth_link(chat_id, entry)
+
+
 def _handle_callback(cq: Dict[str, Any]) -> None:
     cq_id = cq.get("id")
     from_user = cq.get("from")
@@ -749,6 +794,11 @@ def _handle_callback(cq: Dict[str, Any]) -> None:
             answer_callback_query(cq_id, "Shell mode off")
         else:
             answer_callback_query(cq_id, "Shell mode is not active.")
+        return
+
+    pm = _MCP_PROPOSAL_RE.match(data)
+    if pm:
+        _handle_mcp_proposal_callback(cq_id, chat_id, message_id, pm.group(1) == "y", pm.group(2))
         return
 
     m = _CALLBACK_RE.match(data)
@@ -801,28 +851,28 @@ def _retry_status_lines(status: Dict[str, Any]) -> List[str]:
 
         if phase == "calling":
             if model_html:
-                lines.append("📡 모델 호출 중: <code>{}</code>".format(model_html))
+                lines.append("📡 Calling model: <code>{}</code>".format(model_html))
             else:
-                lines.append("📡 모델 호출 중")
+                lines.append("📡 Calling model")
         elif phase == "cooldown":
             if reason == "429_rpm":
-                lines.append("⏳ 429(RPM) 쿨다운: {}초 남음 — <code>{}</code> 재시도 {}/{}".format(
+                lines.append("⏳ 429 (RPM) cooldown: {}s left — <code>{}</code> retry {}/{}".format(
                     remaining, model_html, a, m
                 ))
             elif reason == "5xx":
-                lines.append("⏳ 서버 오류(5xx) 재시도 대기: {}초 남음 — <code>{}</code> {}/{}회차".format(
+                lines.append("⏳ Server error (5xx) retry wait: {}s left — <code>{}</code> attempt {}/{}".format(
                     remaining, model_html, a, m
                 ))
             elif reason == "transport":
-                lines.append("⏳ 네트워크 오류 재시도 대기: {}초 남음 — <code>{}</code> {}/{}회차".format(
+                lines.append("⏳ Network error retry wait: {}s left — <code>{}</code> attempt {}/{}".format(
                     remaining, model_html, a, m
                 ))
             elif reason == "chain_cooldown":
-                lines.append("⏳ 모든 모델 실패, 전체 재시도 대기: {}초 남음 ({}/{})".format(
+                lines.append("⏳ All models failed, full retry wait: {}s left ({}/{})".format(
                     remaining, a, m
                 ))
             else:
-                lines.append("⏳ 재시도 대기: {}초 남음".format(remaining))
+                lines.append("⏳ Retry wait: {}s left".format(remaining))
 
         return lines
     except Exception:
@@ -835,7 +885,7 @@ def _queue_status_text() -> str:
     lines = ["<b>Queue status</b>"]
     if active is not None:
         preview = html.escape(active.text[:80])
-        lines.append("🔄 처리 중: <code>{}</code>".format(preview))
+        lines.append("🔄 Processing: <code>{}</code>".format(preview))
         if _active_continuation > 0:
             lines.append(
                 "Auto-continuation: {}/{}".format(
@@ -843,9 +893,9 @@ def _queue_status_text() -> str:
                 )
             )
     else:
-        lines.append("💤 대기 중 (idle)")
+        lines.append("💤 Idle")
     lines.extend(_retry_status_lines(get_retry_status()))
-    lines.append("대기 항목: {}".format(depth))
+    lines.append("Queued items: {}".format(depth))
     return "\n".join(lines)
 
 
@@ -966,6 +1016,101 @@ def _handle_schedule_command(chat_id: int, text: str) -> None:
     send_message(chat_id, _SCHEDULE_USAGE)
 
 
+# ---------------------------------------------------------------------------
+# /mcp command (issue #25): OAuth login for MCP servers. The approval link is
+# opened on the user's own device; the redirect URL is pasted back here.
+# All output HTML-escaped (D5).
+# ---------------------------------------------------------------------------
+
+_MCP_USAGE = (
+    "Usage:\n"
+    "<code>/mcp</code> — list OAuth MCP servers and login state\n"
+    "<code>/mcp auth &lt;server&gt;</code> — get the approval link\n"
+    "<code>/mcp finish &lt;server&gt; &lt;pasted URL&gt;</code> — complete the login\n"
+    "<code>/mcp logout &lt;server&gt;</code> — forget the stored login"
+)
+
+
+def _mcp_oauth_entry(name: str) -> Optional[Dict[str, Any]]:
+    entry = mcp.find_server(name)
+    if entry is None or not isinstance(entry.get("oauth"), dict):
+        return None
+    return entry
+
+
+def _send_mcp_auth_link(chat_id: int, entry: Dict[str, Any]) -> bool:
+    """Send the OAuth approval link for a server. Returns False if it could not start."""
+    name = entry["name"]
+    ok, result = mcp_oauth.begin(entry)
+    if not ok:
+        send_message(chat_id, "⚠️ " + _esc(result))
+        return False
+    send_message(
+        chat_id,
+        "🔐 Approval link for <b>{name}</b> (valid 15 minutes):\n{url}\n\n"
+        "Open it on the device where you will approve access and sign in. "
+        "The browser will then fail to load the redirect page; that is expected. "
+        "Copy the full address from the address bar and send:\n"
+        "<code>/mcp finish {name} &lt;URL&gt;</code>".format(name=_esc(name), url=_esc(result)),
+    )
+    return True
+
+
+def _handle_mcp_command(chat_id: int, message_id: Optional[int], text: str) -> bool:
+    if _first_token_command(text) != "/mcp":
+        return False
+
+    tokens = text.split()
+    sub = tokens[1].lower() if len(tokens) > 1 else "status"
+    name = tokens[2] if len(tokens) > 2 else ""
+
+    if sub == "status":
+        oauth_servers = [e for e in mcp.configured_servers() if isinstance(e.get("oauth"), dict)]
+        if not oauth_servers:
+            send_message(chat_id, "No MCP servers with OAuth configured.")
+            return True
+        lines = [
+            "{}: {}".format(e["name"], "connected" if mcp_oauth.is_connected(e) else "not connected")
+            for e in oauth_servers
+        ]
+        send_message(chat_id, "<pre>{}</pre>".format(_esc("\n".join(lines))))
+        return True
+
+    if sub not in ("auth", "finish", "logout") or not name:
+        send_message(chat_id, _MCP_USAGE)
+        return True
+
+    entry = _mcp_oauth_entry(name)
+    if entry is None:
+        send_message(chat_id, "⚠️ " + _esc("No OAuth MCP server named '{}' in MCP_SERVERS.".format(name)))
+        return True
+
+    if sub == "auth":
+        _send_mcp_auth_link(chat_id, entry)
+        return True
+
+    if sub == "finish":
+        pasted = tokens[3] if len(tokens) > 3 else ""
+        if not pasted:
+            send_message(chat_id, _MCP_USAGE)
+            return True
+        # The pasted URL carries a one-time authorization code: remove it from the chat.
+        if message_id is not None:
+            delete_message(chat_id, message_id)
+        ok, msg = mcp_oauth.finish(entry, pasted)
+        if ok:
+            mcp.reset_session(name)
+        send_message(chat_id, ("✅ " if ok else "⚠️ ") + _esc(msg))
+        return True
+
+    # sub == "logout"
+    removed = mcp_oauth.logout(name)
+    mcp.reset_session(name)
+    msg = "Stored login for {} removed.".format(name) if removed else "No stored login for {}.".format(name)
+    send_message(chat_id, _esc(msg))
+    return True
+
+
 def _handle_restart(chat_id: int) -> None:
     has_systemd = bool(os.environ.get("INVOCATION_ID"))
     xpc = os.environ.get("XPC_SERVICE_NAME")
@@ -1012,7 +1157,7 @@ def _handle_bypass_command(chat_id: int, text: str) -> bool:
         drained = _drain_queue()
         msg = "🔄 Conversation context cleared."
         if drained:
-            msg += " (대기 항목 {}개 삭제됨)".format(drained)
+            msg += " ({} queued items removed)".format(drained)
         if _abandon_task("reset") is not None:
             msg += " Unfinished task discarded."
         if _exit_shell_mode(notify=False):
@@ -1023,8 +1168,8 @@ def _handle_bypass_command(chat_id: int, text: str) -> bool:
     if cmd == "/kill":
         drained = _drain_queue()
         active = _queue_active_item
-        active_note = " 현재 처리 중인 항목은 완료 후 중단됩니다." if active else ""
-        msg = "🗑️ 대기 항목 {}개 삭제됨.{}".format(drained, active_note)
+        active_note = " The item being processed will stop after it finishes." if active else ""
+        msg = "🗑️ {} queued items removed.{}".format(drained, active_note)
         if _abandon_task("kill") is not None:
             msg += " Unfinished task discarded."
         send_message(chat_id, msg)
@@ -1069,8 +1214,13 @@ def _handle_bypass_command(chat_id: int, text: str) -> bool:
             n = max(1, min(n, 500))
         except ValueError:
             n = 50
-        log_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), "agent.log")
-        output = execute_shell("tail -{} {}".format(n, log_path))
+        if os.environ.get("INVOCATION_ID"):
+            # Running under systemd: stdout goes to the journal, not agent.log.
+            command = "journalctl --user-unit=shellie.service -n {} --no-pager -o cat".format(n)
+        else:
+            log_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), "agent.log")
+            command = "tail -{} {}".format(n, log_path)
+        output = execute_shell(command)
         send_message(chat_id, "<pre>{}</pre>".format(html.escape(output)))
         return True
 
@@ -1229,7 +1379,7 @@ def _queue_worker() -> None:
         except Exception:
             _LOGGER.exception("Unexpected error in queue worker for chat_id=%s", item.chat_id)
             try:
-                send_message(item.chat_id, "⚠️ 처리 중 오류가 발생했습니다.")
+                send_message(item.chat_id, "⚠️ An error occurred while processing.")
             except Exception:
                 _LOGGER.debug("Failed to send worker error notice", exc_info=True)
         finally:
@@ -1506,7 +1656,7 @@ def _make_cooldown_notifier(chat_id: int) -> Callable[[int, int, float], None]:
         try:
             send_message(
                 chat_id,
-                "⏳ 모든 모델 응답 실패. {}초 후 재시도… ({}/{})".format(
+                "⏳ All models failed to respond. Retrying in {}s… ({}/{})".format(
                     int(delay), attempt, max_retries
                 ),
             )
@@ -1544,9 +1694,9 @@ _FC_WRAPUP_LOOP_NOTE = (
     "answer and briefly explain what blocked progress."
 )
 
-_FC_LIMIT_NOTICE = "⚠️ 도구 호출 한도({}회)에 도달해 작업을 중단했습니다. 지금까지의 결과로 정리합니다."
-_FC_LOOP_NOTICE = "⚠️ 동일한 도구 호출이 {}회 연속 반복되어 작업을 중단했습니다."
-_FC_NO_TEXT_FALLBACK = "(요약 응답을 생성하지 못했습니다.)"
+_FC_LIMIT_NOTICE = "⚠️ Stopped after reaching the tool-call limit ({} calls). Summarizing the results so far."
+_FC_LOOP_NOTICE = "⚠️ Stopped: the same tool call repeated {} times in a row."
+_FC_NO_TEXT_FALLBACK = "(Could not generate a summary response.)"
 
 
 def _iteration_signature(calls_and_results: List[Tuple[str, Dict[str, Any], Any]]) -> Tuple[Any, ...]:
@@ -1635,6 +1785,31 @@ def _run_tool_for_chat(chat_id: int, name: str, args: Dict[str, Any]) -> str:
             return tg_files.send_file(chat_id, str(args.get("path", "")), args.get("caption") or None)[1]
         except Exception as exc:
             return "Error: {}".format(exc)
+    if name == "manage_skill":
+        result = run_tool(name, args)
+        if isinstance(result, str) and result.startswith("OK:") and not result.startswith("OK: user skills"):
+            try:
+                send_message(chat_id, "🧩 " + _esc(result))
+            except Exception:
+                _LOGGER.debug("Failed to send skill change notice", exc_info=True)
+        return result
+    if name == "propose_mcp_server":
+        result = run_tool(name, args)
+        match = _PROPOSAL_ID_RE.search(result) if isinstance(result, str) else None
+        summary = chat_admin.describe(match.group(1)) if match else None
+        if summary is not None:
+            try:
+                send_message(
+                    chat_id,
+                    "🔌 " + _esc(summary),
+                    reply_markup={"inline_keyboard": [[
+                        {"text": "✅ Confirm", "callback_data": "mcp:y:" + match.group(1)},
+                        {"text": "✖ Cancel", "callback_data": "mcp:n:" + match.group(1)},
+                    ]]},
+                )
+            except Exception:
+                _LOGGER.debug("Failed to send MCP proposal", exc_info=True)
+        return result
     if name == "manage_schedule":
         result = run_tool(name, args)
         if isinstance(result, str) and result.startswith("OK:"):

@@ -421,7 +421,8 @@ class SettingsCommandTests(HandlersTestCase):
     def test_env_at_bot_suffix_works(self) -> None:
         handlers.process_update(self._update("/env@MyBot"))
         reply = self.mock_send_message.call_args[0][1]
-        self.assertTrue(reply.startswith("<pre>"))
+        self.assertTrue(reply.startswith("<b>Shellie v"))
+        self.assertIn("<pre>", reply)
         self.assertEqual(handlers._task_queue.qsize(), 0)
 
     def test_env_never_calls_update_or_unset(self) -> None:
@@ -484,7 +485,7 @@ class FunctionCallLoopTests(HandlersTestCase):
         self.assertIs(last_call_kwargs["allow_tools"], False)
 
         reply = self.mock_send_message.call_args[0][1]
-        self.assertIn("도구 호출 한도(2회)", reply)
+        self.assertIn("tool-call limit (2 calls)", reply)
         self.assertIn("summary", reply)
 
         self.assertEqual(len(handlers._history), 2)
@@ -514,7 +515,7 @@ class FunctionCallLoopTests(HandlersTestCase):
         self.assertIs(last_call_kwargs["allow_tools"], False)
 
         reply = self.mock_send_message.call_args[0][1]
-        self.assertIn("3회 연속 반복", reply)
+        self.assertIn("repeated 3 times in a row", reply)
         self.assertIn("wrap", reply)
         self.assertEqual(len(handlers._history), 2)
 
@@ -553,7 +554,7 @@ class FunctionCallLoopTests(HandlersTestCase):
         # 3 iterations executed before the loop detector fires on the 3rd.
         self.assertEqual(self.mock_call_llm.call_count, 4)
         reply = self.mock_send_message.call_args[0][1]
-        self.assertIn("3회 연속 반복", reply)
+        self.assertIn("repeated 3 times in a row", reply)
 
     def test_wrapup_failure_falls_back_to_last_text(self) -> None:
         self._settings_values["FC_MAX_LOOPS"] = 1
@@ -570,7 +571,7 @@ class FunctionCallLoopTests(HandlersTestCase):
         self._drain_queue()
 
         reply = self.mock_send_message.call_args[0][1]
-        self.assertIn("도구 호출 한도(1회)", reply)
+        self.assertIn("tool-call limit (1 calls)", reply)
         self.assertIn("partial", reply)
         self.assertNotIn("boom", reply)
 
@@ -593,8 +594,8 @@ class FunctionCallLoopTests(HandlersTestCase):
         self._drain_queue()
 
         reply = self.mock_send_message.call_args[0][1]
-        self.assertIn("도구 호출 한도(1회)", reply)
-        self.assertIn("(요약 응답을 생성하지 못했습니다.)", reply)
+        self.assertIn("tool-call limit (1 calls)", reply)
+        self.assertIn("(Could not generate a summary response.)", reply)
         self.assertEqual(handlers._history, [])
 
     def test_blocked_response_sends_blocked_message_and_history_not_retained(self) -> None:
@@ -657,7 +658,7 @@ class QueueTests(HandlersTestCase):
     def test_queue_status_idle(self) -> None:
         handlers.process_update(self._update("/queue"))
         reply = self.mock_send_message.call_args[0][1]
-        self.assertIn("idle", reply)
+        self.assertIn("Idle", reply)
         self.assertIn("0", reply)
 
     def test_queue_status_shows_depth(self) -> None:
@@ -709,7 +710,7 @@ class QueueTests(HandlersTestCase):
                               return_value={"phase": "calling", "model": "gemini-x"}):
             handlers.process_update(self._update("/queue"))
         reply = self.mock_send_message.call_args[0][1]
-        self.assertIn("📡 모델 호출 중: <code>gemini-x</code>", reply)
+        self.assertIn("📡 Calling model: <code>gemini-x</code>", reply)
 
     def test_queue_status_retry_rpm_cooldown_shows_remaining(self) -> None:
         """RPM cooldown shows remaining seconds and attempt counter."""
@@ -725,11 +726,11 @@ class QueueTests(HandlersTestCase):
                               }):
             handlers.process_update(self._update("/queue"))
         reply = self.mock_send_message.call_args[0][1]
-        self.assertIn("429(RPM) 쿨다운: 30초 남음", reply)
-        self.assertIn("재시도 1/1", reply)
+        self.assertIn("429 (RPM) cooldown: 30s left", reply)
+        self.assertIn("retry 1/1", reply)
 
     def test_queue_status_retry_5xx_shows_attempt(self) -> None:
-        """5xx cooldown shows remaining seconds and attempt counter with 회차."""
+        """5xx cooldown shows remaining seconds and attempt counter."""
         with mock.patch.object(handlers.time, "time", return_value=1000.0), \
              mock.patch.object(handlers, "get_retry_status",
                               return_value={
@@ -742,8 +743,8 @@ class QueueTests(HandlersTestCase):
                               }):
             handlers.process_update(self._update("/queue"))
         reply = self.mock_send_message.call_args[0][1]
-        self.assertIn("서버 오류(5xx) 재시도 대기: 20초 남음", reply)
-        self.assertIn("2/3회차", reply)
+        self.assertIn("Server error (5xx) retry wait: 20s left", reply)
+        self.assertIn("attempt 2/3", reply)
 
     def test_queue_status_retry_transport_shows_network_error(self) -> None:
         """Transport error cooldown shows network error message."""
@@ -759,7 +760,7 @@ class QueueTests(HandlersTestCase):
                               }):
             handlers.process_update(self._update("/queue"))
         reply = self.mock_send_message.call_args[0][1]
-        self.assertIn("네트워크 오류 재시도 대기", reply)
+        self.assertIn("Network error retry wait", reply)
 
     def test_queue_status_retry_chain_cooldown_shows_pass_counter(self) -> None:
         """Chain cooldown shows pass counter without model name."""
@@ -775,7 +776,7 @@ class QueueTests(HandlersTestCase):
                               }):
             handlers.process_update(self._update("/queue"))
         reply = self.mock_send_message.call_args[0][1]
-        self.assertIn("모든 모델 실패, 전체 재시도 대기: 120초 남음 (1/2)", reply)
+        self.assertIn("All models failed, full retry wait: 120s left (1/2)", reply)
 
     def test_queue_status_retry_remaining_clamped_at_zero(self) -> None:
         """Remaining seconds clamped at zero when until is in the past."""
@@ -791,7 +792,7 @@ class QueueTests(HandlersTestCase):
                               }):
             handlers.process_update(self._update("/queue"))
         reply = self.mock_send_message.call_args[0][1]
-        self.assertIn("0초 남음", reply)
+        self.assertIn("0s left", reply)
 
     def test_queue_status_retry_model_name_escaped(self) -> None:
         """Model name with HTML special chars is escaped."""
@@ -811,7 +812,7 @@ class QueueTests(HandlersTestCase):
                               return_value={"phase": "cooldown", "until": "bad"}):
             handlers.process_update(self._update("/queue"))
         reply = self.mock_send_message.call_args[0][1]
-        self.assertIn("대기 항목", reply)
+        self.assertIn("Queued items", reply)
 
 
 class ContinuationTests(HandlersTestCase):
