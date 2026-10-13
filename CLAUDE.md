@@ -88,8 +88,12 @@ bypass, 24/7 via launchd/systemd.
 - `core/mcp.py` — HTTP MCP client (Streamable HTTP JSON-RPC): initialize →
   tools/list → tools/call, Mcp-Session-Id support, 300s TTL cache invalidated by
   config fingerprint, tools exposed as `mcp_<server>_<tool>`. **No stdio, no
-  OAuth, no SSE** (SSE servers skipped with a warning). Configured via
-  MCP_SERVERS key (JSON array, secret/web-only).
+  SSE** (SSE servers skipped with a warning). Configured via MCP_SERVERS key
+  (JSON array, secret/web-only).
+- `core/mcp_oauth.py` — OAuth code+PKCE login for MCP servers (#25), copy-paste
+  flow via `/mcp auth|finish|logout`; tokens in SHELLIE_HOME/mcp_oauth.json
+  (0600), bound to the server's url/token_url/client_id; refresh on demand.
+  Locks are never held across network calls.
 - `telegram/files.py` — attachment detection, filename sanitization, unique-path
   claiming, `save_incoming` to SHELLIE_WORKSPACE root with 0600 + collision
   suffixes, `resolve_send_path` with .env/settings.json blocked, `send_file`,

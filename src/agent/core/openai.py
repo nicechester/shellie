@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 
 from src.agent.core.gemini import Attempt, _set_retry_status, build_system_instruction, build_tools_schema
 from src.agent.utils.http import http_post_h
+from src.agent.version import __version__
 
 _LOGGER = logging.getLogger("shellie.openai")
 
@@ -268,7 +269,12 @@ def attempt_model(model: str, payload: Dict[str, Any], base: str, key: str, time
     _set_retry_status("calling", model=model)
     # Both headers: Authorization is the OpenAI standard, X-API-Key is what
     # some gateways (e.g. Launch-hosted APIs) require instead.
-    headers = {"Authorization": "Bearer " + key, "X-API-Key": key} if key else {}
+    # An explicit User-Agent: Python's default (Python-urllib/x.y) is blocked with
+    # HTTP 403 "error code: 1010" by Cloudflare in front of some hosts (e.g. Groq).
+    headers = {"User-Agent": "Shellie/" + __version__}
+    if key:
+        headers["Authorization"] = "Bearer " + key
+        headers["X-API-Key"] = key
     body = dict(payload, model=model)
     res, status, resp_headers = http_post_h(base + "/chat/completions", body, headers=headers, timeout=timeout)
 

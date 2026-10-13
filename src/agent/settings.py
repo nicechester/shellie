@@ -36,7 +36,10 @@ _DEFAULT_LLM_MODEL_CHAIN = (
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 _MCP_SERVER_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,32}$")
 _MCP_URL_RE = re.compile(r"^https?://")
-_MCP_SERVERS_CONSTRAINT = "JSON array: name(alphanumeric_-), url(http/https), headers(optional)"
+_MCP_SERVERS_CONSTRAINT = (
+    "JSON array: name(alphanumeric_-), url(http/https), headers(optional), "
+    "oauth(optional: authorization_url, token_url, redirect_uri, client_id, client_secret, scope)"
+)
 
 
 def mask_secret_value(key: str, value: Any) -> str:
@@ -186,7 +189,37 @@ def _parse_mcp_servers(raw: Any) -> str:
                 isinstance(k, str) and isinstance(v, str) for k, v in headers.items()
             ):
                 raise ValueError(_MCP_SERVERS_CONSTRAINT)
+        oauth = entry.get("oauth")
+        if oauth is not None and not _valid_mcp_oauth(oauth):
+            raise ValueError(_MCP_SERVERS_CONSTRAINT)
     return s
+
+
+_MCP_OAUTH_ENDPOINT_RE = re.compile(r"^(https://|http://(localhost|127\.0\.0\.1|\[::1\])([:/]|$))")
+_MCP_OAUTH_REQUIRED = ("authorization_url", "token_url", "redirect_uri", "client_id")
+_MCP_OAUTH_OPTIONAL = ("client_secret", "scope")
+
+
+def _valid_mcp_oauth(oauth: Any) -> bool:
+    """Check an MCP server's optional `oauth` block (issue #25)."""
+    if not isinstance(oauth, dict):
+        return False
+    if set(oauth) - set(_MCP_OAUTH_REQUIRED) - set(_MCP_OAUTH_OPTIONAL):
+        return False
+    for key in _MCP_OAUTH_REQUIRED:
+        value = oauth.get(key)
+        if not isinstance(value, str) or not value:
+            return False
+    for key in ("authorization_url", "token_url"):
+        # Codes, verifiers and client_secret travel here: HTTPS only, except loopback.
+        if not _MCP_OAUTH_ENDPOINT_RE.match(oauth[key]):
+            return False
+    if not _MCP_URL_RE.match(oauth["redirect_uri"]):
+        return False
+    for key in _MCP_OAUTH_OPTIONAL:
+        if key in oauth and not isinstance(oauth[key], str):
+            return False
+    return True
 
 
 def _split_model_chain(raw: Any, pattern: "re.Pattern[str]") -> Tuple[str, ...]:

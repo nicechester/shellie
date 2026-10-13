@@ -7,6 +7,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.agent.config import settings
+from src.agent.core import mcp_oauth
 from src.agent.utils.http import http_post_h
 from src.agent.version import __version__
 
@@ -14,7 +15,8 @@ _LOGGER = logging.getLogger("shellie.mcp")
 
 # Non-goals (deliberately out of scope for this client):
 # - stdio transport (only Streamable HTTP is supported)
-# - OAuth / any auth flow beyond static headers configured per server
+# - auth flows beyond static headers and the copy-paste OAuth login in
+#   mcp_oauth.py (no device flow, no dynamic client registration)
 # - SSE stream parsing: a server whose response Content-Type contains
 #   "text/event-stream" is logged as unsupported and its tools are skipped
 #   for the rest of the current cache period.
@@ -86,6 +88,24 @@ def _load_servers() -> List[Dict[str, Any]]:
     return servers
 
 
+def configured_servers() -> List[Dict[str, Any]]:
+    """Return every valid configured server entry (read at call time)."""
+    return _load_servers()
+
+
+def find_server(name: str) -> Optional[Dict[str, Any]]:
+    """Return the configured entry for a server name, or None."""
+    for entry in _load_servers():
+        if entry.get("name") == name:
+            return entry
+    return None
+
+
+def reset_session(name: str) -> None:
+    """Drop cached session and tools for a server so the next call re-initializes."""
+    _cache.pop(name, None)
+
+
 def _cache_for(entry: Dict[str, Any]) -> _ServerCache:
     name = entry["name"]
     fingerprint = json.dumps(entry, sort_keys=True)
@@ -106,6 +126,10 @@ def _request_headers(entry: Dict[str, Any], cache: _ServerCache) -> Dict[str, st
     if isinstance(custom, dict):
         for key, value in custom.items():
             headers[str(key)] = str(value)
+    # OAuth token (issue #25) overrides any static Authorization header.
+    token = mcp_oauth.access_token(entry)
+    if token:
+        headers["Authorization"] = "Bearer " + token
     if cache.session_id:
         headers["Mcp-Session-Id"] = cache.session_id
     return headers

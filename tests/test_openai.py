@@ -23,6 +23,8 @@ _TOOLS = [{
 def _settings_get(overrides: dict):
     defaults = {
         "LLM_MODEL_CHAIN": ("openai/m1", "openai/m2"),
+        "GEMINI_API_KEY": "gemini-test-key",
+        "GEMINI_TIMEOUT_SEC": 30,
         "OPENAI_API_BASE": "http://localhost:11434/v1",
         "OPENAI_API_KEY": "sk-test",
         "OPENAI_TIMEOUT_SEC": 30,
@@ -85,7 +87,8 @@ class ConversionTests(unittest.TestCase):
             {"inlineData": {"mimeType": "application/pdf", "data": "AAAA"}},
         ]}]
         messages = openai_backend.to_openai_messages(contents, "SYS")
-        self.assertIn("[attachment omitted", messages[1]["content"][1]["text"])
+        # An all-text user turn is collapsed to one string (see to_openai_messages).
+        self.assertIn("[attachment omitted", messages[1]["content"])
 
     def test_image_attachment_becomes_data_url(self) -> None:
         contents = [{"role": "user", "parts": [
@@ -124,22 +127,19 @@ class ConversionTests(unittest.TestCase):
 
 class CallOpenAITests(unittest.TestCase):
     def setUp(self) -> None:
-        settings_patcher = mock.patch.object(openai_backend, "settings")
         llm_settings_patcher = mock.patch.object(llm, "settings")
         http_patcher = mock.patch.object(openai_backend, "http_post_h")
-        sleep_patcher = mock.patch.object(openai_backend.time, "sleep")
+        sleep_patcher = mock.patch.object(llm.time, "sleep")
         system_patcher = mock.patch.object(
             openai_backend, "build_system_instruction", return_value={"parts": [{"text": "SYS"}]}
         )
         tools_patcher = mock.patch.object(openai_backend, "build_tools_schema", return_value=_TOOLS)
-        self.settings = settings_patcher.start()
         self.llm_settings = llm_settings_patcher.start()
         self.http = http_patcher.start()
         self.sleep = sleep_patcher.start()
         system_patcher.start()
         tools_patcher.start()
         self.addCleanup(mock.patch.stopall)
-        self.settings.get.side_effect = _settings_get({})
         self.llm_settings.get.side_effect = _settings_get({})
 
     def _contents(self):
@@ -161,14 +161,18 @@ class CallOpenAITests(unittest.TestCase):
         url = self.http.call_args.args[0]
         headers = self.http.call_args.kwargs["headers"]
         self.assertEqual(url, "http://localhost:11434/v1/chat/completions")
-        self.assertEqual(headers, {"Authorization": "Bearer sk-test", "X-API-Key": "sk-test"})
+        self.assertEqual(headers["Authorization"], "Bearer sk-test")
+        self.assertEqual(headers["X-API-Key"], "sk-test")
+        self.assertTrue(headers["User-Agent"].startswith("Shellie/"))
 
     def test_no_auth_header_when_key_is_empty(self) -> None:
-        self.settings.get.side_effect = _settings_get({"OPENAI_API_KEY": ""})
         self.llm_settings.get.side_effect = _settings_get({"OPENAI_API_KEY": ""})
         self.http.return_value = (_completion("ok"), 200, {})
         llm.call_llm(self._contents())
-        self.assertEqual(self.http.call_args.kwargs["headers"], {})
+        headers = self.http.call_args.kwargs["headers"]
+        self.assertNotIn("Authorization", headers)
+        self.assertNotIn("X-API-Key", headers)
+        self.assertTrue(headers["User-Agent"].startswith("Shellie/"))
 
     def test_tools_disabled_sets_tool_choice_none_keeps_tools(self) -> None:
         self.http.return_value = (_completion("ok"), 200, {})

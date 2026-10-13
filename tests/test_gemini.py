@@ -16,6 +16,9 @@ def _settings_get(overrides: dict):
         "GEMINI_FALLBACK_DELAY_SEC": 1,
         "GEMINI_RETRY_BASE_DELAY_SEC": 60,
         "GEMINI_MAX_RETRIES": 0,
+        "OPENAI_API_BASE": "https://api.openai.com/v1",
+        "OPENAI_API_KEY": "",
+        "OPENAI_TIMEOUT_SEC": 30,
         "SYSTEM_PROMPT": "SYS",
         "SEARCH_MODEL": ("search-model",),
     }
@@ -228,7 +231,7 @@ class CallGeminiFallbackTests(unittest.TestCase):
         with self.assertRaises(Exception) as ctx:
             llm.call_llm(self._contents())
 
-        self.assertIn("All Gemini models", str(ctx.exception))
+        self.assertIn("All LLM models", str(ctx.exception))
 
     def test_allow_tools_false_sets_function_calling_mode_none(self) -> None:
         res = {"candidates": []}
@@ -341,7 +344,7 @@ class CallGeminiFallbackTests(unittest.TestCase):
         with self.assertRaises(Exception) as ctx:
             llm.call_llm(self._contents())
 
-        self.assertIn("All Gemini models", str(ctx.exception))
+        self.assertIn("All LLM models", str(ctx.exception))
         # Chain-retry cooldown sleeps: 60, 120 (exponential backoff between passes)
         chain_cooldown_calls = [c for c in self.mock_sleep.call_args_list if c == mock.call(60) or c == mock.call(120)]
         self.assertEqual(chain_cooldown_calls, [mock.call(60), mock.call(120)])

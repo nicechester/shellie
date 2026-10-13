@@ -9,7 +9,7 @@ from collections import namedtuple
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from src.agent.config import REPO_SKILLS_DIR, SKILLS_DIR, settings
-from src.agent.core import mcp, scheduler, shell
+from src.agent.core import chat_admin, mcp, scheduler, shell
 from src.agent.core.memory import append_memory, read_memory
 from src.agent.utils.http import http_post_h
 
@@ -347,6 +347,8 @@ TOOL_REGISTRY: List[ToolEntry] = [
     ToolEntry("send_file", _send_file_declaration, _send_file_run),
     ToolEntry("view_file", _view_file_declaration, _view_file_run),
     ToolEntry("manage_schedule", _manage_schedule_declaration, _manage_schedule_run),
+    ToolEntry("manage_skill", chat_admin.skill_declaration, chat_admin.skill_run),
+    ToolEntry("propose_mcp_server", chat_admin.mcp_declaration, chat_admin.mcp_run),
 ]
 
 
@@ -436,6 +438,12 @@ def build_system_instruction() -> Dict[str, Any]:
             ".md: read full text with cat skills/<name>.md and follow the procedure; "
             "create new skills in ~/.shellie/skills/)\n" + skills_text
         )
+
+    text += (
+        "\n\n[tool errors] If a tool returns an error (for example 'MCP tool error' or a "
+        "permission denied message), report that error to the user as it is. Do not search "
+        "the filesystem or try unrelated commands to work around it."
+    )
 
     env = shell.execution_environment()
     text += "\n\n[execution environment]\nOS: {} / arch: {} / shell: {} / cwd: {}".format(
