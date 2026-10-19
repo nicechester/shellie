@@ -265,7 +265,7 @@ This stops and removes the service. Your data in `~/.shellie` and
 | `/mcp auth <server>` | Bypass (MCP) | Sends the approval link for an OAuth server (valid 15 minutes) |
 | `/mcp finish <server> <URL>` | Bypass (MCP) | Completes an OAuth login from the address you copied back. Shellie deletes that message, since it holds a one-time code |
 | `/mcp logout <server>` | Bypass (MCP) | Forgets the stored login for a server |
-| anything else | LLM | Sent with the tools listed in [§1](#1-overview). Function-calling loop up to `FC_MAX_LOOPS`, with up to `CONTEXT_TURNS` recent turns of history |
+| anything else | LLM | Sent with the tools listed in [§1](#1-overview). Function-calling loop up to `FC_MAX_LOOPS`, with up to `CONTEXT_TURNS` recent turns of history; older turns are compacted into a rolling summary |
 
 Adding skills and MCP servers needs no command: ask in chat, for example
 `add MCP server gdrive at https://drivemcp.googleapis.com/mcp/v1 with OAuth`,
@@ -355,8 +355,8 @@ shadowed until you `/unset` that key (or delete `settings.json`).
 | `SYSTEM_PROMPT` | language-adaptive default | 1–4000 chars, multi-line allowed | Yes | immediate |
 | `FC_MAX_LOOPS` | `15` | 1–50 | Yes | immediate |
 | `FC_MAX_CONTINUATIONS` | `2` | 0–5 | Yes | immediate |
-| `CONTEXT_TURNS` | `10` | 0–50 (0 = single-shot, no history kept) | Yes | immediate |
-| `IDLE_RESET_MINUTES` | `30` | 0–1440 (0 = disabled) | Yes | immediate |
+| `CONTEXT_TURNS` | `10` | 0–50 (0 = single-shot, no history kept; older turns are compacted into a rolling summary) | Yes | immediate |
+| `IDLE_RESET_MINUTES` | `1440` | 0–1440 (1440 = 24 h, 0 = disabled) | Yes | immediate |
 | `SHELL_TIMEOUT_SEC` | `45` | 1–600 | Yes | immediate |
 | `SHELL_OUTPUT_LIMIT` | `3000` | 200–20000 (characters) | Yes | immediate |
 | `POLL_TIMEOUT_SEC` | `30` | 1–50 | Yes | next poll cycle |

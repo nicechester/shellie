@@ -33,6 +33,9 @@ _LOGGER = logging.getLogger("shellie.telegram.handlers")
 # Gemini contents history (user/model turns only). Settings and bypass
 # commands are never added here (P6). Worker thread only after queue introduced.
 _history: List[Dict[str, Any]] = []
+# Rolling summary of turns compacted out of _history (issue #42). Injected
+# ahead of the verbatim history on each call; cleared with _history.
+_summary: str = ""
 _last_activity: float = 0.0
 
 # Task persistence (issue #4): guards every tasks.* file-mutating call and
@@ -168,8 +171,9 @@ _CODE_RE = re.compile(r"`([^`]+?)`")
 
 
 def _reset_history() -> None:
-    global _history
+    global _history, _summary
     _history = []
+    _summary = ""
 
 
 def _drain_queue() -> int:
@@ -1634,17 +1638,115 @@ def _trimmed_history(context_turns: int) -> List[Dict[str, Any]]:
     if context_turns <= 0:
         return []
     limit = context_turns * 2
-    return list(_history[-limit:]) if len(_history) > limit else list(_history)
+    turns = list(_history[-limit:]) if len(_history) > limit else list(_history)
+    if _summary:
+        return [
+            {"role": "user", "parts": [{"text": "[Summary of earlier conversation, for context only]\n" + _summary}]},
+            {"role": "model", "parts": [{"text": "Understood."}]},
+        ] + turns
+    return turns
 
 
 def _trim_history_pairs(context_turns: int) -> None:
-    global _history
+    global _history, _summary
     if context_turns <= 0:
         _history = []
+        _summary = ""
         return
-    limit = context_turns * 2
+    limit = min(context_turns * 4, _HISTORY_HARD_CAP)
     if len(_history) > limit:
         _history = _history[-limit:]
+
+
+# Hard cap on retained history entries (issue #42): headroom above 2*CONTEXT_TURNS
+# so compaction can run before the next turn trims anything verbatim.
+_HISTORY_HARD_CAP = 200
+
+_COMPACT_INSTRUCTION = (
+    "Summarize the conversation below so it can serve as context for later turns. "
+    "Keep it under about 1500 characters. Preserve facts, decisions, file paths, "
+    "names, and open tasks. Write the summary in the user's language. "
+    "Output only the summary."
+)
+_TRANSCRIPT_TURN_MAX = 2000
+_TRANSCRIPT_MAX = 20000
+
+
+def _history_to_transcript(turns: List[Dict[str, Any]]) -> str:
+    """Render text parts of the given turns as a "User:" / "Assistant:"
+    transcript. Each turn is truncated, and the whole transcript keeps only
+    its most recent characters."""
+    lines: List[str] = []
+    for turn in turns:
+        texts = [
+            p["text"] for p in turn.get("parts", [])
+            if isinstance(p, dict) and isinstance(p.get("text"), str)
+        ]
+        body = "\n".join(texts)
+        if not body:
+            continue
+        if len(body) > _TRANSCRIPT_TURN_MAX:
+            body = body[:_TRANSCRIPT_TURN_MAX] + "..."
+        label = "User" if turn.get("role") == "user" else "Assistant"
+        lines.append("{}: {}".format(label, body))
+    transcript = "\n\n".join(lines)
+    return transcript[-_TRANSCRIPT_MAX:]
+
+
+def _compact_history(context_turns: int) -> None:
+    """Fold turns older than the verbatim window into _summary (issue #42).
+
+    Never raises. The summarizer call runs without a cooldown notifier and
+    without tools. Results are applied only if _history still starts with the
+    same turn it started with, so a /reset or other change during the call is
+    respected. Summaries and transcripts are never logged.
+    """
+    global _history, _summary
+    try:
+        if context_turns <= 0 or len(_history) <= 2 * context_turns:
+            return
+        keep = 2 * max(1, context_turns // 2)
+        older = _history[:-keep]
+        first = older[0]
+
+        previous = ""
+        if _summary:
+            previous = "Previous summary:\n" + _summary + "\n\n"
+        prompt = (
+            _COMPACT_INSTRUCTION + "\n\n" + previous
+            + "Conversation to summarize:\n" + _history_to_transcript(older)
+        )
+        summary_text = ""
+        reason = ""
+        try:
+            response, _model = call_llm(
+                [{"role": "user", "parts": [{"text": prompt}]}], allow_tools=False
+            )
+            parsed = parse_response(response)
+            if parsed.blocked:
+                reason = "blocked"
+            else:
+                summary_text = parsed.text.strip()
+                if not summary_text:
+                    reason = "empty"
+        except Exception as exc:
+            reason = type(exc).__name__
+
+        if not (_history and _history[0] is first):
+            _LOGGER.info("history_compact_discarded reason=history_changed")
+            return
+        if summary_text:
+            _summary = summary_text
+            _history = _history[-keep:]
+            _LOGGER.info(
+                "history_compacted older=%d kept=%d summary_len=%d",
+                len(older), keep, len(summary_text),
+            )
+            return
+        _LOGGER.warning("history_compact_failed reason=%s", reason)
+        _history = _history[-2 * context_turns:]
+    except Exception:
+        _LOGGER.warning("history_compact_error", exc_info=False)
 
 
 def _make_cooldown_notifier(chat_id: int) -> Callable[[int, int, float], None]:
@@ -2019,7 +2121,6 @@ def _handle_llm(
         _LOGGER.info("attachments n=%d mimes=%s bytes=%d", len(refs), ",".join(mimes), total_bytes)
 
     user_turn = {"role": "user", "parts": parts + [{"text": text}]}
-    contents = (_trimmed_history(context_turns) if history_in else []) + [user_turn]
 
     send_chat_action(chat_id)
 
@@ -2029,6 +2130,10 @@ def _handle_llm(
     )
     typing_thread.start()
     try:
+        # Runs after the typing indicator starts: the summarizer call can be slow.
+        if history_in:
+            _compact_history(context_turns)
+        contents = (_trimmed_history(context_turns) if history_in else []) + [user_turn]
         return _run_llm_turn(chat_id, contents, user_turn, context_turns, history_out=history_out)
     except Exception as exc:
         _LOGGER.exception("Error in LLM track")

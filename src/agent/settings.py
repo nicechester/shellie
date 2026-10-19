@@ -443,13 +443,13 @@ CATALOG: Tuple[SettingSpec, ...] = (
     SettingSpec(
         "CONTEXT_TURNS", "int", _make_int_parser(0, 50),
         default=10, apply_timing="immediate",
-        description="Recent conversation turns to retain (0=single-shot)",
+        description="Recent turns kept verbatim; older turns are auto-summarized (0=single-shot)",
         constraint="0~50",
     ),
     SettingSpec(
         "IDLE_RESET_MINUTES", "int", _make_int_parser(0, 1440),
-        default=30, apply_timing="immediate",
-        description="Idle time before auto-resetting conversation context (minutes, 0=off)",
+        default=1440, apply_timing="immediate",
+        description="Idle time before auto-resetting conversation context (minutes, 1440 = 24h, 0=off)",
         constraint="0~1440",
     ),
     SettingSpec(

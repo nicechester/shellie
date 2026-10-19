@@ -141,7 +141,7 @@ class HandlersTestCase(unittest.TestCase):
             "ALLOWED_USER_ID": 111,
             "FC_MAX_LOOPS": 5,
             "CONTEXT_TURNS": 10,
-            "IDLE_RESET_MINUTES": 30,
+            "IDLE_RESET_MINUTES": 1440,
             "WEB_PORT": 8321,
             "FC_MAX_CONTINUATIONS": 2,
         }
@@ -619,8 +619,10 @@ class HistoryManagementTests(HandlersTestCase):
         self.mock_call_llm.return_value = (_text_response("reply-2"), "m1")
         handlers.process_update(self._update("msg2"))
         self._drain_queue()
-        self.assertEqual(len(handlers._history), 2)
-        self.assertEqual(handlers._history[0]["parts"][0]["text"], "msg2")
+        # Hard cap is 4*CONTEXT_TURNS entries now, so the stored history holds
+        # both pairs until the next call compacts it.
+        self.assertEqual(len(handlers._history), 4)
+        self.assertEqual(handlers._history[0]["parts"][0]["text"], "msg1")
 
     def test_context_turns_zero_retains_nothing_and_sends_empty_history(self) -> None:
         self._settings_values["CONTEXT_TURNS"] = 0
@@ -647,6 +649,97 @@ class HistoryManagementTests(HandlersTestCase):
         # Only the newest turn pair should remain; the stale history was reset first.
         self.assertEqual(len(handlers._history), 2)
         self.assertEqual(handlers._history[0]["parts"][0]["text"], "new message")
+
+
+class HistoryCompactionTests(HandlersTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        handlers._reset_history()
+        handlers._summary = ""
+
+    def _fill_history(self, pairs: int) -> None:
+        for i in range(pairs):
+            handlers._history.append({"role": "user", "parts": [{"text": "user-{}".format(i)}]})
+            handlers._history.append({"role": "model", "parts": [{"text": "model-{}".format(i)}]})
+
+    def test_compaction_triggers_and_keeps_recent_pairs(self) -> None:
+        self._fill_history(4)  # 8 entries > 2 * CONTEXT_TURNS(2)
+        self.mock_call_llm.return_value = (_text_response("SUMMARY"), "m1")
+
+        handlers._compact_history(2)
+
+        self.assertEqual(self.mock_call_llm.call_count, 1)
+        self.assertEqual(self.mock_call_llm.call_args[1], {"allow_tools": False})
+        prompt = self.mock_call_llm.call_args[0][0][0]["parts"][0]["text"]
+        self.assertIn("User: user-0", prompt)
+        self.assertEqual(handlers._summary, "SUMMARY")
+        self.assertEqual(len(handlers._history), 2)
+        self.assertEqual(handlers._history[0]["parts"][0]["text"], "user-3")
+
+    def test_compaction_skipped_when_within_window(self) -> None:
+        self._fill_history(2)  # 4 entries, not > 2 * CONTEXT_TURNS(2)
+
+        handlers._compact_history(2)
+
+        self.mock_call_llm.assert_not_called()
+        self.assertEqual(handlers._summary, "")
+        self.assertEqual(len(handlers._history), 4)
+
+    def test_summary_injected_before_history(self) -> None:
+        handlers._summary = "S"
+        self._fill_history(1)
+
+        contents = handlers._trimmed_history(2)
+
+        self.assertEqual(contents[0]["role"], "user")
+        self.assertIn("[Summary of earlier conversation, for context only]", contents[0]["parts"][0]["text"])
+        self.assertIn("S", contents[0]["parts"][0]["text"])
+        self.assertEqual(contents[1], {"role": "model", "parts": [{"text": "Understood."}]})
+        self.assertEqual(contents[2]["parts"][0]["text"], "user-0")
+        self.assertEqual(contents[3]["parts"][0]["text"], "model-0")
+        self.assertEqual(len(contents), 4)
+
+    def test_compaction_failure_falls_back_to_plain_trim(self) -> None:
+        self._fill_history(3)  # 6 entries > 4
+        self.mock_call_llm.side_effect = RuntimeError("boom")
+
+        handlers._compact_history(2)
+
+        self.assertEqual(handlers._summary, "")
+        self.assertEqual(len(handlers._history), 4)
+        self.assertEqual(handlers._history[0]["parts"][0]["text"], "user-1")
+
+    def test_blocked_summary_falls_back_to_plain_trim(self) -> None:
+        self._fill_history(3)
+        self.mock_call_llm.return_value = (_blocked_response("SAFETY"), "m1")
+
+        handlers._compact_history(2)
+
+        self.assertEqual(handlers._summary, "")
+        self.assertEqual(len(handlers._history), 4)
+
+    def test_reset_history_clears_summary(self) -> None:
+        handlers._summary = "S"
+        self._fill_history(1)
+
+        handlers._reset_history()
+
+        self.assertEqual(handlers._summary, "")
+        self.assertEqual(handlers._history, [])
+
+    def test_reset_during_summarizer_call_discards_result(self) -> None:
+        self._fill_history(3)
+
+        def _reset_mid_call(*_args, **_kwargs):
+            handlers._reset_history()
+            return (_text_response("SUMMARY"), "m1")
+
+        self.mock_call_llm.side_effect = _reset_mid_call
+
+        handlers._compact_history(2)
+
+        self.assertEqual(handlers._history, [])
+        self.assertEqual(handlers._summary, "")
 
 
 class QueueTests(HandlersTestCase):
