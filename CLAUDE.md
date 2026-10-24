@@ -74,11 +74,11 @@ bypass, 24/7 via launchd/systemd.
   QuotaFailure.quotaId "PerDay" → RPD (fall back); otherwise RPM (sleep
   server-hinted delay and retry once, then fall back). `ToolEntry` registry:
   execute_shell (dynamic description) + append_memory + execute_web_search
-  (google_search grounding via SEARCH_MODEL) + send_file + view_file + manage_schedule. Hybrid skills auto-discovery —
-  `skills/*.py` (first docstring line) AND `skills/*.md` procedure docs (first
-  non-empty line, `#` stripped, 80 chars; README.md and `_`-prefixed excluded);
-  only the one-line summary goes into the system prompt, the LLM `cat`s the full
-  .md on demand and follows its steps — `[execution environment]` block
+  (google_search grounding via SEARCH_MODEL) + send_file + view_file + manage_schedule. Skills auto-discovery —
+  `skills/*.md` procedure docs only (first non-empty line, `#` stripped, 80 chars;
+  README.md and `_`-prefixed files excluded; `_`-prefixed `.py` helpers are called
+  from the procedures, never listed); only the one-line summary goes into the system
+  prompt, the LLM `cat`s the full .md on demand and follows its steps — `[execution environment]` block
   (OS/arch/shell/cwd, local time in YYYY-MM-DD HH:MM with TZ and UTC offset, computed at call time),
   robust `parse_response()` (multi functionCall parts,
   thought-part skip, blocked/finishReason handling). Live retry state (calling /
@@ -155,9 +155,9 @@ bypass, 24/7 via launchd/systemd.
 
 D1 fail-closed auth · D2 secrets in .env (600) · D3 Python ≥3.8 (Chester's Mac
 is 3.8.2) · D4 offset file, at-most-once · D5 Telegram HTML · D6 context =
-N turns + idle reset · D7 chain flash→pro→lite · D8 skills = hybrid: .py scripts
-run via execute_shell (deterministic) + .md procedure docs the LLM reads and
-follows · D9 settings.json overlay · D10 setup-required mode · D11 web =
+N turns + idle reset · D7 chain flash→pro→lite · D8 skills = `.md` procedure docs
+the LLM reads and follows; deterministic logic lives in `_`-prefixed helper scripts
+that the procedure runs via execute_shell (`manage_skill` creates `.md` only) · D9 settings.json overlay · D10 setup-required mode · D11 web =
 no login + Host/Origin/CSRF · D12 launchd + systemd user unit, POSIX only.
 
 ## Commands
@@ -167,7 +167,7 @@ no login + Host/Origin/CSRF · D12 launchd + systemd user unit, POSIX only.
 - Service install: `sh launchd/install.sh` (Darwin→launchd, Linux→systemd user
   unit; Linux boot-start needs `loginctl enable-linger $USER`)
 
-## Status (2026-10-22)
+## Status (2026-10-24)
 
 Phases 0–9 all implemented; issue #4 v1+v2 (auto-continuation + task persistence) implemented. Recent changes:
 - `GEMINI_TIMEOUT_SEC` default raised 60 → 120s.
@@ -187,8 +187,8 @@ Phases 0–9 all implemented; issue #4 v1+v2 (auto-continuation + task persisten
 - `skills/gws.md` gained a quoting-rules section (no backslash-escaped quotes;
   `'` for single quotes inside JSON; payload files for large JSON) and its
   bad `--json-values '[[\"a\"...]]'` example was fixed (it was teaching the
-  model the exact over-escape pattern). New `skills/sheet_from_csv.py`:
-  CSV → new/existing spreadsheet via argv-based gws calls (no shell quoting).
+  model the exact over-escape pattern). New `skills/sheet_from_csv.md` + helper
+  `skills/_sheet_from_csv.py`: CSV → new/existing spreadsheet via argv-based gws calls (no shell quoting).
 - Issue #4 v1+v2: new `core/tasks.py` (single-slot `current.json` CRUD, atomic
   0600 writes, corrupt-file quarantine, 3-day expiry, `format_age`); handlers
   drive an epoch-guarded auto-continuation chain (`_run_task_chain`) when a turn
@@ -212,8 +212,11 @@ Phases 0–9 all implemented; issue #4 v1+v2 (auto-continuation + task persisten
 - Issue #33 implemented: mixed `LLM_MODEL_CHAIN` fallback across Gemini and OpenAI-compatible models.
 - Issue #25 implemented: MCP OAuth (code + PKCE) via `/mcp auth|finish|logout`, tokens in `SHELLIE_HOME/mcp_oauth.json`; prompt-driven MCP/skill setup with Telegram Confirm for MCP changes.
 - Issue #39 implemented: version shown at startup and in `/help`, `/settings`, `/env`, `/get` (`src/agent/version.py`); bumped to 1.1.0, then 1.1.1 in the #25 release.
+- Issue #45 implemented (PR #47): `manage_skill` creates `.md` skills only; existing `.py` skills can still be updated.
+- Issue #46 (in progress, branch `issue-46-migrate-py-skills`): repo skills migrated to `.md` — `sample_skill.py` removed, `sheet_from_csv` / `slides_create` now `.md` skills with `_`-prefixed helpers. User skills in `~/.shellie/skills/` are migrated on Chester's machine.
 - Issue #42 implemented: `IDLE_RESET_MINUTES` default 30 → 1440 (24h); history over 2×`CONTEXT_TURNS` is auto-compacted into a rolling summary (tools-off LLM call, falls back to plain trimming on failure); hard history cap `min(4×CONTEXT_TURNS, 200)`.
 
 Outstanding:
-1. Chester: run tests + acceptance playbook.
+1. Chester: run tests + acceptance playbook (PR #47 and the #46 changes are untested).
 2. Open decision: whether to migrate OpenClaw data (memories/settings).
+3. Chester: migrate user `.py` skills in `~/.shellie/skills/` to `.md` (#46).

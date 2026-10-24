@@ -1,8 +1,8 @@
 """Create a Google Spreadsheet from a local CSV file via the gws CLI (no shell quoting needed).
 
 Usage:
-  python3 skills/sheet_from_csv.py --title "TITLE" --csv data.csv
-  python3 skills/sheet_from_csv.py --append-to SPREADSHEET_ID --csv data.csv
+  python3 skills/_sheet_from_csv.py --title "TITLE" --csv data.csv
+  python3 skills/_sheet_from_csv.py --append-to SPREADSHEET_ID --csv data.csv
   Options: [--no-coerce] [--gws /full/path/to/gws] [--dry-run]
 
 Prepare the data as a CSV file first (e.g. with a quoted heredoc), then run this
