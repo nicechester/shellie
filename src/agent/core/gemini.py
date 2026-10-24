@@ -436,7 +436,8 @@ def build_system_instruction() -> Dict[str, Any]:
         text += (
             "\n\n[skills] (.py: run with python3 skills/<name>.py / "
             ".md: read full text with cat skills/<name>.md and follow the procedure; "
-            "create new skills in ~/.shellie/skills/)\n" + skills_text
+            "create new skills as .md in ~/.shellie/skills/; existing .py skills stay as they are)\n"
+            + skills_text
         )
 
     text += (
