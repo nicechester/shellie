@@ -1,7 +1,7 @@
 # Shellie
 
 A personal Telegram agent that runs on your own machine. Zero pip dependencies —
-Python 3.8+ standard library only. Current version: **1.1.1**.
+Python 3.8+ standard library only. Current version: **1.2.0**.
 
 ## 1. Overview
 

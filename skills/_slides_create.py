@@ -1,8 +1,8 @@
 """Create a Google Slides presentation with a title slide and content slides.
 
 Usage:
-  python3 skills/slides_create.py --title "TITLE" --slide "Slide 1 Title|bullet1|bullet2" --slide "Slide 2 Title|bullet1"
-  python3 skills/slides_create.py --title "TITLE" --slide "Title|point1|point2" [--slide ...] [--gws /full/path/to/gws]
+  python3 skills/_slides_create.py --title "TITLE" --slide "Slide 1 Title|bullet1|bullet2" --slide "Slide 2 Title|bullet1"
+  python3 skills/_slides_create.py --title "TITLE" --slide "Title|point1|point2" [--slide ...] [--gws /full/path/to/gws]
 
 Each --slide value is pipe-separated: first token is the slide title, remaining tokens are bullet points.
 Prints the presentation URL on success.

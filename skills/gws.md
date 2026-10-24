@@ -29,7 +29,7 @@ Docs: https://github.com/googleworkspace/cli
    (The `<<'EOF'` quoted heredoc passes the JSON through byte-for-byte — no
    escaping needed inside it.)
 5. To create a spreadsheet from tabular data, prefer the deterministic skill
-   `skills/sheet_from_csv.py` (see Sheets below) — it invokes `gws` without a
+   `skills/_sheet_from_csv.py` (see Sheets below) — it invokes `gws` without a
    shell, so quoting problems cannot happen.
 
 ---
@@ -92,7 +92,7 @@ gws drive files get  --params '{"fileId":"FILE_ID"}'
 
 Create a spreadsheet from a CSV file (preferred — no shell quoting involved):
 ```
-python3 skills/sheet_from_csv.py --title "TITLE" --csv data.csv
+python3 skills/_sheet_from_csv.py --title "TITLE" --csv data.csv
 ```
 Save your data as a CSV file first (via a quoted heredoc or a script), then run
 the skill; it prints the new spreadsheet's ID and URL. Use `--append-to <ID>`
@@ -115,7 +115,7 @@ gws sheets +append --spreadsheet <ID> --json-values '[["a","b"],["c","d"]]'
 ```
 For more than a few rows, put the JSON in a file and use
 `--json-values "$(cat payload.json)"` (see Quoting rules above), or use
-`skills/sheet_from_csv.py`.
+`skills/_sheet_from_csv.py`.
 
 ---
 
@@ -156,7 +156,7 @@ gws calendar events list --params '{"calendarId":"primary","timeMin":"2026-01-01
 
 ## Slides
 
-To create a presentation with content, use `skills/slides_create.py` instead.
+To create a presentation with content, use `skills/_slides_create.py` instead.
 
 Get a presentation:
 ```
