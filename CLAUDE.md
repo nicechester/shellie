@@ -167,7 +167,7 @@ no login + Host/Origin/CSRF · D12 launchd + systemd user unit, POSIX only.
 - Service install: `sh launchd/install.sh` (Darwin→launchd, Linux→systemd user
   unit; Linux boot-start needs `loginctl enable-linger $USER`)
 
-## Status (2026-09-29)
+## Status (2026-10-22)
 
 Phases 0–9 all implemented; issue #4 v1+v2 (auto-continuation + task persistence) implemented. Recent changes:
 - `GEMINI_TIMEOUT_SEC` default raised 60 → 120s.
@@ -208,7 +208,11 @@ Phases 0–9 all implemented; issue #4 v1+v2 (auto-continuation + task persisten
 - Issue #6 implemented — multimodal uploads to Gemini (inlineData media + inline text files, 5MB/5-attachment/100KB caps, no-caption follow-up question, history stripping).
 - Issue #22 implemented — `view_file` tool (vision on existing workspace files; #6 history placeholders now point to view_file).
 - Issue #5 implemented — scheduled prompts (`/schedule` bypass commands, `manage_schedule` LLM tool, recurring daily/weekdays/weekly/hourly/every with comma time lists, min 15m, aligned to local midnight; per-schedule inflight dedup, save-before-enqueue, 10min grace skip-missed; ticker only touches scheduler+settings+queue.put, never Telegram; ⏰ notice on run start; daily/weekdays/weekly add to history, interval results are not).
-- Issue #13 open: OpenAI-compatible LLM backend support.
+- Issue #13 implemented: OpenAI-compatible LLM backend support (`core/openai.py`).
+- Issue #33 implemented: mixed `LLM_MODEL_CHAIN` fallback across Gemini and OpenAI-compatible models.
+- Issue #25 implemented: MCP OAuth (code + PKCE) via `/mcp auth|finish|logout`, tokens in `SHELLIE_HOME/mcp_oauth.json`; prompt-driven MCP/skill setup with Telegram Confirm for MCP changes.
+- Issue #39 implemented: version shown at startup and in `/help`, `/settings`, `/env`, `/get` (`src/agent/version.py`); bumped to 1.1.0, then 1.1.1 in the #25 release.
+- Issue #42 implemented: `IDLE_RESET_MINUTES` default 30 → 1440 (24h); history over 2×`CONTEXT_TURNS` is auto-compacted into a rolling summary (tools-off LLM call, falls back to plain trimming on failure); hard history cap `min(4×CONTEXT_TURNS, 200)`.
 
 Outstanding:
 1. Chester: run tests + acceptance playbook.

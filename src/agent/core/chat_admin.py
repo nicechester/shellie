@@ -49,16 +49,18 @@ def skill_declaration() -> Dict[str, Any]:
         "description": (
             "Create, update, list or remove user skills (files in the skills folder). "
             "Use only when the user explicitly asks to add, change or delete a skill. "
-            "A .md skill is a procedure you read and follow step by step; a .py skill is "
-            "a script you run with execute_shell. Names: lowercase letters, digits, - and _, "
-            "ending in .md or .py. Built-in skills cannot be changed. Keep content short "
+            "Skills are .md procedures that you read and follow step by step. New skills "
+            "must be .md; put any code in a helper script that the procedure calls with "
+            "execute_shell. Existing .py skills can be updated but not created. Names: "
+            "lowercase letters, digits, - and _, ending in .md (or .py for existing skills). "
+            "Built-in skills cannot be changed. Keep content short "
             "and concrete, and never store secrets or tokens in a skill."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
                 "action": {"type": "STRING", "description": "list, create, update or remove"},
-                "name": {"type": "STRING", "description": "Skill file name, e.g. weather.md or resize.py"},
+                "name": {"type": "STRING", "description": "Skill file name, e.g. weather.md"},
                 "content": {"type": "STRING", "description": "Full file content (required for create and update)"},
             },
             "required": ["action"],
@@ -110,6 +112,8 @@ def skill_run(args: Dict[str, Any]) -> str:
     exists = os.path.isfile(path)
 
     if action == "create":
+        if name.endswith(".py"):
+            return "Error: new skills must be .md prompt files; put any code in a helper script the .md calls"
         if exists:
             return "Error: skill '{}' already exists. Use update.".format(name)
         content = _checked_content(args)
