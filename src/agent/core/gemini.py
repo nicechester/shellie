@@ -371,8 +371,9 @@ def build_tools_schema() -> List[Dict[str, Any]]:
     return [{"functionDeclarations": declarations}]
 
 
-def _describe_py_skill(name: str, path: str) -> str:
-    line = "- skills/{}".format(name)
+def _describe_py_skill(path: str) -> str:
+    # Absolute path: the shell cwd is the workspace, so relative skills/ paths would miss.
+    line = "- {}".format(path)
     try:
         with open(path, "r", encoding="utf-8") as f:
             source = f.read()
@@ -380,14 +381,14 @@ def _describe_py_skill(name: str, path: str) -> str:
         if doc:
             first_line = doc.strip().splitlines()[0].strip()
             if first_line:
-                line = "- skills/{}: {}".format(name, first_line)
+                line = "- {}: {}".format(path, first_line)
     except Exception:
         pass
     return line
 
 
-def _describe_md_skill(name: str, path: str) -> str:
-    line = "- skills/{}".format(name)
+def _describe_md_skill(path: str) -> str:
+    line = "- {}".format(path)
     try:
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
@@ -396,7 +397,7 @@ def _describe_md_skill(name: str, path: str) -> str:
             if stripped:
                 summary = stripped.lstrip("#").strip()
                 if summary:
-                    line = "- skills/{}: {}".format(name, summary[:80])
+                    line = "- {}: {}".format(path, summary[:80])
                 break
     except Exception:
         pass
@@ -420,9 +421,9 @@ def list_skills() -> str:
             continue
         path = skill_map[name]
         if name.endswith(".py"):
-            lines.append(_describe_py_skill(name, path))
+            lines.append(_describe_py_skill(path))
         else:
-            lines.append(_describe_md_skill(name, path))
+            lines.append(_describe_md_skill(path))
     return "\n".join(lines)
 
 
@@ -434,9 +435,14 @@ def build_system_instruction() -> Dict[str, Any]:
     skills_text = list_skills()
     if skills_text:
         text += (
-            "\n\n[skills] (.py: run with python3 skills/<name>.py / "
-            ".md: read full text with cat skills/<name>.md and follow the procedure; "
-            "create new skills as .md in ~/.shellie/skills/; existing .py skills stay as they are)\n"
+            "\n\n[skills] (paths are absolute; the shell cwd is the workspace, so never use "
+            "relative skills/ paths and never create a skills folder in the workspace. "
+            "Built-in skills dir: {}; user skills dir: {}. A procedure that mentions skills/<file> "
+            "means the file in one of these dirs. "
+            ".py: run with python3 <absolute path> / "
+            ".md: read full text with cat <absolute path> and follow the procedure; "
+            "create new skills only as .md in ~/.shellie/skills/; existing .py skills stay as they are)\n"
+            .format(REPO_SKILLS_DIR, SKILLS_DIR)
             + skills_text
         )
 
