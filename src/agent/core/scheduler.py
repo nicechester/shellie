@@ -9,7 +9,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from src.agent.config import SCHEDULES_FILE
+from src.agent.config import SCHEDULES_FILE, SCHEDULE_STATE_FILE
 from src.agent.core import tasks
 
 _LOGGER = logging.getLogger("shellie.scheduler")
@@ -29,8 +29,18 @@ _MIN_EVERY_MIN = 15
 _MAX_EVERY_MIN = 1440
 _MAX_EVERY_HOURS = 24
 _DOW = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+_LEGACY_KINDS = ("daily", "weekdays", "weekly", "hourly", "every", "at")
 
-_SCHEMA_VERSION = 1
+# Definitions file (schedules.json) is version 2; version 1 kept run state
+# inline and is migrated on load. The running-state file is versioned apart.
+_SCHEMA_VERSION = 2
+_LEGACY_SCHEMA_VERSION = 1
+_STATE_VERSION = 1
+_JSON_INDENT = 2
+
+# Cron day scan: the longest gap between two matching days is 8 years
+# (Feb 29 across a skipped century leap year), so scan at least that far.
+_CRON_SCAN_DAYS = 366 * 8
 
 _started = False
 _stop_event = threading.Event()
@@ -112,12 +122,134 @@ def _parse_date(token: str) -> Tuple[Optional[int], Optional[int], Optional[int]
     return y, mo, d, None
 
 
+# Cron fields: (label, min, max, name table). Cron weekday 0 = Sunday, and 7
+# is accepted as an alias for Sunday. Names are matched case-insensitively.
+_CRON_MONTH_NAMES = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+                     "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+_CRON_DOW_NAMES = {"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6}
+_CRON_FIELD_SPECS = (
+    ("minute", 0, 59, None),
+    ("hour", 0, 23, None),
+    ("day-of-month", 1, 31, None),
+    ("month", 1, 12, _CRON_MONTH_NAMES),
+    ("day-of-week", 0, 7, _CRON_DOW_NAMES),
+)
+# First token of a cron expression starts with a digit or '*' (or contains
+# one of the cron operators); legacy keywords never match this.
+_CRON_HINT = re.compile(r"^[\d*]|[*/,]")
+
+
+def _cron_value(
+    label: str, token: str, lo: int, hi: int, names: Optional[Dict[str, int]]
+) -> Tuple[Optional[int], Optional[str]]:
+    lowered = token.lower()
+    if names is not None and lowered in names:
+        value = names[lowered]
+    elif re.match(r"^\d+$", token):
+        value = int(token)
+    else:
+        return None, "Invalid {} value '{}'".format(label, token)
+    if not (lo <= value <= hi):
+        return None, "{} value '{}' out of range {}-{}".format(label, token, lo, hi)
+    return value, None
+
+
+def _parse_cron_field(
+    label: str, token: str, lo: int, hi: int, names: Optional[Dict[str, int]]
+) -> Tuple[Optional[Set[int]], Optional[str]]:
+    """One cron field: '*', 'N', 'A-B', '*/S', 'A-B/S', 'N/S' (= N-max/S) and
+    comma lists of those."""
+    values: Set[int] = set()
+    for part in token.split(","):
+        if not part:
+            return None, "Empty entry in {} field '{}'".format(label, token)
+        base, slash, step_text = part.partition("/")
+        step = 1
+        if slash:
+            if not re.match(r"^\d+$", step_text) or int(step_text) < 1:
+                return None, "Invalid step '{}' in {} field '{}'".format(step_text, label, token)
+            step = int(step_text)
+        if base == "*":
+            start, end = lo, hi
+        elif "-" in base:
+            a, _dash, b = base.partition("-")
+            start, err = _cron_value(label, a, lo, hi, names)
+            if err:
+                return None, err
+            end, err = _cron_value(label, b, lo, hi, names)
+            if err:
+                return None, err
+            if start > end:
+                return None, "Descending range '{}' in {} field".format(base, label)
+        else:
+            start, err = _cron_value(label, base, lo, hi, names)
+            if err:
+                return None, err
+            end = hi if slash else start
+        values.update(range(start, end + 1, step))
+    return values, None
+
+
+def _parse_cron(text: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Parse a 5-field cron expression (minute hour day-of-month month
+    day-of-week). Returns (parsed, error). Never raises.
+
+    Day matching follows Vixie cron: if day-of-month or day-of-week is `*`
+    (or starts with `*`), both must match; if both are restricted, a day
+    matches when either does."""
+    fields = text.split()
+    if len(fields) != 5:
+        return None, "Cron needs exactly 5 fields: minute hour day-of-month month day-of-week"
+    sets: List[Set[int]] = []
+    for field, (label, lo, hi, names) in zip(fields, _CRON_FIELD_SPECS):
+        values, err = _parse_cron_field(label, field, lo, hi, names)
+        if err:
+            return None, err
+        sets.append(values)  # type: ignore[arg-type]
+    minutes, hours, doms, months, dow_values = sets
+    dows = {0 if d == 7 else d for d in dow_values}
+
+    # Minimum interval: fire times within a day (wrapping at midnight) must
+    # be at least _MIN_EVERY_MIN apart. Same-day pairs and midnight wrap are
+    # both covered; a restricted day list can only widen the real gaps.
+    day_times = sorted(h * 60 + m for h in hours for m in minutes)
+    gaps = [b - a for a, b in zip(day_times, day_times[1:])]
+    gaps.append(day_times[0] + 1440 - day_times[-1])
+    if min(gaps) < _MIN_EVERY_MIN:
+        return None, "Interval too short: cron fires {} minutes apart; minimum is {} minutes".format(
+            min(gaps), _MIN_EVERY_MIN
+        )
+
+    parsed = {
+        "kind": "cron",
+        "minutes": minutes,
+        "hours": hours,
+        "doms": doms,
+        "months": months,
+        "dows": dows,
+        "dom_star": fields[2].startswith("*"),
+        "dow_star": fields[4].startswith("*"),
+        "times": None,
+        "ts": None,
+        "text": " ".join(fields).lower(),
+    }
+    return parsed, None
+
+
 def parse_spec(tokens: List[str]) -> Tuple[Optional[Dict[str, Any]], int, Optional[str]]:
     """Parse a schedule grammar from an already-split token list. Returns
     (parsed, tokens_consumed, error). Never raises."""
     if not tokens:
         return None, 0, "Empty schedule spec."
     kind_token = tokens[0].lower()
+
+    if kind_token not in _LEGACY_KINDS and _CRON_HINT.search(tokens[0]):
+        if len(tokens) < 5:
+            return None, 0, "Cron needs 5 fields: minute hour day-of-month month day-of-week"
+        parsed, err = _parse_cron(" ".join(tokens[:5]))
+        if err:
+            return None, 0, err
+        return parsed, 5, None
 
     if kind_token in ("daily", "weekdays"):
         if len(tokens) < 2:
@@ -182,8 +314,9 @@ def parse_spec(tokens: List[str]) -> Tuple[Optional[Dict[str, Any]], int, Option
         text = "at {}-{:02d}-{:02d} {:02d}:{:02d}".format(y, mo, d, hh, mm)
         return {"kind": "at", "minutes": None, "times": None, "dows": None, "ts": ts, "text": text}, 3, None
 
-    return None, 0, "Unknown schedule kind '{}'. Use daily, weekdays, weekly, hourly, every, or at.".format(
-        kind_token
+    return None, 0, (
+        "Unknown schedule kind '{}'. Use a 5-field cron expression, daily, weekdays, weekly, "
+        "hourly, every, or at.".format(kind_token)
     )
 
 
@@ -205,6 +338,38 @@ def split_spec_prompt(text: str) -> Tuple[Optional[Dict[str, Any]], Optional[str
     if len(prompt) > _MAX_PROMPT_CHARS:
         return None, None, "Prompt too long (max {} chars).".format(_MAX_PROMPT_CHARS)
     return parsed, prompt, None
+
+
+def _to_cron_text(parsed: Dict[str, Any]) -> Optional[str]:
+    """Cron text for a legacy spec when an exactly equivalent cron expression
+    exists, else None (the legacy text is stored as-is). The stored text is
+    the only thing that changes; next runs are identical (see tests)."""
+    kind = parsed["kind"]
+    if kind in ("daily", "weekdays", "weekly"):
+        times = parsed["times"]
+        if len({m for _h, m in times}) != 1:
+            return None
+        dows = parsed["dows"]
+        if len(dows) == 7:
+            dow_field = "*"
+        else:
+            # Python tm_wday 0 = Monday; cron 0 = Sunday.
+            dow_field = ",".join(str(v) for v in sorted((d + 1) % 7 for d in dows))
+        hours_field = ",".join(str(h) for h, _m in times)
+        return "{} {} * * {}".format(times[0][1], hours_field, dow_field)
+    if kind == "hourly":
+        return "{} * * * *".format(parsed["minutes"])
+    if kind == "every":
+        n = parsed["minutes"]
+        if n < 60 and 60 % n == 0:
+            return "*/{} * * * *".format(n)
+        if n % 60 == 0 and 24 % (n // 60) == 0:
+            return "0 */{} * * *".format(n // 60)
+    return None
+
+
+def _stored_text(parsed: Dict[str, Any]) -> str:
+    return _to_cron_text(parsed) or parsed["text"]
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +447,43 @@ def _next_run_daily(parsed: Dict[str, Any], after: float) -> float:
     raise ValueError("next_run: no candidate found for day-based spec")
 
 
+def _next_run_cron(parsed: Dict[str, Any], after: float) -> float:
+    minutes = sorted(parsed["minutes"])
+    hours = sorted(parsed["hours"])
+    lt = time.localtime(after)
+    for day_offset in range(0, _CRON_SCAN_DAYS):
+        try:
+            # Noon avoids DST-gap midnights; only the calendar date is used.
+            noon = time.mktime(
+                (lt.tm_year, lt.tm_mon, lt.tm_mday + day_offset, 12, 0, 0, 0, 0, -1)
+            )
+        except (OverflowError, ValueError):
+            continue
+        day_lt = time.localtime(noon)
+        if day_lt.tm_mon not in parsed["months"]:
+            continue
+        cron_dow = (day_lt.tm_wday + 1) % 7
+        dom_ok = day_lt.tm_mday in parsed["doms"]
+        dow_ok = cron_dow in parsed["dows"]
+        if parsed["dom_star"] or parsed["dow_star"]:
+            day_ok = dom_ok and dow_ok
+        else:
+            day_ok = dom_ok or dow_ok
+        if not day_ok:
+            continue
+        for hh in hours:
+            for mm in minutes:
+                try:
+                    candidate = time.mktime(
+                        (day_lt.tm_year, day_lt.tm_mon, day_lt.tm_mday, hh, mm, 0, 0, 0, -1)
+                    )
+                except (OverflowError, ValueError):
+                    continue
+                if candidate > after:
+                    return candidate
+    raise ValueError("next_run: no candidate found for cron spec")
+
+
 def next_run(parsed: Dict[str, Any], after: float) -> Optional[float]:
     """First occurrence strictly after `after`, or None for a spent one-shot
     ("at" in the past — a legitimate result, not an error). May raise
@@ -296,16 +498,135 @@ def next_run(parsed: Dict[str, Any], after: float) -> Optional[float]:
         return _next_run_every(parsed, after)
     if kind == "hourly":
         return _next_run_hourly(parsed, after)
+    if kind == "cron":
+        return _next_run_cron(parsed, after)
     return _next_run_daily(parsed, after)  # daily / weekdays / weekly
 
 
 # ---------------------------------------------------------------------------
-# Persistence: {"version": 1, "next_id": N, "schedules": [...]}. Mirrors
-# core/tasks.py's atomic-write + quarantine pattern. Never logs prompts.
+# Plain-English rendering (pure). describe_spec never raises: anything it
+# cannot describe is shown as the raw spec text.
+# ---------------------------------------------------------------------------
+
+_DOW_LABELS = ("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")  # cron values 0-6
+_MAX_DESCRIBED_TIMES = 6
+
+
+def _plural(n: int, unit: str) -> str:
+    return "{} {}".format(n, unit if n == 1 else unit + "s")
+
+
+def _describe_hm_list(times: List[Tuple[int, int]]) -> Optional[str]:
+    if len(times) > _MAX_DESCRIBED_TIMES:
+        return None
+    return ", ".join("{:02d}:{:02d}".format(h, m) for h, m in times)
+
+
+def _describe_dows(dows: Set[int]) -> str:
+    if dows == {1, 2, 3, 4, 5}:
+        return "weekdays"
+    if dows == {0, 6}:
+        return "weekends"
+    return ", ".join(_DOW_LABELS[d] for d in sorted(dows, key=lambda d: (d - 1) % 7))
+
+
+def _describe_legacy(parsed: Dict[str, Any]) -> Optional[str]:
+    kind = parsed["kind"]
+    if kind in ("daily", "weekdays", "weekly"):
+        times = _describe_hm_list(parsed["times"])
+        if times is None:
+            return None
+        if kind == "daily":
+            return "daily at {}".format(times)
+        if kind == "weekdays":
+            return "weekdays at {}".format(times)
+        days = ", ".join(_DOW[i].capitalize() for i in sorted(parsed["dows"]))
+        return "{} at {}".format(days, times)
+    if kind == "hourly":
+        return "hourly at :{:02d}".format(parsed["minutes"])
+    if kind == "every":
+        n = parsed["minutes"]
+        if n >= 60 and n % 60 == 0:
+            return "every {}".format(_plural(n // 60, "hour"))
+        return "every {}".format(_plural(n, "minute"))
+    if kind == "at":
+        _at, day, clock = parsed["text"].split()
+        return "once on {} at {}".format(day, clock)
+    return None
+
+
+def _describe_cron(parsed: Dict[str, Any]) -> Optional[str]:
+    if len(parsed["months"]) != 12:
+        return None
+    doms = parsed["doms"]
+    dows = parsed["dows"]
+    dom_all = len(doms) == 31
+    dow_all = len(dows) == 7
+    if not dom_all and not dow_all:
+        return None  # day-of-month and day-of-week both set: raw (OR rule)
+    minutes = sorted(parsed["minutes"])
+    hours = sorted(parsed["hours"])
+    every_hour = len(hours) == 24
+
+    if every_hour:
+        if len(minutes) == 1:  # M * * * *
+            if dom_all and dow_all:
+                return "hourly at :{:02d}".format(minutes[0])
+            return None
+        if not (dom_all and dow_all) or len(minutes) < 2:
+            return None
+        step = minutes[1] - minutes[0]  # */N * * * *
+        if minutes[0] == 0 and minutes == list(range(0, 60, step)):
+            return "every {}".format(_plural(step, "minute"))
+        return None
+
+    if len(minutes) != 1:
+        return None
+    minute = minutes[0]
+    if dom_all and dow_all and minute == 0 and len(hours) > 1:
+        step = hours[1] - hours[0]  # 0 */N * * *
+        if hours == list(range(0, 24, step)):
+            return "every {}".format(_plural(step, "hour"))
+
+    times = _describe_hm_list([(h, minute) for h in hours])
+    if times is None:
+        return None
+    if not dom_all:
+        if len(doms) != 1:
+            return None
+        return "monthly on day {} at {}".format(min(doms), times)
+    if dow_all:
+        return "daily at {}".format(times)
+    return "{} at {}".format(_describe_dows(dows), times)
+
+
+def describe_spec(spec_text: str) -> str:
+    """Plain-English description of a stored spec (legacy or cron). Pure;
+    never raises; falls back to the raw spec text."""
+    try:
+        tokens = str(spec_text).split()
+        parsed, n, err = parse_spec(tokens)
+        if err or parsed is None or n != len(tokens):
+            return spec_text
+        if parsed["kind"] == "cron":
+            text = _describe_cron(parsed)
+        else:
+            text = _describe_legacy(parsed)
+    except Exception:
+        return spec_text
+    return text if text else spec_text
+
+
+# ---------------------------------------------------------------------------
+# Persistence. Two files, both atomic 0600 writes with corrupt-file
+# quarantine (mirrors core/tasks.py):
+#   schedules.json       version 2 — user-owned definitions only
+#   schedule_state.json  version 1 — last_run_at / next_run_at keyed by id
+# Never logs prompts.
 # ---------------------------------------------------------------------------
 
 
-def _fresh_data() -> Dict[str, Any]:
+def _fresh_defs() -> Dict[str, Any]:
     return {"version": _SCHEMA_VERSION, "next_id": 1, "schedules": []}
 
 
@@ -334,6 +655,13 @@ def _valid_entry(entry: Any) -> bool:
     created_at = entry.get("created_at")
     if isinstance(created_at, bool) or not isinstance(created_at, (int, float)):
         return False
+    return True
+
+
+def _valid_entry_v1(entry: Any) -> bool:
+    """Version 1 entries carried their run state inline."""
+    if not _valid_entry(entry):
+        return False
     next_run_at = entry.get("next_run_at")
     if isinstance(next_run_at, bool) or not isinstance(next_run_at, (int, float)):
         return False
@@ -345,10 +673,10 @@ def _valid_entry(entry: Any) -> bool:
     return True
 
 
-def _valid_file(data: Any) -> bool:
+def _valid_file(data: Any, version: int, entry_check: Callable[[Any], bool]) -> bool:
     if not isinstance(data, dict):
         return False
-    if data.get("version") != _SCHEMA_VERSION:
+    if data.get("version") != version:
         return False
     next_id = data.get("next_id")
     if isinstance(next_id, bool) or not isinstance(next_id, int) or next_id < 1:
@@ -358,7 +686,7 @@ def _valid_file(data: Any) -> bool:
         return False
     seen_ids: Set[int] = set()
     for entry in schedules:
-        if not _valid_entry(entry):
+        if not entry_check(entry):
             return False
         eid = entry["id"]
         if eid in seen_ids or eid >= next_id:
@@ -367,50 +695,69 @@ def _valid_file(data: Any) -> bool:
     return True
 
 
-def load() -> Dict[str, Any]:
-    """Load the whole schedules file. Never raises; missing/corrupt file
-    quarantines and returns a fresh empty structure."""
-    path = SCHEDULES_FILE
-    if not os.path.exists(path):
-        return _fresh_data()
+def _valid_state(data: Any) -> bool:
+    if not isinstance(data, dict) or data.get("version") != _STATE_VERSION:
+        return False
+    states = data.get("state")
+    if not isinstance(states, dict):
+        return False
+    for st in states.values():
+        if not isinstance(st, dict):
+            return False
+        for key in ("last_run_at", "next_run_at"):
+            value = st.get(key)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
+                return False
+    return True
 
+
+def _fix_file_mode(path: str) -> None:
     try:
         mode = stat.S_IMODE(os.stat(path).st_mode)
         if mode & 0o077:
             try:
                 os.chmod(path, 0o600)
-                _LOGGER.warning("Fixed schedules file permissions to 0600")
+                _LOGGER.warning("Fixed %s permissions to 0600", os.path.basename(path))
             except OSError as exc:
-                _LOGGER.warning("Failed to fix schedules file permissions: %s", exc)
+                _LOGGER.warning("Failed to fix %s permissions: %s", os.path.basename(path), exc)
     except OSError:
         pass
 
+
+def _quarantine(path: str) -> None:
+    corrupt_path = "{}.corrupt-{}".format(path, int(time.time()))
+    try:
+        os.replace(path, corrupt_path)
+        _LOGGER.warning("Corrupt %s preserved as %s, ignoring", os.path.basename(path), corrupt_path)
+    except OSError as exc:
+        _LOGGER.warning("Failed to handle corrupt %s: %s", os.path.basename(path), exc)
+
+
+def _read_json_quarantine(path: str, validator: Callable[[Any], bool]) -> Optional[Any]:
+    """Read and validate a JSON file. Returns the data, or None when the file
+    is missing or corrupt (a corrupt file is moved aside, never deleted)."""
+    if not os.path.exists(path):
+        return None
+    _fix_file_mode(path)
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
         data = None
-
-    if data is None or not _valid_file(data):
-        corrupt_path = "{}.corrupt-{}".format(path, int(time.time()))
-        try:
-            os.replace(path, corrupt_path)
-            _LOGGER.warning("Corrupt schedules file preserved as %s, ignoring", corrupt_path)
-        except OSError as exc:
-            _LOGGER.warning("Failed to handle corrupt schedules file: %s", exc)
-        return _fresh_data()
-
-    return data
+    if data is not None and validator(data):
+        return data
+    _quarantine(path)
+    return None
 
 
-def _save(data: Dict[str, Any]) -> bool:
-    path = SCHEDULES_FILE
+def _atomic_write(path: str, obj: Any, indent: Optional[int]) -> bool:
     tmp_path = path + ".tmp"
     try:
         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
         fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
+            json.dump(obj, f, ensure_ascii=False, indent=indent)
+            f.write("\n")
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, path)
@@ -421,8 +768,121 @@ def _save(data: Dict[str, Any]) -> bool:
                 os.remove(tmp_path)
         except OSError:
             pass
-        _LOGGER.warning("Failed to save schedules file: %s", exc)
+        _LOGGER.warning("Failed to save %s: %s", os.path.basename(path), exc)
         return False
+
+
+def _definition_of(entry: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": entry["id"],
+        "spec": entry["spec"],
+        "prompt": entry["prompt"],
+        "name": entry["name"],
+        "enabled": entry["enabled"],
+        "created_at": entry["created_at"],
+    }
+
+
+def _state_from_entries(entries: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    return {
+        str(e["id"]): {"last_run_at": e.get("last_run_at"), "next_run_at": e.get("next_run_at")}
+        for e in entries
+    }
+
+
+def _state_doc(states: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    return {"version": _STATE_VERSION, "state": states}
+
+
+def _load_state() -> Dict[str, Dict[str, Any]]:
+    data = _read_json_quarantine(SCHEDULE_STATE_FILE, _valid_state)
+    if data is None:
+        return {}
+    return dict(data["state"])
+
+
+def _migrate_legacy(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Version 1 schedules.json -> version 2 definitions + state file. State
+    is written first; the definitions are rewritten only after it succeeds,
+    so a crash in between re-runs the migration on the next load. State that
+    already exists (from an earlier partial run) wins over inline values."""
+    definitions = [_definition_of(e) for e in data["schedules"]]
+    defs = {"version": _SCHEMA_VERSION, "next_id": data["next_id"], "schedules": definitions}
+    states = _state_from_entries(data["schedules"])
+    states.update(_load_state())
+    if not _atomic_write(SCHEDULE_STATE_FILE, _state_doc(states), _JSON_INDENT):
+        _LOGGER.warning("Schedule migration deferred: running state could not be written")
+        return defs
+    if not _atomic_write(SCHEDULES_FILE, defs, _JSON_INDENT):
+        _LOGGER.warning("Schedule migration deferred: definitions could not be rewritten")
+        return defs
+    _LOGGER.info(
+        "Migrated %d schedule(s) to schedules.json version %d; running state moved to %s",
+        len(definitions), _SCHEMA_VERSION, os.path.basename(SCHEDULE_STATE_FILE),
+    )
+    return defs
+
+
+def _load_defs() -> Dict[str, Any]:
+    data = _read_json_quarantine(
+        SCHEDULES_FILE,
+        lambda d: _valid_file(d, _SCHEMA_VERSION, _valid_entry)
+        or _valid_file(d, _LEGACY_SCHEMA_VERSION, _valid_entry_v1),
+    )
+    if data is None:
+        return _fresh_defs()
+    if data.get("version") == _SCHEMA_VERSION:
+        return data
+    return _migrate_legacy(data)
+
+
+def _fill_missing_next_run(entry: Dict[str, Any], now: float) -> None:
+    """An enabled entry with no stored next run (state file missing or
+    rebuilt) gets one computed from now. It is never treated as due."""
+    if not entry["enabled"] or entry["next_run_at"] is not None:
+        return
+    parsed, _n, err = parse_spec(entry["spec"].split())
+    if err or parsed is None:
+        return
+    try:
+        entry["next_run_at"] = next_run(parsed, now)
+    except (OverflowError, ValueError):
+        _LOGGER.error("schedule_next_run_failed id=%s", entry["id"])
+
+
+def load() -> Dict[str, Any]:
+    """Merged view of definitions and running state: {"next_id", "schedules"},
+    each entry carrying last_run_at/next_run_at from the state file. Never
+    raises; missing or corrupt files fall back to empty data."""
+    defs = _load_defs()
+    states = _load_state()
+    now = time.time()
+    entries = []
+    for definition in defs["schedules"]:
+        entry = dict(definition)
+        st = states.get(str(definition["id"]), {})
+        entry["last_run_at"] = st.get("last_run_at")
+        entry["next_run_at"] = st.get("next_run_at")
+        _fill_missing_next_run(entry, now)
+        entries.append(entry)
+    return {"next_id": defs["next_id"], "schedules": entries}
+
+
+def _commit(data: Dict[str, Any], defs_changed: bool) -> bool:
+    """Persist a merged view from load(). Definitions are rewritten only when
+    defs_changed; running state is always rewritten and pruned to the ids
+    that still exist. Definitions are written first."""
+    if defs_changed:
+        defs = {
+            "version": _SCHEMA_VERSION,
+            "next_id": data["next_id"],
+            "schedules": [_definition_of(e) for e in data["schedules"]],
+        }
+        if not _atomic_write(SCHEDULES_FILE, defs, _JSON_INDENT):
+            return False
+    return _atomic_write(
+        SCHEDULE_STATE_FILE, _state_doc(_state_from_entries(data["schedules"])), _JSON_INDENT
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +897,8 @@ def _next_str(entry: Dict[str, Any], now: float) -> str:
     # from a leftover next_run_at that predates the pause.
     if not entry["enabled"]:
         return "paused"
+    if entry["next_run_at"] is None:
+        return "not scheduled"
     dt = time.strftime("%a %H:%M", time.localtime(entry["next_run_at"]))
     delta = entry["next_run_at"] - now
     if delta > 0:
@@ -454,8 +916,11 @@ def format_entry(entry: Dict[str, Any], now: Optional[float] = None) -> str:
     last_str = "{} ago".format(tasks.format_age(now - last_run_at)) if last_run_at else "never"
     prompt_preview = entry["prompt"][:80]
     name = entry.get("name", "")
-    return "#{} [{}] {} ({}) — next {} — last {} — {}".format(
-        entry["id"], state, name, entry["spec"], _next_str(entry, now), last_str, prompt_preview
+    spec = entry["spec"]
+    english = describe_spec(spec)
+    schedule = spec if english == spec else "{} ({})".format(spec, english)
+    return "#{} [{}] {} — {} — next {} — last {} — {}".format(
+        entry["id"], state, name, schedule, _next_str(entry, now), last_str, prompt_preview
     )
 
 
@@ -514,7 +979,7 @@ def add(
         data["next_id"] = eid + 1
         entry = {
             "id": eid,
-            "spec": parsed["text"],
+            "spec": _stored_text(parsed),
             "prompt": prompt,
             "name": resolved_name,
             "enabled": True,
@@ -523,7 +988,7 @@ def add(
             "next_run_at": next_run_at,
         }
         data["schedules"].append(entry)
-        if not _save(data):
+        if not _commit(data, defs_changed=True):
             return False, "Failed to save schedule."
 
     return True, "OK: schedule #{} added — next run {}".format(eid, _next_str(entry, now))
@@ -583,7 +1048,7 @@ def update_schedule(
                 return False, "Could not compute the next run time for this schedule."
             if next_run_at is None:
                 return False, "Schedule time must be in the future."
-            target["spec"] = parsed["text"]
+            target["spec"] = _stored_text(parsed)
             target["next_run_at"] = next_run_at
 
         if prompt is not None:
@@ -591,7 +1056,7 @@ def update_schedule(
         if resolved_name is not None:
             target["name"] = resolved_name
 
-        if not _save(data):
+        if not _commit(data, defs_changed=True):
             return False, "Failed to save schedule."
         entry_copy = dict(target)
 
@@ -607,7 +1072,7 @@ def remove(schedule_id: int) -> Tuple[bool, str]:
         data["schedules"] = [e for e in data["schedules"] if e["id"] != schedule_id]
         if len(data["schedules"]) == before:
             return False, "Unknown schedule id: {}".format(schedule_id)
-        if not _save(data):
+        if not _commit(data, defs_changed=True):
             return False, "Failed to save schedule."
         _inflight.discard(schedule_id)
     return True, "OK: schedule #{} removed.".format(schedule_id)
@@ -634,7 +1099,7 @@ def set_enabled(schedule_id: int, enabled: bool) -> Tuple[bool, str]:
                         target["next_run_at"] = next_run_at
                 except (OverflowError, ValueError):
                     _LOGGER.error("schedule_next_run_failed id=%s", schedule_id)
-        if not _save(data):
+        if not _commit(data, defs_changed=True):
             return False, "Failed to save schedule."
         entry_copy = dict(target)
 
@@ -648,7 +1113,8 @@ def set_enabled(schedule_id: int, enabled: bool) -> Tuple[bool, str]:
 def run_now(schedule_id: int) -> Optional[Dict[str, Any]]:
     """Mark a schedule in-flight for a manual run and return a copy of it.
     Returns None when the id is unknown or already running. Does not touch
-    next_run_at (a manual run never perturbs the regular schedule)."""
+    next_run_at (a manual run never perturbs the regular schedule). Only the
+    running-state file is rewritten."""
     now = time.time()
     with _lock:
         if schedule_id in _inflight:
@@ -662,7 +1128,7 @@ def run_now(schedule_id: int) -> Optional[Dict[str, Any]]:
         if target is None:
             return None
         target["last_run_at"] = now
-        if not _save(data):
+        if not _commit(data, defs_changed=False):
             return None
         _inflight.add(schedule_id)
         return dict(target)
@@ -752,6 +1218,20 @@ def _plan(
             recomputed = None
             _LOGGER.error("schedule_next_run_failed id=%s", eid)
 
+        # A missing stored next run is never "due". A disabled entry keeps
+        # none; an enabled one gets it recomputed from now, and a spent
+        # one-shot whose state went missing is dropped.
+        if entry["next_run_at"] is None:
+            if not entry["enabled"]:
+                updated.append(entry)
+                continue
+            if recomputed is None and parsed["kind"] == "at":
+                _LOGGER.warning("schedule_spent_without_state id=%s", eid)
+                continue
+            entry["next_run_at"] = recomputed
+            updated.append(entry)
+            continue
+
         # Clock-back reset takes precedence and applies even to disabled
         # entries: the stored next_run_at is implausibly far in the future
         # compared to what `now` would compute.
@@ -804,8 +1284,11 @@ def tick(now: float, enqueue: Callable[[Dict[str, Any]], bool]) -> None:
         updated, to_fire, skipped_ids, overlapped_ids = _plan(data["schedules"], now)
         for entry in to_fire:
             _inflight.add(entry["id"])
+        # Definitions change only when a spent one-shot was deleted; the
+        # per-tick bookkeeping goes to the running-state file alone.
+        defs_changed = len(updated) != len(data["schedules"])
         data["schedules"] = updated
-        saved = _save(data)
+        saved = _commit(data, defs_changed=defs_changed)
         if not saved:
             for entry in to_fire:
                 _inflight.discard(entry["id"])

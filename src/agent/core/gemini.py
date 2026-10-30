@@ -250,7 +250,7 @@ def _view_file_run(args: Dict[str, Any]) -> str:
 def _manage_schedule_declaration() -> Dict[str, Any]:
     return {
         "name": "manage_schedule",
-        "description": "Create, list, get, enable/disable or remove scheduled prompts that run automatically and report back in this chat. Only add/remove/disable/update when the user explicitly asks. ALWAYS set a short name (≤60 chars) on add. Call `list` first to resolve plain-English references like 'the news briefing' to an id. Minimum interval 15 minutes. Spec grammar (local time, examples): 'daily 09:00', 'daily 09:00,18:00', 'weekdays 08:30', 'weekly mon,thu 09:00', 'hourly :15', 'every 30m', 'at YYYY-MM-DD HH:MM' (one-shot, must be future; min 15m for recurring, aligned to local midnight).",
+        "description": "Create, list, get, enable/disable or remove scheduled prompts that run automatically and report back in this chat. Only add/remove/disable/update when the user explicitly asks. ALWAYS set a short name (≤60 chars) on add. Call `list` first to resolve plain-English references like 'the news briefing' to an id. Minimum interval 15 minutes. Preferred spec: 5-field cron in local time (minute hour day-of-month month day-of-week), e.g. '0 9 * * *' (daily 09:00), '0 9 * * 1-5' (weekdays 09:00), '15 0,2,4 * * *', '*/30 * * * *'. Day-of-week 0 or 7 is Sunday; names like mon or jan are accepted. If both day-of-month and day-of-week are restricted, a day matches when either matches. Legacy forms are still accepted: 'daily 09:00', 'daily 09:00,18:00', 'weekdays 08:30', 'weekly mon,thu 09:00', 'hourly :15', 'every 30m', 'every 2h'. One-shot: 'at YYYY-MM-DD HH:MM' (must be in the future).",
         "parameters": {
             "type": "OBJECT",
             "properties": {
@@ -260,7 +260,7 @@ def _manage_schedule_declaration() -> Dict[str, Any]:
                 },
                 "spec": {
                     "type": "STRING",
-                    "description": "Schedule spec (required for add, optional for update)",
+                    "description": "Schedule spec (required for add, optional for update): 5-field cron (preferred, e.g. '0 9 * * 1-5'), a legacy form (e.g. 'daily 09:00'), or 'at YYYY-MM-DD HH:MM' for a one-shot",
                 },
                 "prompt": {
                     "type": "STRING",

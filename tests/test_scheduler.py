@@ -26,9 +26,13 @@ class SchedulerTestCase(unittest.TestCase):
         self._tmp_dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self._tmp_dir, ignore_errors=True)
         self.path = os.path.join(self._tmp_dir, "sub", "schedules.json")
+        self.state_path = os.path.join(self._tmp_dir, "sub", "schedule_state.json")
         patcher = mock.patch.object(scheduler, "SCHEDULES_FILE", self.path)
         patcher.start()
         self.addCleanup(patcher.stop)
+        state_patcher = mock.patch.object(scheduler, "SCHEDULE_STATE_FILE", self.state_path)
+        state_patcher.start()
+        self.addCleanup(state_patcher.stop)
 
         scheduler._inflight.clear()
         self.addCleanup(scheduler._inflight.clear)
@@ -408,7 +412,7 @@ class CrudTests(SchedulerTestCase):
         # happened long after the entry was last due.
         data = scheduler.load()
         data["schedules"][0]["next_run_at"] = now - 3600
-        scheduler._save(data)
+        scheduler._commit(data, defs_changed=False)
         entry = scheduler.list_entries()[0]
         text = scheduler.format_entry(entry, now)
         self.assertIn("paused", text)
@@ -419,7 +423,7 @@ class CrudTests(SchedulerTestCase):
         scheduler.add("daily 09:00", "prompt", now=_mk(2025, 6, 2, 0, 0))
         data = scheduler.load()
         data["schedules"][0]["next_run_at"] = now - 60
-        scheduler._save(data)
+        scheduler._commit(data, defs_changed=False)
         entry = scheduler.list_entries()[0]
         text = scheduler.format_entry(entry, now)
         self.assertIn("(due)", text)
@@ -489,7 +493,7 @@ class TickTests(SchedulerTestCase):
             if e["id"] == entry["id"]:
                 e["next_run_at"] = next_run_at
                 e["enabled"] = enabled
-        scheduler._save(data)
+        scheduler._commit(data, defs_changed=True)
         return entry["id"]
 
     def test_due_within_grace_fires_once(self) -> None:
@@ -555,17 +559,17 @@ class TickTests(SchedulerTestCase):
         now = _mk(2025, 6, 2, 9, 0)
         self._add_due("daily 09:00", "prompt", now - 60, now)
         order = []
-        orig_save = scheduler._save
+        orig_commit = scheduler._commit
 
-        def _tracking_save(data):
+        def _tracking_commit(data, defs_changed):
             order.append("save")
-            return orig_save(data)
+            return orig_commit(data, defs_changed)
 
         def _tracking_enqueue(_entry):
             order.append("enqueue")
             return True
 
-        with mock.patch.object(scheduler, "_save", side_effect=_tracking_save):
+        with mock.patch.object(scheduler, "_commit", side_effect=_tracking_commit):
             scheduler.tick(now, _tracking_enqueue)
         self.assertEqual(order, ["save", "enqueue"])
 
@@ -578,6 +582,409 @@ class TickTests(SchedulerTestCase):
         fired_ids = [e["id"] for e in fired]
         self.assertIn(due_id, fired_ids)
         self.assertNotIn(not_due_id, fired_ids)
+
+
+def _occurrences(parsed, start, span):
+    """Every next run in (start, start + span], walked from `start`."""
+    out = []
+    cursor = start
+    while True:
+        nxt = scheduler.next_run(parsed, cursor)
+        if nxt is None or nxt > start + span:
+            return out
+        out.append(nxt)
+        cursor = nxt
+
+
+class CronParseTests(SchedulerTestCase):
+    def test_five_fields_parse(self) -> None:
+        parsed, n, err = scheduler.parse_spec(["0", "9", "*", "*", "1-5"])
+        self.assertIsNone(err)
+        self.assertEqual(n, 5)
+        self.assertEqual(parsed["kind"], "cron")
+        self.assertEqual(parsed["minutes"], {0})
+        self.assertEqual(parsed["hours"], {9})
+        self.assertEqual(parsed["dows"], {1, 2, 3, 4, 5})
+        self.assertTrue(parsed["dom_star"])
+        self.assertFalse(parsed["dow_star"])
+        self.assertEqual(parsed["text"], "0 9 * * 1-5")
+
+    def test_names_are_case_insensitive(self) -> None:
+        parsed, _n, err = scheduler.parse_spec(["0", "9", "*", "JAN-MAR", "MON-FRI"])
+        self.assertIsNone(err)
+        self.assertEqual(parsed["months"], {1, 2, 3})
+        self.assertEqual(parsed["dows"], {1, 2, 3, 4, 5})
+
+    def test_day_of_week_seven_is_sunday(self) -> None:
+        parsed, _n, err = scheduler.parse_spec(["0", "9", "*", "*", "7"])
+        self.assertIsNone(err)
+        self.assertEqual(parsed["dows"], {0})
+
+    def test_steps_and_n_over_s(self) -> None:
+        parsed, _n, err = scheduler.parse_spec(["*/30", "*", "*", "*", "*"])
+        self.assertIsNone(err)
+        self.assertEqual(parsed["minutes"], {0, 30})
+        parsed, _n, err = scheduler.parse_spec(["5/20", "*", "*", "*", "*"])
+        self.assertIsNone(err)
+        self.assertEqual(parsed["minutes"], {5, 25, 45})
+
+    def test_comma_hour_list(self) -> None:
+        parsed, _n, err = scheduler.parse_spec(["15", "0,2,4", "*", "*", "*"])
+        self.assertIsNone(err)
+        self.assertEqual(parsed["hours"], {0, 2, 4})
+
+    def test_rejects_wrong_field_count(self) -> None:
+        _parsed, _n, err = scheduler.parse_spec(["0", "9", "*", "*"])
+        self.assertIsNotNone(err)
+
+    def test_rejects_macros_and_extensions(self) -> None:
+        _parsed, _n, err = scheduler.parse_spec(["@daily"])
+        self.assertIsNotNone(err)
+        for fields in (["0", "9", "L", "*", "*"], ["0", "9", "*", "*", "5#2"], ["0", "9", "15W", "*", "*"]):
+            _parsed, _n, err = scheduler.parse_spec(fields)
+            self.assertIsNotNone(err, fields)
+
+    def test_rejects_out_of_range_fields(self) -> None:
+        for fields in (
+            ["60", "*", "*", "*", "*"],
+            ["0", "24", "*", "*", "*"],
+            ["0", "9", "0", "*", "*"],
+            ["0", "9", "*", "13", "*"],
+            ["0", "9", "*", "*", "8"],
+        ):
+            _parsed, _n, err = scheduler.parse_spec(fields)
+            self.assertIsNotNone(err, fields)
+
+    def test_rejects_fire_times_closer_than_fifteen_minutes(self) -> None:
+        for fields in (["*/5", "*", "*", "*", "*"], ["0,10", "9", "*", "*", "*"], ["*", "*", "*", "*", "*"]):
+            _parsed, _n, err = scheduler.parse_spec(fields)
+            self.assertIsNotNone(err, fields)
+        _parsed, _n, err = scheduler.parse_spec(["*/15", "*", "*", "*", "*"])
+        self.assertIsNone(err)
+
+    def test_split_spec_prompt_with_cron(self) -> None:
+        parsed, prompt, err = scheduler.split_spec_prompt("0 9 * * * do the report")
+        self.assertIsNone(err)
+        self.assertEqual(parsed["kind"], "cron")
+        self.assertEqual(prompt, "do the report")
+
+
+class CronNextRunTests(SchedulerTestCase):
+    def _next(self, fields: str, after: float):
+        parsed, _n, err = scheduler.parse_spec(fields.split())
+        self.assertIsNone(err)
+        return scheduler.next_run(parsed, after)
+
+    def test_daily(self) -> None:
+        self.assertEqual(self._next("0 9 * * *", _mk(2025, 6, 2, 10, 0)), _mk(2025, 6, 3, 9, 0))
+
+    def test_weekdays_friday_rolls_to_monday(self) -> None:
+        # 2025-06-06 is a Friday.
+        self.assertEqual(self._next("0 9 * * 1-5", _mk(2025, 6, 6, 10, 0)), _mk(2025, 6, 9, 9, 0))
+
+    def test_sunday_zero_and_seven(self) -> None:
+        # 2025-06-02 is a Monday; the next Sunday is 2025-06-08.
+        self.assertEqual(self._next("0 9 * * 0", _mk(2025, 6, 2, 0, 0)), _mk(2025, 6, 8, 9, 0))
+        self.assertEqual(self._next("0 9 * * 7", _mk(2025, 6, 2, 0, 0)), _mk(2025, 6, 8, 9, 0))
+
+    def test_dom_or_dow_when_both_restricted(self) -> None:
+        # Friday 2025-06-06 is not the 13th, so the weekday alone matches it.
+        self.assertEqual(self._next("0 9 13 * 5", _mk(2025, 6, 2, 0, 0)), _mk(2025, 6, 6, 9, 0))
+        # Friday 2025-06-13 matches both.
+        self.assertEqual(self._next("0 9 13 * 5", _mk(2025, 6, 6, 10, 0)), _mk(2025, 6, 13, 9, 0))
+
+    def test_dom_only_when_dow_is_star(self) -> None:
+        self.assertEqual(self._next("0 9 13 * *", _mk(2025, 6, 14, 0, 0)), _mk(2025, 7, 13, 9, 0))
+
+    def test_month_rollover(self) -> None:
+        self.assertEqual(self._next("0 0 1 1 *", _mk(2025, 6, 2, 0, 0)), _mk(2026, 1, 1, 0, 0))
+
+    def test_feb_29_waits_for_next_leap_year(self) -> None:
+        self.assertEqual(self._next("0 12 29 2 *", _mk(2025, 3, 1, 0, 0)), _mk(2028, 2, 29, 12, 0))
+
+    def test_comma_hours_and_steps(self) -> None:
+        self.assertEqual(self._next("15 0,2,4 * * *", _mk(2025, 6, 2, 3, 0)), _mk(2025, 6, 2, 4, 15))
+        self.assertEqual(self._next("*/30 * * * *", _mk(2025, 6, 2, 0, 5)), _mk(2025, 6, 2, 0, 30))
+        self.assertEqual(self._next("*/30 * * * *", _mk(2025, 6, 2, 0, 30)), _mk(2025, 6, 2, 1, 0))
+
+    def test_impossible_date_raises(self) -> None:
+        parsed, _n, err = scheduler.parse_spec("0 9 31 2 *".split())
+        self.assertIsNone(err)
+        with self.assertRaises(ValueError):
+            scheduler.next_run(parsed, _mk(2025, 6, 2, 0, 0))
+
+    @unittest.skipUnless(_HAS_TZSET, "time.tzset() not available on this platform")
+    def test_dst_spring_forward_fires_once_per_day(self) -> None:
+        self._set_tz("America/Los_Angeles")
+        # 2024-03-10: 02:30 does not exist; the next day must still be
+        # strictly later, never a repeat of the same occurrence.
+        parsed, _n, _err = scheduler.parse_spec(["30", "2", "*", "*", "*"])
+        before = _mk(2024, 3, 9, 12, 0)
+        first = scheduler.next_run(parsed, before)
+        second = scheduler.next_run(parsed, first)
+        self.assertIsNotNone(first)
+        self.assertGreater(second, first)
+        self.assertGreater(second - first, 3600 * 20)
+
+
+class LegacyCronEquivalenceTests(SchedulerTestCase):
+    _LEGACY_SPECS = (
+        "daily 09:00,18:00",
+        "weekdays 08:30",
+        "weekly mon,thu 09:00",
+        "hourly :15",
+        "every 15m",
+        "every 20m",
+        "every 30m",
+        "every 2h",
+        "every 12h",
+    )
+
+    def test_converted_text_gives_identical_next_runs(self) -> None:
+        starts = (_mk(2025, 6, 2, 0, 0), _mk(2025, 6, 4, 13, 7))
+        for text in self._LEGACY_SPECS:
+            legacy, _n, err = scheduler.parse_spec(text.split())
+            self.assertIsNone(err)
+            cron_text = scheduler._to_cron_text(legacy)
+            self.assertIsNotNone(cron_text, text)
+            cron, _n2, err2 = scheduler.parse_spec(cron_text.split())
+            self.assertIsNone(err2, cron_text)
+            for start in starts:
+                week = 7 * 86400
+                self.assertEqual(
+                    _occurrences(legacy, start, week), _occurrences(cron, start, week), text
+                )
+
+    def test_add_and_update_store_cron_for_equivalent_input(self) -> None:
+        now = _mk(2025, 6, 2, 0, 0)
+        cases = [
+            ("daily 09:00", "0 9 * * *"),
+            ("weekdays 08:30", "30 8 * * 1,2,3,4,5"),
+            ("hourly :15", "15 * * * *"),
+            ("every 30m", "*/30 * * * *"),
+            ("every 2h", "0 */2 * * *"),
+            ("every 45m", "every 45m"),
+            ("at 2099-01-01 00:00", "at 2099-01-01 00:00"),
+            ("0 9 * * 1-5", "0 9 * * 1-5"),
+        ]
+        for spec, _stored in cases:
+            ok, _msg = scheduler.add(spec, "prompt", now=now)
+            self.assertTrue(ok, spec)
+        self.assertEqual([e["spec"] for e in scheduler.list_entries()], [s for _spec, s in cases])
+        ok, _msg = scheduler.update_schedule(1, spec="daily 10:00")
+        self.assertTrue(ok)
+        self.assertEqual(scheduler.list_entries()[0]["spec"], "0 10 * * *")
+
+
+class MigrationTests(SchedulerTestCase):
+    def _write_json(self, path: str, obj) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+        os.chmod(path, 0o600)
+
+    def _legacy_file(self):
+        return {
+            "version": 1,
+            "next_id": 3,
+            "schedules": [
+                {
+                    "id": 1, "spec": "daily 09:00", "prompt": "morning", "name": "Morning",
+                    "enabled": True, "created_at": 1000.0, "last_run_at": None,
+                    "next_run_at": _mk(2025, 6, 3, 9, 0),
+                },
+                {
+                    "id": 2, "spec": "hourly :15", "prompt": "hourly", "name": "Hourly",
+                    "enabled": False, "created_at": 1001.0, "last_run_at": 2000.0,
+                    "next_run_at": _mk(2025, 6, 2, 11, 15),
+                },
+            ],
+        }
+
+    def test_v1_file_migrates_without_loss(self) -> None:
+        self._write_json(self.path, self._legacy_file())
+        entries = scheduler.list_entries()
+        self.assertEqual([e["id"] for e in entries], [1, 2])
+        self.assertEqual(entries[0]["spec"], "daily 09:00")  # legacy text kept verbatim
+        self.assertEqual(entries[0]["next_run_at"], _mk(2025, 6, 3, 9, 0))
+        self.assertEqual(entries[1]["last_run_at"], 2000.0)
+        self.assertEqual(entries[1]["prompt"], "hourly")
+        with open(self.path, encoding="utf-8") as f:
+            on_disk = json.load(f)
+        self.assertEqual(on_disk["version"], 2)
+        self.assertEqual(on_disk["next_id"], 3)
+        self.assertNotIn("next_run_at", on_disk["schedules"][0])
+        self.assertNotIn("last_run_at", on_disk["schedules"][1])
+        with open(self.state_path, encoding="utf-8") as f:
+            state = json.load(f)
+        self.assertEqual(state["state"]["1"]["next_run_at"], _mk(2025, 6, 3, 9, 0))
+        self.assertEqual(state["state"]["2"]["last_run_at"], 2000.0)
+        # A second load is a plain v2 read and changes nothing.
+        self.assertEqual(scheduler.list_entries(), entries)
+
+    def test_rerun_after_partial_migration_keeps_existing_state(self) -> None:
+        # Crash after the state file was written, before definitions were rewritten.
+        self._write_json(self.path, self._legacy_file())
+        self._write_json(
+            self.state_path,
+            {"version": 1, "state": {"1": {"last_run_at": 5000.0, "next_run_at": 6000.0}}},
+        )
+        entries = scheduler.list_entries()
+        self.assertEqual(entries[0]["next_run_at"], 6000.0)  # existing state wins
+        self.assertEqual(entries[0]["last_run_at"], 5000.0)
+        self.assertEqual(entries[1]["last_run_at"], 2000.0)  # no state yet: from v1
+        with open(self.path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["version"], 2)
+
+    def test_corrupt_state_leaves_definitions_alone(self) -> None:
+        scheduler.add("daily 09:00", "prompt", now=_mk(2025, 6, 2, 0, 0))
+        with open(self.path, "rb") as f:
+            before = f.read()
+        with open(self.state_path, "w", encoding="utf-8") as f:
+            f.write("garbage {{{")
+        entries = scheduler.list_entries()
+        with open(self.path, "rb") as f:
+            self.assertEqual(f.read(), before)
+        self.assertEqual(entries[0]["spec"], "0 9 * * *")
+        self.assertEqual(entries[0]["prompt"], "prompt")
+        self.assertIsNotNone(entries[0]["next_run_at"])
+        self.assertIsNone(entries[0]["last_run_at"])
+        quarantined = [
+            name for name in os.listdir(os.path.dirname(self.state_path))
+            if name.startswith("schedule_state.json.corrupt-")
+        ]
+        self.assertEqual(len(quarantined), 1)
+
+    def test_missing_state_is_never_due(self) -> None:
+        now = _mk(2025, 6, 2, 9, 0)
+        scheduler.add("daily 09:00", "prompt", now=_mk(2025, 6, 2, 0, 0))
+        os.remove(self.state_path)
+        fired = []
+        scheduler.tick(now, fired.append)
+        self.assertEqual(fired, [])
+        self.assertIsNotNone(scheduler.list_entries()[0]["next_run_at"])
+
+
+class PersistenceTests(SchedulerTestCase):
+    def _force_next_run(self, sid: int, next_run_at: float) -> None:
+        data = scheduler.load()
+        for e in data["schedules"]:
+            if e["id"] == sid:
+                e["next_run_at"] = next_run_at
+        scheduler._commit(data, defs_changed=False)
+
+    def _read_bytes(self, path: str) -> bytes:
+        with open(path, "rb") as f:
+            return f.read()
+
+    def test_tick_leaves_definitions_bytes_untouched(self) -> None:
+        now = _mk(2025, 6, 2, 9, 0)
+        scheduler.add("daily 09:00", "prompt", now=_mk(2025, 6, 2, 0, 0))
+        self._force_next_run(1, now - 60)
+        before = self._read_bytes(self.path)
+        fired = []
+        scheduler.tick(now, fired.append)
+        self.assertEqual(len(fired), 1)
+        self.assertEqual(self._read_bytes(self.path), before)
+        with open(self.state_path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["state"]["1"]["last_run_at"], now)
+
+    def test_run_now_leaves_definitions_bytes_untouched(self) -> None:
+        scheduler.add("daily 09:00", "prompt", now=_mk(2025, 6, 2, 0, 0))
+        before = self._read_bytes(self.path)
+        self.assertIsNotNone(scheduler.run_now(1))
+        self.assertEqual(self._read_bytes(self.path), before)
+
+    def test_definitions_file_is_indented_v2_without_run_fields(self) -> None:
+        scheduler.add("daily 09:00", "prompt", now=_mk(2025, 6, 2, 0, 0))
+        with open(self.path, encoding="utf-8") as f:
+            text = f.read()
+        self.assertTrue(text.endswith("\n"))
+        self.assertIn('\n  "version": 2', text)
+        self.assertNotIn("next_run_at", text)
+        self.assertNotIn("last_run_at", text)
+
+    def test_both_files_are_0600(self) -> None:
+        scheduler.add("daily 09:00", "prompt", now=_mk(2025, 6, 2, 0, 0))
+        for path in (self.path, self.state_path):
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+
+    def test_remove_prunes_state(self) -> None:
+        now = _mk(2025, 6, 2, 0, 0)
+        scheduler.add("daily 09:00", "A", now=now)
+        scheduler.add("daily 09:00", "B", now=now)
+        scheduler.remove(1)
+        with open(self.state_path, encoding="utf-8") as f:
+            self.assertEqual(sorted(json.load(f)["state"].keys()), ["2"])
+
+    def test_one_shot_self_delete_rewrites_definitions(self) -> None:
+        scheduler.add("at 2025-06-02 00:30", "one shot", now=_mk(2025, 6, 2, 0, 0))
+        before = self._read_bytes(self.path)
+        scheduler.tick(_mk(2025, 6, 2, 0, 31), lambda _entry: True)
+        self.assertNotEqual(self._read_bytes(self.path), before)
+        with open(self.path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["schedules"], [])
+
+
+class DescribeTests(SchedulerTestCase):
+    def test_legacy_descriptions(self) -> None:
+        cases = {
+            "daily 09:00": "daily at 09:00",
+            "daily 09:00,18:00": "daily at 09:00, 18:00",
+            "weekdays 08:30": "weekdays at 08:30",
+            "weekly mon,wed 09:00": "Mon, Wed at 09:00",
+            "hourly :15": "hourly at :15",
+            "every 30m": "every 30 minutes",
+            "every 2h": "every 2 hours",
+            "every 1h": "every 1 hour",
+            "at 2099-01-01 00:00": "once on 2099-01-01 at 00:00",
+        }
+        for spec, expected in cases.items():
+            self.assertEqual(scheduler.describe_spec(spec), expected, spec)
+
+    def test_cron_descriptions(self) -> None:
+        cases = {
+            "0 9 * * *": "daily at 09:00",
+            "15 0,2,4 * * *": "daily at 00:15, 02:15, 04:15",
+            "0 9 * * 1-5": "weekdays at 09:00",
+            "0 10 * * 0,6": "weekends at 10:00",
+            "0 9 * * 1,3,5": "Mon, Wed, Fri at 09:00",
+            "0 9 * * 7": "Sun at 09:00",
+            "15 * * * *": "hourly at :15",
+            "*/30 * * * *": "every 30 minutes",
+            "0 */2 * * *": "every 2 hours",
+            "0 9 1 * *": "monthly on day 1 at 09:00",
+        }
+        for spec, expected in cases.items():
+            self.assertEqual(scheduler.describe_spec(spec), expected, spec)
+
+    def test_unsupported_cron_falls_back_to_raw(self) -> None:
+        for spec in (
+            "0 9 13 * 5",
+            "0 9 * 6 *",
+            "0 8,9,10,11,12,13,14 * * *",
+            "0 9 1,15 * *",
+            "0,30 9 * * *",
+        ):
+            self.assertEqual(scheduler.describe_spec(spec), spec, spec)
+
+    def test_describe_never_raises(self) -> None:
+        self.assertEqual(scheduler.describe_spec("garbage here"), "garbage here")
+        self.assertEqual(scheduler.describe_spec(""), "")
+        self.assertEqual(scheduler.describe_spec("0 9 * *"), "0 9 * *")
+
+    def test_format_entry_shows_cron_with_description(self) -> None:
+        now = _mk(2025, 6, 2, 0, 0)
+        scheduler.add("0 9 * * 1-5", "prompt", name="Briefing", now=now)
+        text = scheduler.format_entry(scheduler.list_entries()[0], now)
+        self.assertIn("Briefing — 0 9 * * 1-5 (weekdays at 09:00) — next", text)
+
+    def test_format_entry_shows_raw_spec_once_when_undescribed(self) -> None:
+        now = _mk(2025, 6, 2, 0, 0)
+        scheduler.add("0 9 13 * 5", "prompt", name="Odd", now=now)
+        text = scheduler.format_entry(scheduler.list_entries()[0], now)
+        self.assertIn("Odd — 0 9 13 * 5 — next", text)
+        self.assertNotIn("(0 9 13 * 5)", text)
 
 
 class StartTickerTests(SchedulerTestCase):

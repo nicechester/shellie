@@ -52,10 +52,13 @@ bypass, 24/7 via launchd/systemd.
 - `core/tasks.py` — task-file CRUD: atomic 0600 `current.json` under
   `SHELLIE_HOME/tasks`, single slot, 3-day expiry, corrupt files preserved as
   `.corrupt-*` for debugging.
-- `core/scheduler.py` — recurring scheduled prompts: spec grammar (daily/weekdays/weekly/hourly/every
-  with comma-separated times, aligned to local midnight, min 15m floor, plus one-shot `at YYYY-MM-DD HH:MM` form),
-  optional short name (≤60 chars) per entry, pure `next_after()` / `plan_tick()` logic, locked atomic 0600 `schedules.json`
-  with corrupt-file quarantine, 20s daemon ticker (`start_ticker(enqueue)`) started from `_run_polling_loop` only,
+- `core/scheduler.py` — recurring scheduled prompts: 5-field cron (preferred; DOM/DOW Vixie OR rule when both restricted),
+  legacy grammar still accepted (daily/weekdays/weekly/hourly/every with comma-separated times, aligned to local midnight,
+  min 15m floor, plus one-shot `at YYYY-MM-DD HH:MM` form; new schedules store cron where exactly equivalent),
+  `describe_spec()` plain-English rendering, optional short name (≤60 chars) per entry, pure `next_run()` logic.
+  Two files, both atomic 0600 with corrupt-file quarantine: `schedules.json` (version 2, indented, definitions only)
+  and `schedule_state.json` (last/next run by id; rewritten on ticks and runs, never the definitions); version 1
+  `schedules.json` migrates on load. 20s daemon ticker (`start_ticker(enqueue)`) started from `_run_polling_loop` only,
   save-before-enqueue at-most-once, grace 600s skip-missed (10 min downtime → skipped, never replayed), per-schedule
   inflight dedup via `mark_finished()`. Max 20 schedules; integer ids never reused; expiry is N/A (user-managed).
   `list_entries() -> List[Dict]`, `get_schedule(id)`, `add(spec, prompt, name)`, `update_schedule(id, spec, prompt, name)`,
