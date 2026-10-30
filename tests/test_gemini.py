@@ -1067,8 +1067,8 @@ class ListSkillsTests(unittest.TestCase):
                 result = gemini.list_skills()
 
         lines = result.split("\n")
-        self.assertIn("- skills/alpha.py: Alpha skill does something useful.", lines)
-        self.assertIn("- skills/broken.py", lines)
+        self.assertIn("- {}: Alpha skill does something useful.".format(os.path.join(tmp, "alpha.py")), lines)
+        self.assertIn("- {}".format(os.path.join(tmp, "broken.py")), lines)
         self.assertFalse(any("_internal" in line for line in lines))
 
     def test_md_skill_with_heading_strips_hash(self) -> None:
@@ -1080,7 +1080,7 @@ class ListSkillsTests(unittest.TestCase):
                  mock.patch.object(gemini, "REPO_SKILLS_DIR", "/nonexistent"):
                 result = gemini.list_skills()
 
-        self.assertEqual(result, "- skills/x.md: Title")
+        self.assertEqual(result, "- {}: Title".format(os.path.join(tmp, "x.md")))
 
     def test_md_skill_with_plain_text_first_line(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1091,7 +1091,7 @@ class ListSkillsTests(unittest.TestCase):
                  mock.patch.object(gemini, "REPO_SKILLS_DIR", "/nonexistent"):
                 result = gemini.list_skills()
 
-        self.assertEqual(result, "- skills/x.md: Plain text summary line.")
+        self.assertEqual(result, "- {}: Plain text summary line.".format(os.path.join(tmp, "x.md")))
 
     def test_empty_md_skill_is_name_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1102,7 +1102,7 @@ class ListSkillsTests(unittest.TestCase):
                  mock.patch.object(gemini, "REPO_SKILLS_DIR", "/nonexistent"):
                 result = gemini.list_skills()
 
-        self.assertEqual(result, "- skills/x.md")
+        self.assertEqual(result, "- {}".format(os.path.join(tmp, "x.md")))
 
     def test_readme_md_is_excluded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1138,8 +1138,8 @@ class ListSkillsTests(unittest.TestCase):
                 result = gemini.list_skills()
 
         lines = result.split("\n")
-        self.assertIn("- skills/alpha.py: Alpha skill summary.", lines)
-        self.assertIn("- skills/beta.md: Beta procedure", lines)
+        self.assertIn("- {}: Alpha skill summary.".format(os.path.join(tmp, "alpha.py")), lines)
+        self.assertIn("- {}: Beta procedure".format(os.path.join(tmp, "beta.md")), lines)
 
 
 class CallWebSearchTests(unittest.TestCase):
@@ -1181,7 +1181,7 @@ class BuildSystemInstructionTests(unittest.TestCase):
     def test_all_sections_present_when_skills_exist(self) -> None:
         with mock.patch.object(gemini, "settings") as mock_settings, \
                 mock.patch.object(gemini, "read_memory", return_value="MEMCONTENT"), \
-                mock.patch.object(gemini, "list_skills", return_value="- skills/foo.py: desc"), \
+                mock.patch.object(gemini, "list_skills", return_value="- /abs/skills/foo.py: desc"), \
                 mock.patch.object(
                     gemini.shell,
                     "execution_environment",
@@ -1196,8 +1196,9 @@ class BuildSystemInstructionTests(unittest.TestCase):
         self.assertIn("MEMCONTENT", text)
         self.assertIn("[execution environment]", text)
         self.assertIn("[skills]", text)
-        self.assertIn("- skills/foo.py: desc", text)
-        self.assertIn("cat skills/", text)
+        self.assertIn("- /abs/skills/foo.py: desc", text)
+        self.assertIn("read full text with cat <absolute path>", text)
+        self.assertIn("paths are absolute", text)
 
     def test_skills_section_omitted_when_no_skills(self) -> None:
         with mock.patch.object(gemini, "settings") as mock_settings, \

@@ -1,7 +1,7 @@
 # Shellie
 
 A personal Telegram agent that runs on your own machine. Zero pip dependencies —
-Python 3.8+ standard library only. Current version: **1.2.1**.
+Python 3.8+ standard library only. Current version: **1.3.0**.
 
 ## 1. Overview
 
@@ -86,7 +86,8 @@ Shellie uses two separate directories:
 
 - **`SHELLIE_HOME`** (default: `~/.shellie/`) — configuration and context:
   `settings.json`, memory files, user skills (`skills/`), MCP login tokens
-  (`mcp_oauth.json`), schedules, the task file and the offset file
+  (`mcp_oauth.json`), schedules (`schedules.json`, `schedule_state.json`), the
+  task file and the offset file
 - **`SHELLIE_WORKSPACE`** (default: `~/workspace/`) — work products: job
   outputs, generated code, documents created by the LLM, and files you upload
 
@@ -296,20 +297,38 @@ When you send files via Telegram, Shellie includes them in your next LLM message
 
 Shellie can run recurring prompts on a schedule, without you needing to send a message:
 
-**Spec grammar** (in local time, including DST; examples):
+**Spec grammar** (local time, including DST):
+
+Preferred: standard 5-field cron — `minute hour day-of-month month day-of-week`:
+- `0 9 * * *` — every day at 09:00 (`0 9,18 * * *` for 09:00 and 18:00)
+- `0 9 * * 1-5` — Monday–Friday at 09:00 (`0 9 * * mon-fri` also works)
+- `0 9 * * 1,4` — Monday and Thursday at 09:00
+- `15 0,2,4 * * *` — every day at 00:15, 02:15 and 04:15
+- `*/30 * * * *` — every 30 minutes (`0 */2 * * *` = every 2 hours)
+- `0 9 1 * *` — the 1st of every month at 09:00
+- Supported: `*`, `N`, `A-B`, `*/S`, `A-B/S`, `N/S`, comma lists, names `jan`–`dec` and `sun`–`sat` (case-insensitive). Weekday `0` and `7` are Sunday. `@daily`, `L`, `W` and `#` are not supported.
+- **Day matching:** if both day-of-month and day-of-week are restricted (neither is `*`), a day matches when *either* matches (standard cron behaviour). If one of them is `*`, only the other applies.
+- The minimum interval is **15 minutes**: two fire times on the same day closer than that are rejected.
+
+Legacy forms are still accepted, and existing schedules keep their text:
 - `daily 09:00` or `daily 09:00,18:00` — every day at that time(s)
 - `weekdays 08:30` or `weekdays 08:30,17:00` — Monday–Friday at that time(s)
 - `weekly mon,thu 09:00` or `weekly mon,thu 09:00,14:00` — specific days and time(s)
 - `hourly :15` — every hour at that minute (e.g. at :15 past each hour)
 - `every 30m` / `every 2h` — every N minutes or hours, aligned to local midnight (min **15 minutes**, max 24 hours). `every 30m` fires at :00 and :30 of each hour; `every 2h` fires at 00:00, 02:00, 04:00, etc. Slots do not drift across restarts.
-- `at 2026-10-05 14:30` — **one-shot, fires once** at that date and time (must be in the future), then shows as done.
+- `at 2026-10-05 14:30` — **one-shot, fires once** at that date and time (must be in the future), then is removed. One-shots have no cron form (cron has no year field).
+
+When you add or change a schedule, legacy input is stored as cron wherever an exactly equivalent cron expression exists (`daily`, `weekdays`, `weekly` with one minute for all times; `hourly :MM`; `every 15m/20m/30m`; `every Nh` when N divides 24). Other forms, and `at`, are stored as written. Next-run times are identical either way.
+
+**Listing:** `/schedule` and the model's `list` / `get` output show each spec followed by a plain-English description, for example `0 9 * * 1-5 (weekdays at 09:00)` or `every 30m (every 30 minutes)`. Patterns the description cannot express are shown as the raw spec only.
 
 **Schedule names:**
 - Optional short label (≤60 chars) to help identify a schedule. The model sets these automatically on add to make future changes easier (e.g. "news briefing" instead of just "id 3").
 
 **Constraints:**
 - **Max 20 schedules** per bot instance.
-- Schedules are stored in `~/.shellie/schedules.json`.
+- Schedule **definitions** are stored in `~/.shellie/schedules.json` (indented, hand-editable). Running state (last and next run times) is stored separately in `~/.shellie/schedule_state.json`, so ticks and runs never rewrite the definitions. Both files are written atomically with mode 0600.
+- Older `schedules.json` files (version 1, with run times inline) are migrated automatically on first load. Nothing is lost; the migration is logged once. If the state file is corrupt it is set aside and next run times are recomputed; definitions are not affected.
 - Schedule **IDs are small integers, never reused** across the lifetime of the instance.
 - The prompt must be **self-contained** — it runs with no conversation context or chat history.
 - **Scheduled runs never replace an unfinished interactive task** — they run independently and post a ⏰ notice when starting.
